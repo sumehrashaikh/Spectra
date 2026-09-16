@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Matplotlib / temporary files
+*.png
+*.jpg
+*.jpeg
+
+# Large generated signal files
+prototype/data/output/
+
+# Python packaging
+*.egg-info/
+dist/
+build/
