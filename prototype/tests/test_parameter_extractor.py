@@ -4,7 +4,7 @@ from prototype.core.signal import Signal
 from prototype.parameters.extractor import extract_parameters
 
 
-def main():
+def test_test_parameter_extractor():
 
     print("=" * 70)
     print("V2 PARAMETER EXTRACTION TEST")

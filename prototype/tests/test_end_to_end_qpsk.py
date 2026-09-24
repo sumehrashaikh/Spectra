@@ -149,7 +149,7 @@ def apply_phase_offset(
     )
 
 
-def main():
+def test_test_end_to_end_qpsk():
     print("=" * 70)
     print("SPECTRA V2 END-TO-END QPSK TEST")
     print("=" * 70)

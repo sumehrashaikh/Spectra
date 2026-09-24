@@ -68,7 +68,7 @@ def run_test(
     return error
 
 
-def main():
+def test_test_symbol_rate():
 
     print("=" * 70)
     print("V2 SYMBOL-RATE ESTIMATION TEST")

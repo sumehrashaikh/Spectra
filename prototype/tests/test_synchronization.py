@@ -171,7 +171,7 @@ def qpsk_decision(
     )
 
 
-def main():
+def test_test_synchronization():
 
     print("=" * 70)
     print("V2 FULL SYNCHRONIZATION INTEGRATION TEST")

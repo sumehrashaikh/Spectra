@@ -104,6 +104,48 @@ def _calculate_feature_confidence(
             )
         )
 
+    elif modulation == "OOK":
+        bimodality = float(
+            features.get(
+                "amplitude_bimodality",
+                0.0,
+            )
+        )
+
+        scores.append(
+            np.clip(
+                bimodality / 1.0,
+                0.0,
+                1.0,
+            )
+        )
+
+    elif modulation == "8-PSK":
+        # Evidence: constant magnitude envelope + two phase clusters
+        # modulo 90 degrees (QPSK-like constellations have one).
+        magnitude_cv = float(
+            features.get(
+                "magnitude_cv",
+                1.0,
+            )
+        )
+
+        clusters = features.get(
+            "phase_clusters_mod_90deg",
+            0,
+        )
+
+        envelope_score = np.clip(
+            (0.18 - magnitude_cv) / 0.18,
+            0.0,
+            1.0,
+        )
+
+        cluster_score = 1.0 if clusters in (2, 3) else 0.0
+
+        scores.append(envelope_score)
+        scores.append(cluster_score)
+
     if not scores:
         return 0.0
 
@@ -166,6 +208,35 @@ def classify_constellation(
 
     confidence = 0.0
 
+    if modulation == "8-PSK":
+        # Evidence: constant magnitude envelope + two phase clusters
+        # modulo 90 degrees (QPSK-like constellations have one).
+        magnitude_cv = float(
+            features.get(
+                "magnitude_cv",
+                1.0,
+            )
+        )
+
+        clusters = features.get(
+            "phase_clusters_mod_90deg",
+            0,
+        )
+
+        envelope_score = float(
+            np.clip(
+                (0.18 - magnitude_cv) / 0.18,
+                0.0,
+                1.0,
+            )
+        )
+
+        cluster_score = 1.0 if clusters in (2, 3) else 0.0
+
+        confidence = (
+            envelope_score + cluster_score
+        ) / 2.0 * 100.0
+
     if modulation == "BPSK":
         axis_ratio = float(
             features.get(
@@ -179,6 +250,22 @@ def classify_constellation(
             0.0,
             1.0,
         ) * 100.0
+
+        # Fallback: a phase-locked BPSK line is generally NOT axis
+        # aligned, so the tight rotation-invariant line ratio is the
+        # stronger evidence when the axis ratio is large.
+        line_ratio = float(
+            features.get(
+                "rotation_invariant_line_ratio",
+                1.0,
+            )
+        )
+
+        if line_ratio < 0.20:
+            confidence = max(
+                confidence,
+                (0.20 - line_ratio) / 0.20 * 100.0,
+            )
 
     elif modulation == "QPSK":
         i_symmetry = float(

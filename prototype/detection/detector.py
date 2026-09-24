@@ -64,31 +64,35 @@ class DetectionResult:
 
 def compute_spectrum(
     signal: Signal,
+    nperseg: int = 4096,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute a two-sided FFT power spectrum."""
+    """
+    Compute a two-sided power spectrum for detection.
+
+    A single rectangular full-length FFT dilutes narrowband signal
+    energy into tens of thousands of bins and makes the noise-floor
+    threshold unstable for long captures. Welch averaging with a
+    Hann window gives a stable floor and a peak-to-floor ratio that
+    reflects the real channel occupancy. nperseg is capped at the
+    signal length.
+    """
 
     if not isinstance(signal, Signal):
         raise TypeError(
             "compute_spectrum() requires a Signal object."
         )
 
-    samples = signal.samples
-    n = signal.num_samples
-    sample_rate = signal.sample_rate
+    from prototype.dsp.spectral import welch_psd
 
-    spectrum = np.fft.fftshift(
-        np.fft.fft(samples)
+    seg = min(
+        nperseg,
+        max(16, signal.num_samples),
     )
 
-    power_spectrum = (
-        np.abs(spectrum) ** 2
-    ) / (n ** 2)
-
-    frequency_axis = np.fft.fftshift(
-        np.fft.fftfreq(
-            n,
-            d=1.0 / sample_rate,
-        )
+    frequency_axis, power_spectrum = welch_psd(
+        signal.samples,
+        signal.sample_rate,
+        nperseg=seg,
     )
 
     return frequency_axis, power_spectrum

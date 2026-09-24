@@ -51,7 +51,7 @@ def generate_bpsk(
     return baseband * carrier
 
 
-def main():
+def test_test_bpsk_parameters():
 
     print("=" * 70)
     print("V2 BPSK PARAMETER EXTRACTION INTEGRATION TEST")

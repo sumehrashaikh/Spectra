@@ -71,7 +71,7 @@ def generate_test_bpsk(
     )
 
 
-def main():
+def test_test_timing_recovery():
 
     print("=" * 70)
     print("V2 TIMING RECOVERY TEST")

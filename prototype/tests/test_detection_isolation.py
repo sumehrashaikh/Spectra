@@ -78,7 +78,7 @@ def select_candidate(detection_result, target_frequency):
     )
 
 
-def main():
+def test_test_detection_isolation():
     print("=" * 70)
     print("V2 DETECTION → CANDIDATE SELECTION → ISOLATION TEST")
     print("=" * 70)

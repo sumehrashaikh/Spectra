@@ -131,7 +131,7 @@ def qpsk_decision(samples):
     )
 
 
-def main():
+def test_test_carrier_recovery():
 
     print("=" * 70)
     print("V2 CARRIER & PHASE RECOVERY TEST")

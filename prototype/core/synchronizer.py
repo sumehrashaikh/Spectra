@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from prototype.core.signal import Signal
+from .signal import Signal
 
 
 @dataclass
@@ -14,6 +14,7 @@ class SynchronizationResult:
     samples_per_symbol: float
     timing_offset: int
     timing_confidence: float
+    estimated_symbol_rate: float | None = None
 
 
 def estimate_timing_offset(
@@ -171,20 +172,24 @@ def recover_symbols(
 
 def synchronize_signal(
     signal: Signal,
-    symbol_rate: float,
+    symbol_rate: float | None = None,
+    min_symbol_rate: float = 20.0,
+    max_symbol_rate: float | None = None,
 ) -> SynchronizationResult:
     """
     Perform timing synchronization using a known/estimated
     symbol rate.
 
-    The symbol rate should normally come from the parameter
-    extraction stage.
+    A known/estimated ``symbol_rate`` (normally produced by
+    the parameter-extraction stage) may be supplied directly.
+    If it is omitted, the symbol rate is estimated from the
+    cyclostationary structure of the signal.
 
     Pipeline:
 
         Signal
           ↓
-        Known symbol rate
+        Known symbol rate (or cyclostationary estimate)
           ↓
         Samples-per-symbol
           ↓
@@ -197,6 +202,36 @@ def synchronize_signal(
         raise TypeError(
             "synchronize_signal expects a Signal object."
         )
+
+    estimated_symbol_rate: float | None = None
+
+    if symbol_rate is None:
+
+        from ..parameters.symbol_rate import (
+            estimate_symbol_rate,
+        )
+
+        if max_symbol_rate is None:
+            max_symbol_rate = signal.sample_rate / 4.0
+
+        rate_estimate = estimate_symbol_rate(
+            signal.samples,
+            signal.sample_rate,
+            min_symbol_rate=min_symbol_rate,
+            max_symbol_rate=max_symbol_rate,
+        )
+
+        estimated_symbol_rate = float(
+            rate_estimate.symbol_rate
+        )
+
+        if estimated_symbol_rate <= 0:
+            raise ValueError(
+                "Could not estimate a symbol rate from the "
+                "signal. Supply symbol_rate explicitly."
+            )
+
+        symbol_rate = estimated_symbol_rate
 
     if symbol_rate <= 0:
         raise ValueError(
@@ -250,4 +285,5 @@ def synchronize_signal(
         timing_confidence=float(
             timing_confidence
         ),
+        estimated_symbol_rate=estimated_symbol_rate,
     )

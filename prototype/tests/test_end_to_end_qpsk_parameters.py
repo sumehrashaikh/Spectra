@@ -131,7 +131,7 @@ def apply_impairments(
 # MAIN TEST
 # ============================================================
 
-def main():
+def test_test_end_to_end_qpsk_parameters():
 
     print("=" * 70)
     print("SPECTRA V2 END-TO-END QPSK PARAMETER TEST")

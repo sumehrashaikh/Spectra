@@ -1,5 +1,3 @@
-from pyexpat import features
-
 import numpy as np
 
 
@@ -98,10 +96,35 @@ def extract_modulation_features(samples, sample_rate):
             np.median(robust_frequency)
         )
 
+        # ----------------------------------------------------
+        # Bimodality of the instantaneous frequency.
+        #
+        # FSK spends most of its time near two tone values
+        # (a bimodal distribution), whereas pulse-shaped
+        # PSK/QAM only produces brief IF spikes at symbol
+        # transitions (a long-tailed, unimodal distribution).
+        #
+        # Bimodality coefficient: |mean - median| / std
+        # (Pearson's second coefficient; ~0 for symmetric
+        # distributions, large for separated two-tone data).
+        # ----------------------------------------------------
+
+        if frequency_std > 1e-9:
+            frequency_bimodality = float(
+                abs(
+                    np.mean(robust_frequency)
+                    - np.median(robust_frequency)
+                )
+                / frequency_std
+            )
+        else:
+            frequency_bimodality = 0.0
+
     else:
 
         frequency_std = 0.0
         frequency_median = 0.0
+        frequency_bimodality = 0.0
 
     # --------------------------------------------------------
     # Amplitude distribution
@@ -184,6 +207,26 @@ def extract_modulation_features(samples, sample_rate):
         )
     )
 
+    # --------------------------------------------------------
+    # Amplitude bimodality (OOK/ASK discriminator).
+    #
+    # Pearson-style separation of the two dominant magnitude
+    # clusters: |mean(high half) - mean(low half)| / std.
+    # Large for on/off keying, small for phase/FSK schemes.
+    # --------------------------------------------------------
+
+    if amplitude_p50 > 1e-12 and amplitude_std > 1e-12:
+        above = amplitude[amplitude >= amplitude_p50]
+        below = amplitude[amplitude < amplitude_p50]
+        if above.size and below.size:
+            amplitude_bimodality = float(
+                (above.mean() - below.mean()) / amplitude_std
+            )
+        else:
+            amplitude_bimodality = 0.0
+    else:
+        amplitude_bimodality = 0.0
+
     return {
         "amplitude_cv":
             float(amplitude_cv),
@@ -206,6 +249,9 @@ def extract_modulation_features(samples, sample_rate):
         "amplitude_std_ratio":
             float(amplitude_std_ratio),
 
+        "amplitude_bimodality":
+            float(amplitude_bimodality),
+
         "r2_phase_coherence":
             float(r2),
 
@@ -217,6 +263,9 @@ def extract_modulation_features(samples, sample_rate):
 
         "instantaneous_frequency_median_hz":
             float(frequency_median),
+
+        "instantaneous_frequency_bimodality":
+            float(frequency_bimodality),
     }
 
 
@@ -251,6 +300,26 @@ def classify_modulation(samples, sample_rate):
         "instantaneous_frequency_std_hz"
     ]
 
+    frequency_bimodality = features.get(
+        "instantaneous_frequency_bimodality",
+        0.0,
+    )
+
+    amplitude_bimodality = features.get(
+        "amplitude_bimodality",
+        0.0,
+    )
+
+    amplitude_p10 = features.get(
+        "amplitude_p10",
+        0.0,
+    )
+
+    amplitude_p90 = features.get(
+        "amplitude_p90",
+        1.0,
+    )
+
     # ========================================================
     # BFSK
     # ========================================================
@@ -270,6 +339,7 @@ def classify_modulation(samples, sample_rate):
         and freq_std >= 80
         and r2 < 0.55
         and r4 < 0.55
+        and frequency_bimodality >= 0.25
     ):
 
         return (
@@ -289,6 +359,10 @@ def classify_modulation(samples, sample_rate):
     # Strong frequency variation is characteristic of BFSK.
     # Exclude it here so noisy BFSK is not swallowed by the
     # broad 16-QAM amplitude rule.
+    #
+    # Constellation stage additionally excludes constant-magnitude
+    # signals (PSK family, magnitude_cv < 0.18), which are handled
+    # by the dedicated QPSK/8-PSK rules above.
     # ========================================================
 
     if (
@@ -307,6 +381,39 @@ def classify_modulation(samples, sample_rate):
 
 
     # ========================================================
+    # OOK / ASK: two very different magnitude levels.
+    #
+    # Checked BEFORE BPSK: single-sideband OOK (all samples on
+    # one half-plane) produces r2 ~ 1.0 just like BPSK, and
+    # band-limited OOK transitions can inflate r4 as well.
+    # The reliable discriminators are the magnitude structure:
+    #
+    # - amplitude_cv >= 0.5  (on/off levels far apart)
+    # - p10/p90 <= 0.25      (off-state near zero)
+    # - amplitude_bimodality >= 1.2 (two separated clusters)
+    #
+    # BPSK/QPSK/16-QAM/BFSK envelopes all keep CV below ~0.35
+    # and a p10/p90 ratio above ~0.3 (noise-free), so the gate
+    # cannot swallow them.
+    #
+    # NOTE: DC-centred OOK is mathematically identical to BPSK
+    # (two levels {0, A} centered -> {−A/2, +A/2}); the
+    # preprocessor's DC removal therefore makes such signals
+    # classify as BPSK. This is documented in docs/ARCHITECTURE.
+    # ========================================================
+
+    if (
+        cv >= 0.50
+        and (amplitude_p10 / (amplitude_p90 + 1e-12)) <= 0.25
+        and amplitude_bimodality >= 1.20
+    ):
+
+        return (
+            "OOK",
+            features
+        )
+
+    # ========================================================
     # BPSK
     # ========================================================
 
@@ -318,7 +425,14 @@ def classify_modulation(samples, sample_rate):
         )
 
     # ========================================================
-    # QPSK
+    # QPSK vs 8-PSK (waveform stage; both have r4 structure)
+    # ========================================================
+    #
+    # 8-PSK has EIGHT phase states, so its fourth-power
+    # coherence stays high but its phase histogram fills 8
+    # sectors; QPSK fills 4. We separate them using the
+    # normalized circular variance of the phase mod pi/2:
+    # QPSK phases collapse onto 2 values mod pi/2; 8-PSK onto 4.
     # ========================================================
 
     if r4 >= 0.55:
@@ -873,10 +987,12 @@ def classify_from_constellation(symbols):
     constellation geometry.
 
     BPSK:
-        Energy concentrated on one axis.
+        Energy concentrated along one straight line.
+        The line may be rotated by an arbitrary phase.
 
     QPSK:
-        Two symmetric levels on I and Q.
+        Two independent I/Q dimensions with two
+        symmetric levels.
 
     16-QAM:
         Four distinct levels on I and Q.
@@ -891,12 +1007,241 @@ def classify_from_constellation(symbols):
     ]
 
     # =========================================================
-    # BPSK
+    # Rotation-invariant BPSK check
+    # =========================================================
+    #
+    # BPSK symbols occupy one line through the origin.
+    # That line does not have to coincide with the I-axis.
+    #
+    # Therefore use PCA/eigenvalue structure rather than
+    # relying only on I/Q axis energy.
     # =========================================================
 
-    if axis_ratio < 0.20:
+    symbols_array = np.asarray(
+        symbols,
+        dtype=np.complex128,
+    )
+
+    if len(symbols_array) >= 3:
+
+        points = np.column_stack(
+            (
+                symbols_array.real,
+                symbols_array.imag,
+            )
+        )
+
+        points = (
+            points
+            - np.mean(points, axis=0)
+        )
+
+        covariance = np.cov(
+            points,
+            rowvar=False,
+        )
+
+        eigenvalues = np.linalg.eigvalsh(
+            covariance
+        )
+
+        eigenvalues = np.sort(
+            np.maximum(
+                eigenvalues,
+                0.0,
+            )
+        )
+
+        total_variance = float(
+            np.sum(eigenvalues)
+        )
+
+        if total_variance > 1e-12:
+            line_ratio = float(
+                eigenvalues[0]
+                / total_variance
+            )
+        else:
+            line_ratio = 1.0
+
+    else:
+        line_ratio = 1.0
+
+    features["rotation_invariant_line_ratio"] = (
+        line_ratio
+    )
+
+    # A genuine BPSK constellation is essentially
+    # one-dimensional, even when phase-rotated.
+    #
+    # The minor PCA variance should be very small
+    # compared with the total variance.
+    #
+    # OOK exception: OOK symbols also lie on one line
+    # through the origin, BUT both clusters sit on the
+    # SAME side (or one cluster collapses to ~zero).
+    # BPSK clusters straddle the origin symmetrically.
+    # We use the signed projections onto the dominant
+    # axis to separate the two cases before the BPSK
+    # shortcut fires.
+    #
+    # A Gaussian-like QPSK cluster at low SNR can also
+    # show a small line_ratio, but its projections stay
+    # bimodal-symmetric, which the OOK check rejects.
+
+    ook_detected = False
+
+    if line_ratio < 0.20 and len(symbols_array) >= 8:
+
+        cov = np.cov(
+            np.column_stack(
+                (symbols_array.real, symbols_array.imag)
+            ),
+            rowvar=False,
+        )
+
+        evals, evecs = np.linalg.eigh(cov)
+
+        dominant = evecs[
+            :, int(np.argmax(evals))
+        ]
+
+        centered = np.column_stack(
+            (
+                symbols_array.real,
+                symbols_array.imag,
+            )
+        ) - np.mean(
+            np.column_stack(
+                (
+                    symbols_array.real,
+                    symbols_array.imag,
+                )
+            ),
+            axis=0,
+        )
+
+        proj = centered @ dominant
+
+        proj_std = float(np.std(proj))
+
+        if proj_std > 1e-12:
+
+            positive_fraction = float(
+                np.mean(proj > 2.0 * proj_std)
+            )
+
+            negative_fraction = float(
+                np.mean(proj < -2.0 * proj_std)
+            )
+
+            # OOK: essentially all "far" symbols sit on
+            # ONE side (the on-cluster), while BPSK has
+            # far symbols on both sides.
+
+            far = positive_fraction + negative_fraction
+
+            if (
+                far >= 0.30
+                and (
+                    positive_fraction < 0.02
+                    or negative_fraction < 0.02
+                )
+            ):
+
+                ook_detected = True
+
+    if ook_detected:
+
+        return "OOK", features
+
+    if line_ratio < 0.20:
 
         return "BPSK", features
+
+    # =========================================================
+    # 8-PSK vs QPSK vs 16-QAM
+    # =========================================================
+    #
+    # 8-PSK symbol projections onto the I and Q axes look
+    # four-level (mimicking 16-QAM geometry), but the symbol
+    # MAGNITUDE is constant for PSK while it varies strongly
+    # for 16-QAM. Magnitude CV cleanly separates the two:
+    #
+    #   PSK (QPSK, 8-PSK): mag_cv ~ 0.05 at 20 dB SNR
+    #   16-QAM:            mag_cv ~ 0.30+
+    #
+    # For constant-magnitude constellations, the number of
+    # phase clusters modulo 90 degrees separates QPSK (2
+    # clusters at 45/135 deg) from 8-PSK (4 clusters at
+    # 22.5/67.5/112.5/157.5 deg).
+    # =========================================================
+
+    symbols_norm = symbols_array / (
+        np.sqrt(np.mean(np.abs(symbols_array) ** 2)) + 1e-12
+    )
+
+    magnitudes = np.abs(symbols_norm)
+
+    magnitude_cv = float(
+        np.std(magnitudes)
+        / (np.mean(magnitudes) + 1e-12)
+    )
+
+    features["magnitude_cv"] = magnitude_cv
+
+    if magnitude_cv < 0.18 and len(symbols_norm) >= 32:
+
+        # Constant-envelope family: count phase clusters mod pi/2
+        # with circular wraparound merging (a cluster at 0/90 deg is
+        # ONE cluster). QPSK: 1 cluster (45 deg); 8-PSK: 2 clusters
+        # (22.5 and 67.5 deg); BPSK: 1 cluster (0 deg).
+
+        phases_mod = np.angle(symbols_norm) % (np.pi / 2.0)
+
+        bins = 90
+        histogram, _ = np.histogram(
+            phases_mod,
+            bins=bins,
+            range=(0.0, np.pi / 2.0),
+        )
+
+        if histogram.max() > 0:
+
+            # Threshold relative to the MEDIAN of occupied bins (not
+            # the max): a phase-locked 8-PSK constellation spreads its
+            # energy across two nearly equal clusters, where a max-based
+            # threshold would mark everything as background.
+            nonempty = histogram[histogram > 0]
+            median_count = float(np.median(nonempty))
+
+            occupied = (
+                histogram > max(1.5 * median_count, 0.2 * histogram.max())
+            ).astype(int)
+
+            # Dilate to bridge noise-smeared bins within one cluster.
+            for _ in range(3):
+                occupied = (
+                    occupied
+                    | np.roll(occupied, 1)
+                    | np.roll(occupied, -1)
+                )
+
+            # Count rising edges, treating the histogram as circular.
+            rising = int(
+                np.sum(occupied[1:] & ~occupied[:-1])
+            )
+            if occupied[0] and occupied[-1]:
+                rising = 1 if rising <= 1 else rising - 1
+
+            features["phase_clusters_mod_90deg"] = rising
+
+            if rising >= 2 and rising <= 3:
+
+                return "8-PSK", features
+
+            # QPSK falls through to the existing QPSK rule below,
+            # which validates the two-level I/Q structure.
 
     # =========================================================
     # 16-QAM
@@ -932,27 +1277,20 @@ def classify_from_constellation(symbols):
         features["q_spacing_ratio"] > 0.45
     )
 
-    # A genuine 16-QAM constellation needs
-    # four levels on both axes and the 2-level
-    # model should leave significant error.
-
-    # Compare the 2-level and 4-level models.
-    #
-    # In noisy QPSK, the clustering algorithm may create
-    # four artificial levels, but the 2-level model is still
-    # significantly better than the 4-level model.
-    #
-    # Genuine 16-QAM should benefit much more from the
-    # four-level representation.
-
     i_four_level_advantage = (
         features["i_error_4"]
-        / max(features["i_error_2"], 1e-12)
+        / max(
+            features["i_error_2"],
+            1e-12,
+        )
     )
 
     q_four_level_advantage = (
         features["q_error_4"]
-        / max(features["q_error_2"], 1e-12)
+        / max(
+            features["q_error_2"],
+            1e-12,
+        )
     )
 
     genuine_four_level_structure = (
@@ -972,6 +1310,7 @@ def classify_from_constellation(symbols):
         and features["q_error_2"] > 0.05
         and genuine_four_level_structure
     ):
+
         return "16-QAM", features
 
     # =========================================================
@@ -1007,16 +1346,6 @@ def classify_from_constellation(symbols):
     q_symmetry_good = (
         features["q_two_symmetry"] > 0.85
     )
-
-    # IMPORTANT:
-    # Do NOT require i_levels == 2 here.
-    #
-    # Noisy QPSK can be split into four artificial
-    # clusters by the 4-level k-means model.
-    #
-    # Instead, the dedicated 2-level model tells us
-    # whether the underlying constellation has two
-    # symmetric levels.
 
     if (
         axis_ratio > 0.45

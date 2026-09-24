@@ -6,7 +6,7 @@ from prototype.demodulation.qpsk_sync import (
 )
 
 
-def main():
+def test_test_qpsk_phase_resolution():
 
     print("=" * 70)
     print("SPECTRA V2 QPSK PHASE AMBIGUITY TEST")

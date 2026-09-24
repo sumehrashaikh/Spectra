@@ -45,7 +45,7 @@ def generate_bpsk(
     return baseband * carrier
 
 
-def main():
+def test_test_synchronizer():
 
     print("=" * 70)
     print("V2 SYNCHRONIZATION TEST")

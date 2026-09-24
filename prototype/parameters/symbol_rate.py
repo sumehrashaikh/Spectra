@@ -496,6 +496,386 @@ def estimate_symbol_rate_from_cyclostationarity(
     )
 
 
+def estimate_symbol_rate_delay_multiply(
+    samples: np.ndarray,
+    sample_rate: float,
+    min_symbol_rate: float,
+    max_symbol_rate: float,
+    lag_samples: int = 1,
+) -> SymbolRateEstimate:
+    """
+    Estimate symbol rate using the delay-and-multiply method.
+
+    ``w[n] = x[n] * conj(x[n - lag])`` is a cyclostationary process
+    whose spectrum contains discrete lines at integer multiples of
+    the symbol rate. Unlike the ``|x|^2`` method this also works for
+    constant-envelope signals (e.g. rectangular/unshaped PSK) whose
+    squared magnitude carries no symbol-rate periodicity.
+    """
+
+    samples = np.asarray(
+        samples,
+        dtype=np.complex128,
+    )
+
+    if samples.size < 128:
+        raise ValueError(
+            "Not enough samples for symbol-rate estimation."
+        )
+
+    if sample_rate <= 0:
+        raise ValueError(
+            "sample_rate must be positive."
+        )
+
+    if min_symbol_rate <= 0:
+        raise ValueError(
+            "min_symbol_rate must be positive."
+        )
+
+    if max_symbol_rate <= min_symbol_rate:
+        raise ValueError(
+            "max_symbol_rate must be greater than "
+            "min_symbol_rate."
+        )
+
+    lag = max(1, int(lag_samples))
+    if lag >= samples.size - 1:
+        raise ValueError(
+            "lag_samples is too large for the provided signal."
+        )
+
+    x = samples - np.mean(samples)
+
+    delay_product = (
+        x[lag:]
+        * np.conj(x[:-lag])
+    )
+
+    delay_product = delay_product - np.mean(delay_product)
+
+    n = delay_product.size
+
+    spectrum = np.fft.fft(delay_product)
+
+    frequencies = np.fft.fftfreq(
+        n,
+        d=1.0 / sample_rate,
+    )
+
+    power = np.abs(spectrum) ** 2
+
+    valid = (
+        (frequencies >= min_symbol_rate)
+        & (frequencies <= max_symbol_rate)
+    )
+
+    if not np.any(valid):
+        raise RuntimeError(
+            "No valid symbol-rate candidates found."
+        )
+
+    valid_indices = np.flatnonzero(valid)
+
+    local_maxima = []
+
+    for index in valid_indices:
+
+        if index == 0 or index >= len(power) - 1:
+            continue
+
+        if (
+            power[index]
+            >= power[index - 1]
+            and power[index]
+            >= power[index + 1]
+        ):
+            local_maxima.append(index)
+
+    if not local_maxima:
+        local_maxima = [
+            valid_indices[
+                np.argmax(
+                    power[valid_indices]
+                )
+            ]
+        ]
+
+    local_maxima.sort(
+        key=lambda index: power[index],
+        reverse=True,
+    )
+
+    strongest_index = local_maxima[0]
+
+    strongest_frequency = abs(
+        float(
+            frequencies[strongest_index]
+        )
+    )
+
+    strongest_power = float(
+        power[strongest_index]
+    )
+
+    if strongest_power <= 0:
+        return SymbolRateEstimate(
+            symbol_rate=0.0,
+            samples_per_symbol=0.0,
+            confidence=0.0,
+            method="delay_multiply",
+        )
+
+    # Harmonic-aware selection: prefer a subharmonic of the
+    # strongest line when it retains significant energy, since
+    # the strongest line may be a harmonic of the symbol rate.
+    selected_frequency = strongest_frequency
+    selected_power = strongest_power
+
+    for harmonic in range(2, 9):
+
+        candidate_frequency = (
+            strongest_frequency
+            / harmonic
+        )
+
+        if candidate_frequency < min_symbol_rate:
+            continue
+
+        if candidate_frequency > max_symbol_rate:
+            continue
+
+        index = int(
+            np.argmin(
+                np.abs(
+                    frequencies
+                    - candidate_frequency
+                )
+            )
+        )
+
+        candidate_power = float(
+            power[index]
+        )
+
+        if (
+            candidate_power
+            >= selected_power * 0.10
+        ):
+            selected_frequency = (
+                float(frequencies[index])
+            )
+            selected_power = (
+                candidate_power
+            )
+
+    floor = float(
+        np.median(
+            power[valid_indices]
+        )
+    )
+
+    if floor <= 0:
+        confidence = 100.0
+    else:
+        ratio = (
+            selected_power
+            / floor
+        )
+
+        confidence = min(
+            100.0,
+            max(
+                0.0,
+                100.0
+                * (
+                    1
+                    - 1 / max(
+                        ratio,
+                        1.0,
+                    )
+                ),
+            ),
+        )
+
+    return SymbolRateEstimate(
+        symbol_rate=float(
+            selected_frequency
+        ),
+        samples_per_symbol=float(
+            sample_rate
+            / selected_frequency
+        ),
+        confidence=float(
+            confidence
+        ),
+        method="delay_multiply",
+    )
+
+
+def estimate_symbol_rate_fsk(
+    samples: np.ndarray,
+    sample_rate: float,
+    min_symbol_rate: float = 10.0,
+    max_symbol_rate: float | None = None,
+) -> SymbolRateEstimate:
+    """
+    Estimate the symbol rate of a (binary) FSK signal.
+
+    Method ("fsk_run_length"):
+
+    1. Locate the two dominant spectral tones.
+    2. Build a binary tone-state sequence from the smoothed
+       instantaneous frequency.
+    3. The median run length of constant tone state equals one symbol
+       period for random data.
+
+    This method is intended for FSK where envelope-based
+    cyclostationary methods fail (FSK is constant-envelope).
+    """
+
+    samples = np.asarray(samples, dtype=np.complex128)
+
+    if samples.size < 256:
+        raise ValueError(
+            "Not enough samples for FSK symbol-rate estimation."
+        )
+
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive.")
+
+    if max_symbol_rate is None:
+        max_symbol_rate = sample_rate / 4.0
+
+    if not 0 < min_symbol_rate < max_symbol_rate:
+        raise ValueError(
+            "Require 0 < min_symbol_rate < max_symbol_rate."
+        )
+
+    # ---------------------------------------------------------
+    # 1. Two dominant tones from the windowed PSD
+    # ---------------------------------------------------------
+
+    window = np.hanning(samples.size)
+    spectrum = np.fft.fftshift(np.fft.fft(samples * window))
+    frequencies = np.fft.fftshift(
+        np.fft.fftfreq(samples.size, d=1.0 / sample_rate)
+    )
+    power = np.abs(spectrum) ** 2
+
+    from scipy.signal import find_peaks
+
+    prominence = float(np.max(power)) * 0.01
+    peaks, _ = find_peaks(power, prominence=prominence, distance=4)
+
+    if peaks.size < 2:
+        raise RuntimeError(
+            "Could not identify two FSK tones in the spectrum."
+        )
+
+    strongest = peaks[np.argsort(power[peaks])[::-1][:2]]
+    tone_frequencies = sorted(
+        float(frequencies[i]) for i in strongest
+    )
+
+    f_low, f_high = tone_frequencies
+    midpoint = (f_low + f_high) / 2.0
+
+    # ---------------------------------------------------------
+    # 2. Binary tone-state sequence from instantaneous frequency
+    # ---------------------------------------------------------
+
+    phase = np.unwrap(np.angle(samples))
+    inst_freq = np.diff(phase) * sample_rate / (2.0 * np.pi)
+
+    smoothing = max(
+        1,
+        int(sample_rate / max_symbol_rate / 2),
+    )
+
+    if smoothing > 1:
+        kernel = np.ones(smoothing) / smoothing
+        inst_freq = np.convolve(inst_freq, kernel, mode="same")
+
+    state = (
+        inst_freq > midpoint
+    ).astype(np.uint8)
+
+    # ---------------------------------------------------------
+    # 3. Run lengths of the constant-state sequence
+    # ---------------------------------------------------------
+
+    change_points = np.flatnonzero(np.diff(state)) + 1
+    boundaries = np.concatenate(
+        [
+            np.array([0]),
+            change_points,
+            np.array([state.size]),
+        ]
+    )
+    run_lengths = np.diff(boundaries)
+
+    # Discard edge fragments.
+    run_lengths = run_lengths[1:-1] if run_lengths.size > 2 else run_lengths
+
+    usable = run_lengths[
+        run_lengths >= sample_rate / max_symbol_rate
+    ]
+
+    if usable.size < 8:
+        raise RuntimeError(
+            "Too few stable FSK tone runs to estimate the symbol rate."
+        )
+
+    median_run = float(np.median(usable))
+
+    if median_run <= 0:
+        raise RuntimeError(
+            "Invalid median run length in FSK symbol-rate estimation."
+        )
+
+    # Refine using single-symbol runs only: their mean is an unbiased
+    # estimate of the true symbol length (multi-symbol runs are sums of
+    # symbols and the median alone quantizes to the sample grid, whose
+    # bias accumulates into symbol-boundary drift during demodulation).
+    single_runs = usable[usable < 1.5 * median_run]
+
+    if single_runs.size >= 4:
+        refined_run = float(np.mean(single_runs))
+    else:
+        refined_run = median_run
+
+    if refined_run <= 0:
+        raise RuntimeError(
+            "Invalid refined run length in FSK symbol-rate estimation."
+        )
+
+    symbol_rate = sample_rate / refined_run
+
+    if not min_symbol_rate <= symbol_rate <= max_symbol_rate:
+        raise RuntimeError(
+            f"FSK symbol-rate estimate {symbol_rate:.2f} Hz lies "
+            f"outside the configured range."
+        )
+
+    # Confidence: fraction of runs consistent with integer multiples of
+    # the median run (real symbols merge into 1, 2, 3, ... symbol runs).
+    multiples = np.maximum(1, np.round(usable / median_run))
+    residuals = np.abs(usable - multiples * median_run) / median_run
+    consistency = float(np.mean(residuals <= 0.25))
+
+    confidence = float(
+        np.clip(100.0 * consistency, 0.0, 100.0)
+    )
+
+    return SymbolRateEstimate(
+        symbol_rate=float(symbol_rate),
+        samples_per_symbol=float(refined_run),
+        confidence=confidence,
+        method="fsk_run_length",
+    )
+
+
 def estimate_symbol_rate(
     samples: np.ndarray,
     sample_rate: float,
@@ -504,16 +884,73 @@ def estimate_symbol_rate(
 ) -> SymbolRateEstimate:
     """
     Public symbol-rate estimation API.
+
+    Uses the delay-and-multiply method as the primary estimator
+    (works for both pulse-shaped and constant-envelope signals)
+    and cross-checks against the ``|x|^2`` cyclostationary method.
+    Agreement between methods increases the reported confidence;
+    disagreement is reported honestly by keeping the lower
+    combined confidence.
     """
 
     if max_symbol_rate is None:
         max_symbol_rate = sample_rate / 4.0
 
-    return (
-        estimate_symbol_rate_from_cyclostationarity(
-            samples,
-            sample_rate,
-            min_symbol_rate,
-            max_symbol_rate,
+    try:
+        primary = (
+            estimate_symbol_rate_delay_multiply(
+                samples,
+                sample_rate,
+                min_symbol_rate,
+                max_symbol_rate,
+            )
         )
+    except (RuntimeError, ValueError):
+        primary = None
+
+    try:
+        cross_check = (
+            estimate_symbol_rate_from_cyclostationarity(
+                samples,
+                sample_rate,
+                min_symbol_rate,
+                max_symbol_rate,
+            )
+        )
+    except (RuntimeError, ValueError):
+        cross_check = None
+
+    if primary is None and cross_check is None:
+        # Preserve input-validation errors (ValueError) distinctly from
+        # estimation failures (RuntimeError).
+        raise ValueError(
+            "Symbol-rate estimation failed: input is too short or invalid."
+        )
+
+    if primary is None:
+        return cross_check
+
+    if cross_check is None or cross_check.symbol_rate <= 0:
+        return primary
+
+    tolerance = max(
+        0.02 * primary.symbol_rate,
+        sample_rate / 65536.0,
     )
+
+    if abs(
+        primary.symbol_rate
+        - cross_check.symbol_rate
+    ) <= tolerance:
+
+        return SymbolRateEstimate(
+            symbol_rate=primary.symbol_rate,
+            samples_per_symbol=primary.samples_per_symbol,
+            confidence=max(
+                primary.confidence,
+                cross_check.confidence,
+            ),
+            method="delay_multiply+cyclostationarity",
+        )
+
+    return primary

@@ -230,3 +230,64 @@ def create_constellation_figure(
     ax.axis("equal")
 
     return figure
+
+
+def create_symbol_constellation_figure(
+    symbols,
+    max_points=4096,
+    title="Recovered Constellation",
+):
+    """Constellation of synchronized hard-decision symbols.
+
+    Unlike the raw-IQ scatter, this shows the recovered symbol lattice
+    after synchronization: for a correctly demodulated signal the
+    points cluster on the ideal grid, which is the visual quality
+    signal for the whole receive chain.
+    """
+
+    symbols = np.asarray(symbols, dtype=np.complex128)
+
+    if symbols.size == 0:
+        raise ValueError("No symbols to plot.")
+
+    count = min(symbols.size, max_points)
+
+    iq = symbols[:count]
+
+    figure = Figure(
+        figsize=(5, 4),
+        tight_layout=True,
+    )
+
+    ax = figure.add_subplot(111)
+
+    ax.scatter(
+        iq.real,
+        iq.imag,
+        s=8,
+        alpha=0.6,
+    )
+
+    # Equal aspect keeps the lattice geometry readable regardless of
+    # modulation order; no ideal-grid overlay is drawn here because
+    # the point set depends on the classified constellation, not on a
+    # fixed assumption.
+    rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
+
+    if rms > 1e-12:
+
+        limit = 1.6 * rms
+
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+
+    ax.axhline(0, linestyle="--", color="0.6", linewidth=0.7)
+    ax.axvline(0, linestyle="--", color="0.6", linewidth=0.7)
+
+    ax.set_title(title)
+    ax.set_xlabel("I")
+    ax.set_ylabel("Q")
+    ax.grid(True)
+    ax.set_aspect("equal", adjustable="box")
+
+    return figure

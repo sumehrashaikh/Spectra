@@ -24,6 +24,16 @@ class SignalParameters:
     sample_rate: float
     duration: float
 
+    # Professional measures (None when not measurable).
+    bandwidth_3db: float | None = None
+    bandwidth_6db: float | None = None
+    bandwidth_99: float | None = None       # 99% occupied bandwidth
+    papr_db: float | None = None            # peak-to-average power ratio
+    crest_factor: float | None = None       # peak / rms amplitude
+    dynamic_range_db: float | None = None   # peak sample vs noise floor
+    mean_amplitude: float | None = None
+    dc_offset: float | None = None
+
 
 def compute_spectrum(
     samples: np.ndarray,
@@ -319,6 +329,71 @@ def estimate_snr(
     )
 
 
+def estimate_bandwidths_at(
+    samples: np.ndarray,
+    sample_rate: float,
+) -> dict[str, float | None]:
+    """
+    Measure occupied bandwidths from the power spectrum.
+
+    Returns 3 dB / 6 dB bandwidths (measured down from the peak) and
+    the 99% occupied bandwidth (integrated power containment), all in
+    Hz. Values are None when the spectrum is degenerate (flat/noisy).
+    """
+
+    samples = np.asarray(samples, dtype=np.complex128)
+
+    if samples.size < 16:
+        return {"bandwidth_3db": None, "bandwidth_6db": None, "bandwidth_99": None}
+
+    power = np.abs(np.fft.fftshift(np.fft.fft(samples))) ** 2
+    power /= power.max()
+
+    freqs = np.fft.fftshift(
+        np.fft.fftfreq(samples.size, d=1.0 / sample_rate)
+    )
+
+    peak_index = int(np.argmax(power))
+    peak_power = power[peak_index]
+
+    if peak_power <= 0:
+        return {"bandwidth_3db": None, "bandwidth_6db": None, "bandwidth_99": None}
+
+    def width_below(ratio: float) -> float | None:
+        mask = power >= peak_power * ratio
+        # Contiguous run around the peak.
+        if not mask[peak_index]:
+            return None
+        left = peak_index
+        while left > 0 and mask[left - 1]:
+            left -= 1
+        right = peak_index
+        while right < mask.size - 1 and mask[right + 1]:
+            right += 1
+        return float(freqs[right] - freqs[left])
+
+    bw3 = width_below(0.5)       # -3 dB
+    bw6 = width_below(0.251)     # -6 dB
+
+    # 99% occupied bandwidth: grow outward from the peak until the
+    # integrated contained power reaches 99% of the total.
+    total = float(power.sum())
+    order = np.argsort(-power)
+    cumulative = np.cumsum(power[order]) / max(total, 1e-30)
+    if cumulative[-1] < 0.99:
+        bw99 = None
+    else:
+        count = int(np.searchsorted(cumulative, 0.99)) + 1
+        selected = order[:count]
+        bw99 = float(freqs[selected].max() - freqs[selected].min())
+
+    return {
+        "bandwidth_3db": bw3,
+        "bandwidth_6db": bw6,
+        "bandwidth_99": bw99,
+    }
+
+
 def extract_parameters(
     signal: Signal,
     noise_power: float | None = None,
@@ -366,6 +441,30 @@ def extract_parameters(
         noise_power=noise_power,
     )
 
+    bandwidths = estimate_bandwidths_at(
+        signal.samples,
+        signal.sample_rate,
+    )
+
+    magnitudes = np.abs(signal.samples)
+    mean_amplitude = float(np.mean(magnitudes))
+    crest = (
+        float(peak / rms)
+        if rms > 1e-12
+        else None
+    )
+    papr = (
+        float(10.0 * np.log10(peak ** 2 / power))
+        if power > 1e-30 and peak > 0
+        else None
+    )
+    dynamic_range = (
+        float(10.0 * np.log10(peak ** 2 / max(float(noise_power), 1e-30)))
+        if peak > 0
+        else None
+    )
+    dc_offset = complex(np.mean(signal.samples))
+
     return SignalParameters(
         center_frequency=center_frequency,
         peak_frequency=peak_frequency,
@@ -378,6 +477,14 @@ def extract_parameters(
         num_samples=signal.num_samples,
         sample_rate=signal.sample_rate,
         duration=signal.duration,
+        bandwidth_3db=bandwidths["bandwidth_3db"],
+        bandwidth_6db=bandwidths["bandwidth_6db"],
+        bandwidth_99=bandwidths["bandwidth_99"],
+        papr_db=papr,
+        crest_factor=crest,
+        dynamic_range_db=dynamic_range,
+        mean_amplitude=mean_amplitude,
+        dc_offset=abs(dc_offset),
     )
 
 

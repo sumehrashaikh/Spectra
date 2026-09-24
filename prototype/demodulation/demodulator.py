@@ -10,6 +10,7 @@ from prototype.modulation.demodulator import (
     demodulate_qam16,
     demodulate_bfsk,
     qpsk_decision,
+    refine_qam16_phase,
     calculate_ber as v1_calculate_ber,
 )
 
@@ -156,30 +157,11 @@ def demodulate_qpsk_synchronized(
     """
     Demodulate already synchronized QPSK symbols.
 
-    IMPORTANT:
-    The carrier and timing synchronization stages
-    have already been performed.
+    Carrier and timing synchronization, including any known
+    preamble-based phase correction, have already been performed.
 
-    Therefore this function does NOT perform another
-    blind carrier-phase estimation.
-
-    The four possible QPSK phase orientations are
-    evaluated:
-
-        0°
-        90°
-        180°
-        270°
-
-    The orientation producing the strongest decision
-    margin is selected.
-
-    Note:
-    Without a known preamble/reference sequence,
-    absolute QPSK phase ambiguity cannot be resolved
-    from the constellation alone. The selected
-    orientation is therefore the internally most
-    consistent one.
+    Therefore this function performs only the QPSK symbol decision.
+    It does NOT attempt another blind phase-ambiguity resolution.
     """
 
     symbols = np.asarray(
@@ -192,63 +174,20 @@ def demodulate_qpsk_synchronized(
             "No synchronized QPSK symbols supplied."
         )
 
-    rotations = np.deg2rad(
-        np.array(
-            [0.0, 90.0, 180.0, 270.0]
-        )
-    )
-
-    candidates = []
-
-    for rotation in rotations:
-
-        bits, decisions, margin, rotated = (
-            _qpsk_decide_with_rotation(
-                symbols,
-                rotation,
-            )
-        )
-
-        candidates.append(
-            {
-                "rotation": float(rotation),
-                "bits": bits,
-                "decision_symbols": decisions,
-                "margin": float(margin),
-                "rotated_symbols": rotated,
-            }
-        )
-
-    best = max(
-        candidates,
-        key=lambda item: item["margin"],
+    bits, decision_symbols, margin = qpsk_decision(
+        symbols
     )
 
     return {
-        "bits": best["bits"],
-        "decision_symbols": best[
-            "decision_symbols"
-        ],
-        "decision_margin": best["margin"],
-        "num_symbols": int(
-            len(symbols)
-        ),
-        "num_bits": int(
-            len(best["bits"])
-        ),
-        "phase_ambiguity_rotation_rad": best[
-            "rotation"
-        ],
-        "phase_ambiguity_rotation_deg": float(
-            np.rad2deg(
-                best["rotation"]
-            )
-        ),
-        "corrected_symbols": best[
-            "rotated_symbols"
-        ],
+        "bits": bits,
+        "decision_symbols": decision_symbols,
+        "decision_margin": float(margin),
+        "num_symbols": int(len(symbols)),
+        "num_bits": int(len(bits)),
+        "phase_ambiguity_rotation_rad": 0.0,
+        "phase_ambiguity_rotation_deg": 0.0,
+        "corrected_symbols": symbols,
     }
-
 
 def demodulate_signal(
     signal: Signal,
@@ -456,8 +395,17 @@ def demodulate_signal(
             samples_per_symbol
         )
 
+        # The synchronized stream may still carry an arbitrary blind
+        # carrier-phase rotation: the M-th power estimator is tuned for
+        # constant-envelope PSK and is unreliable on amplitude-modulated
+        # 16-QAM (observed ~30-degree errors even on clean captures).
+        # Refine the phase decision-directed before symbol decisions.
+        refined_samples, phase_rotation_rad, converged = refine_qam16_phase(
+            signal.samples
+        )
+
         result = demodulate_qam16(
-            signal.samples,
+            refined_samples,
             samples_per_symbol,
             timing_offset,
         )
@@ -485,6 +433,12 @@ def demodulate_signal(
                 ),
                 "timing_offset": float(
                     timing_offset
+                ),
+                "phase_refinement_rad": float(
+                    phase_rotation_rad
+                ),
+                "phase_refinement_converged": bool(
+                    converged
                 ),
             },
         )
@@ -546,6 +500,99 @@ def demodulate_signal(
                 ),
                 "samples_per_symbol": float(
                     samples_per_symbol
+                ),
+            },
+        )
+
+    # ---------------------------------------------------------
+    # 8-PSK
+    # ---------------------------------------------------------
+
+    if modulation == "8-PSK":
+
+        from prototype.modulation.digital import demodulate_psk8
+
+        if samples_per_symbol is None:
+            raise ValueError(
+                "8-PSK requires samples_per_symbol."
+            )
+
+        _validate_sps(
+            samples_per_symbol
+        )
+
+        result = demodulate_psk8(
+            signal.samples,
+            samples_per_symbol,
+            timing_offset,
+        )
+
+        return DemodulationResult(
+            modulation="8-PSK",
+            bits=result["bits"],
+            num_bits=result["num_bits"],
+            num_symbols=result["num_symbols"],
+            decision_margin=result[
+                "decision_margin"
+            ],
+            metadata={
+                "symbols": result["symbols"],
+                "decision_symbols": result[
+                    "decision_symbols"
+                ],
+                "phase_estimate_rad": result[
+                    "phase_estimate_rad"
+                ],
+                "samples_per_symbol": float(
+                    samples_per_symbol
+                ),
+                "timing_offset": float(
+                    timing_offset
+                ),
+            },
+        )
+
+    # ---------------------------------------------------------
+    # OOK / ASK
+    # ---------------------------------------------------------
+
+    if modulation in ("OOK", "ASK"):
+
+        from prototype.modulation.digital import demodulate_ook
+
+        if samples_per_symbol is None:
+            raise ValueError(
+                "OOK requires samples_per_symbol."
+            )
+
+        _validate_sps(
+            samples_per_symbol
+        )
+
+        result = demodulate_ook(
+            signal.samples,
+            samples_per_symbol,
+            timing_offset,
+        )
+
+        return DemodulationResult(
+            modulation=modulation,
+            bits=result["bits"],
+            num_bits=result["num_bits"],
+            num_symbols=result["num_symbols"],
+            decision_margin=result[
+                "decision_margin"
+            ],
+            metadata={
+                "symbols": result["symbols"],
+                "decision_symbols": result[
+                    "decision_symbols"
+                ],
+                "samples_per_symbol": float(
+                    samples_per_symbol
+                ),
+                "timing_offset": float(
+                    timing_offset
                 ),
             },
         )

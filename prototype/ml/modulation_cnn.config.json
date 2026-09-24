@@ -1,0 +1,52 @@
+{
+  "class_name": "Sequential",
+  "input_shape": [
+    512,
+    2
+  ],
+  "num_classes": 16,
+  "labels": [
+    "class_00",
+    "class_01",
+    "class_02",
+    "class_03",
+    "class_04",
+    "class_05",
+    "class_06",
+    "class_07",
+    "class_08",
+    "class_09",
+    "class_10",
+    "class_11",
+    "class_12",
+    "class_13",
+    "class_14",
+    "class_15"
+  ],
+  "labels_source": "neutral (unlabeled model)",
+  "normalization": "unit_rms",
+  "batch_norm_epsilon": 0.001,
+  "conv_padding": "valid",
+  "pooling": "max, stride 2",
+  "activation_head": "softmax",
+  "keras_version": "3.15.0",
+  "date_saved": "2026-09-19@03:26:23",
+  "architecture": [
+    "InputLayer",
+    "Conv1D(64, k=[7])",
+    "BatchNormalization",
+    "MaxPooling1D",
+    "Conv1D(128, k=[5])",
+    "BatchNormalization",
+    "MaxPooling1D",
+    "Conv1D(256, k=[3])",
+    "BatchNormalization",
+    "MaxPooling1D",
+    "Flatten",
+    "Dense(256)",
+    "Dropout",
+    "Dense(16)"
+  ],
+  "self_check_max_diff": 1.4901161193847656e-08,
+  "note": "Converted from a Keras pickle without unpickling; the training dataset and label map were not embedded in the file. Treat outputs as uncalibrated until validated."
+}

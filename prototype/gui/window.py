@@ -1,6 +1,8 @@
 import numpy as np
 from pathlib import Path
 
+from prototype.core.logging_config import logger
+
 from prototype.core.timing import recover_symbol_timing, sample_symbols
 from prototype.core.bpsk import demodulate_bpsk
 from prototype.core.ber import load_transmitted_bits, validate_bpsk_bits
@@ -8,17 +10,19 @@ from prototype.core.ber import load_transmitted_bits, validate_bpsk_bits
 from prototype.modulation.demodulator import (
 demodulate_qpsk,
 qpsk_decision,
-demodulate_qam16,
 qam16_decision,
 demodulate_bfsk,
 )
 
-# V1 synthetic BFSK test profile.
+# V1 synthetic BFSK test profile (only used for the legacy BFSK flow).
 BFSK_FREQ_0 = 500.0
 BFSK_FREQ_1 = 700.0
 BFSK_SYMBOL_RATE = 100.0
 
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QProgressBar
+from PySide6.QtWidgets import QInputDialog
+from prototype.gui.worker import AnalysisWorker
 from prototype.core.selected_analyzer import (
 analyze_selected_signal as run_selected_analysis
 )
@@ -27,7 +31,10 @@ from prototype.modulation.classifier import (
 classify_modulation
 )
 from prototype.core.isolator import isolate_signal
+from prototype.core.signal import Signal
 from PySide6.QtWidgets import (
+QCheckBox,
+QComboBox,
 QFrame,
 QFileDialog,
 QGridLayout,
@@ -56,6 +63,8 @@ from prototype.core.analyzer import (
 analyze_signal,
 basic_stats,
 )
+
+from prototype.fec import list_schemes as list_fec_schemes
 
 from prototype.core.loader import load_wav
 
@@ -174,6 +183,15 @@ class MainWindow(QMainWindow):
         # Generic BER state for the GUI
         self.ber_validation = None
 
+        # V2 pipeline per-candidate summaries
+        self._pipeline_demod_summary = None
+        self._pipeline_ber_summary = None
+        self._pipeline_sync_summary = None
+        self._pipeline_fec_summary = None
+        self._pipeline_ml_summary = None
+        self._pipeline_candidates = None  # batch: full candidate payload list
+        self._pipeline_candidate_index = None
+
         self.modulation_result = "Unknown"
         self.modulation_features = {}
 
@@ -183,6 +201,15 @@ class MainWindow(QMainWindow):
         # Currently selected signal
         self.selected_signal = None
         self.selected_analysis = None
+
+        # V2 pipeline background worker + results
+        self.pipeline_worker = None
+        self.pipeline_result = None
+        self.pipeline_mode = "balanced"
+
+        # Last analysis provenance (stage timings, versions) — captured
+        # at result-apply time and shown via "Provenance".
+        self._pipeline_provenance = None
 
         # ----------------------------------------------------
         # Window
@@ -289,6 +316,57 @@ class MainWindow(QMainWindow):
         self.clear_analysis
         )
 
+        self.mode_combo = QComboBox()
+
+        self.mode_combo.addItems(
+        ["balanced", "quick", "deep", "realtime"]
+        )
+
+        self.mode_combo.setCurrentText("balanced")
+
+        self.mode_combo.setToolTip(
+        "Processing preset: quick (fast FFT/basic), balanced (full DSP), "
+        "deep (extra cross-checks), realtime (streaming optimized)"
+        )
+
+        self.batch_checkbox = QCheckBox("Analyze all candidates")
+
+        self.batch_checkbox.setToolTip(
+        "Run the full V2 pipeline on every detected candidate "
+        "(multi-signal analysis) instead of just the strongest"
+        )
+
+        # The CNN is supplementary evidence: it never overrides the
+        # rule-based DSP classification, so it is an opt-in toggle.
+        self.ml_checkbox = QCheckBox("ML assist (CNN)")
+
+        self.ml_checkbox.setToolTip(
+        "Score the signal with a convolutional neural network in "
+        "addition to the rule-based classifier. The CNN's prediction "
+        "is reported alongside the DSP result, never instead of it."
+        )
+
+        # FEC decoding is explicit configuration, never guessed by the
+        # pipeline; the selector maps 1:1 onto the FEC framework.
+        self.fec_combo = QComboBox()
+
+        self.fec_combo.addItem("none")
+
+        self.fec_combo.addItems(
+        sorted(list_fec_schemes())
+        )
+
+        self.fec_combo.setToolTip(
+        "Forward error correction applied to demodulated bits. "
+        "FEC is never guessed: pick the scheme the transmitter used."
+        )
+
+        button_layout.addWidget(QLabel("FEC:"))
+
+        button_layout.addWidget(
+        self.fec_combo
+        )
+
         button_layout.addWidget(
         self.open_button
         )
@@ -329,6 +407,20 @@ class MainWindow(QMainWindow):
         self.isolate_button
         )
 
+        button_layout.addWidget(QLabel("Mode:"))
+
+        button_layout.addWidget(
+        self.mode_combo
+        )
+
+        button_layout.addWidget(
+        self.batch_checkbox
+        )
+
+        button_layout.addWidget(
+        self.ml_checkbox
+        )
+
         button_layout.addWidget(
         self.clear_button
         )
@@ -337,6 +429,69 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(
         button_layout
+        )
+
+        # ====================================================
+        # PROGRESS + EXPORT BAR
+        # ====================================================
+
+        progress_layout = QHBoxLayout()
+
+        self.progress_bar = QProgressBar()
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        self.progress_bar.setTextVisible(False)
+
+        self.progress_bar.setMaximumHeight(10)
+
+        self.progress_bar.setToolTip(
+        "Indeterminate while the pipeline runs on the background thread"
+        )
+
+        self.export_json_button = QPushButton("Export JSON")
+
+        self.export_json_button.clicked.connect(
+        self.export_result_json
+        )
+
+        self.export_json_button.setEnabled(False)
+
+        self.export_json_button.setToolTip(
+        "Save the full analysis payload (all stages, warnings, "
+        "provenance) as a JSON file"
+        )
+
+        self.provenance_button = QPushButton("Provenance")
+
+        self.provenance_button.clicked.connect(
+        self.show_provenance
+        )
+
+        self.provenance_button.setEnabled(False)
+
+        self.provenance_button.setToolTip(
+        "Per-stage timings, configuration, software versions and git "
+        "commit recorded by the last analysis"
+        )
+
+        progress_layout.addWidget(
+        self.progress_bar,
+        1,
+        )
+
+        progress_layout.addWidget(
+        self.export_json_button
+        )
+
+        progress_layout.addWidget(
+        self.provenance_button
+        )
+
+        main_layout.addLayout(
+        progress_layout
         )
 
         # ====================================================
@@ -596,6 +751,37 @@ class MainWindow(QMainWindow):
         self.signal_table
         )
 
+        # ----------------------------------------------------
+        # Batch candidate selector (visible in batch mode)
+        # ----------------------------------------------------
+
+        candidate_layout = QHBoxLayout()
+
+        candidate_layout.addWidget(QLabel("Analyzed candidate:"))
+
+        self.candidate_combo = QComboBox()
+
+        self.candidate_combo.setToolTip(
+        "Switch the detail panels between analyzed candidates "
+        "(batch mode)"
+        )
+
+        self.candidate_combo.setVisible(False)
+
+        self.candidate_combo.currentIndexChanged.connect(
+        self._on_candidate_selected
+        )
+
+        candidate_layout.addWidget(
+        self.candidate_combo
+        )
+
+        candidate_layout.addStretch()
+
+        content_layout.addLayout(
+        candidate_layout
+        )
+
         # ====================================================
         # SELECTED SIGNAL STATUS
         # ====================================================
@@ -798,6 +984,26 @@ class MainWindow(QMainWindow):
         "BER Validation: No reference loaded"
         )
 
+        self.parameter_decision_margin = QLabel(
+        "Decision Margin: —"
+        )
+
+        self.parameter_fec = QLabel(
+        "FEC: —"
+        )
+
+        self.parameter_sync_freq = QLabel(
+        "Freq Offset: —"
+        )
+
+        self.parameter_sync_phase = QLabel(
+        "Phase Offset: —"
+        )
+
+        self.parameter_ml = QLabel(
+        "ML Prediction: off"
+        )
+
         self.parameter_selected = QLabel(
         "Selected Signal: —"
         )
@@ -820,6 +1026,11 @@ class MainWindow(QMainWindow):
         self.parameter_timing_confidence,
         self.parameter_symbol_count,
         self.parameter_ber,
+        self.parameter_decision_margin,
+        self.parameter_fec,
+        self.parameter_sync_freq,
+        self.parameter_sync_phase,
+        self.parameter_ml,
         self.parameter_selected,
         ]
 
@@ -858,44 +1069,73 @@ class MainWindow(QMainWindow):
         # ========================================================
 
     def open_wav(self):
+        """Open a WAV or raw IQ capture.
+
+        Raw IQ files (``.iq``/``.c``/``.c64``/...) carry no metadata, so
+        the sample rate (and optionally dtype, byte order, I/Q order)
+        is prompted for unless a ``<stem>.meta.json`` sidecar next to
+        the file provides it — matching the CLI's loader semantics.
+        """
 
         path, _ = QFileDialog.getOpenFileName(
         self,
-        "Open WAV File",
+        "Open Capture (WAV / raw IQ)",
         "",
-        "WAV Files (*.wav);;All Files (*)"
+        "Captures (*.wav *.iq *.iqdata *.cfile *.c *.c64 *.cf32 *.i16 *.s16 *.u8 *.dat *.raw);;"
+        "WAV Files (*.wav);;Raw IQ Files (*.iq *.iqdata *.cfile *.c *.c64 *.cf32 *.i16 *.s16 *.u8 *.dat *.raw);;"
+        "All Files (*)"
         )
 
         if not path:
             return
 
-        try:
+        suffix = Path(path).suffix.lower()
 
-            samples, sample_rate = load_wav(
-            path
-            )
+        is_raw = suffix != ".wav"
 
-            stats = basic_stats(
-            samples,
-            sample_rate
-            )
+        if is_raw:
 
-        except Exception as exc:
+            try:
+                loaded = self._open_raw_iq(path)
 
-            QMessageBox.critical(
-            self,
-            "Unable to open file",
-            str(exc)
-            )
+            except Exception as exc:
 
-            return
+                QMessageBox.critical(
+                self,
+                "Unable to open file",
+                str(exc)
+                )
+
+                return
+
+            if loaded is None:
+                return  # user cancelled the sample-rate prompt
+
+            samples, sample_rate = loaded
+
+        else:
+
+            try:
+
+                samples, sample_rate = load_wav(
+                path
+                )
+
+            except Exception as exc:
+
+                QMessageBox.critical(
+                self,
+                "Unable to open file",
+                str(exc)
+                )
+
+                return
 
         self.samples = samples
         self.sample_rate = sample_rate
         self.current_file = Path(path)
 
         self.analysis = None
-        self.selected_analysis = None
         self.selected_signal = None
         self.isolated_signal = None
         self.isolated_filter_info = None
@@ -912,8 +1152,20 @@ class MainWindow(QMainWindow):
         self.qam16_ber_validation = None
         self.bfsk_demodulation = None
         self.bfsk_ber_validation = None
-        self.bfsk_demodulation = None
-        self.bfsk_ber_validation = None
+        self._pipeline_demod_summary = None
+        self._pipeline_ber_summary = None
+        self._pipeline_sync_summary = None
+        self._pipeline_fec_summary = None
+        self._pipeline_ml_summary = None
+        self.pipeline_result = None
+
+        self.export_json_button.setEnabled(False)
+
+        self.provenance_button.setEnabled(False)
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
         self.parameter_ber.setText(
         "BER Validation: No reference loaded"
         )
@@ -925,7 +1177,8 @@ class MainWindow(QMainWindow):
         self.clear_selected_signal_display()
 
         self.update_basic_information(
-        stats
+        basic_stats(samples, sample_rate),
+        "Raw IQ" if is_raw else "WAV",
         )
 
         self.update_visualizations()
@@ -940,7 +1193,8 @@ class MainWindow(QMainWindow):
 
     def update_basic_information(
     self,
-    stats
+    stats,
+    fmt="WAV",
     ):
 
         self.file_label.setText(
@@ -948,7 +1202,7 @@ class MainWindow(QMainWindow):
         )
 
         self.format_label.setText(
-        "WAV"
+        fmt
         )
 
         self.sample_rate_label.setText(
@@ -991,59 +1245,440 @@ class MainWindow(QMainWindow):
         if self.samples is None:
             return
 
-        try:
+        # --------------------------------------------------------
+        # Refuse a second concurrent run
+        # --------------------------------------------------------
 
-            self.analysis = analyze_signal(
-            self.samples,
-            self.sample_rate
+        if self.pipeline_worker is not None and self.pipeline_worker.isRunning():
+            QMessageBox.information(
+            self,
+            "Analysis in progress",
+            "Please wait for the current analysis to finish."
             )
+            return
 
+        # --------------------------------------------------------
+        # Load optional reference bits (BER) like the V1 flow
+        # --------------------------------------------------------
+
+        reference_bits = None
+
+        if self.current_file is not None:
+            try:
+                reference, _ = load_transmitted_bits(
+                self.current_file
+                )
+                reference_bits = reference
+            except Exception:  # no reference present: fine
+                reference_bits = None
+
+        # --------------------------------------------------------
+        # Start the V2 pipeline on a background thread
+        # --------------------------------------------------------
+
+        self.pipeline_mode = self.mode_combo.currentText()
+
+        self.analyze_button.setEnabled(False)
+
+        self.analyze_button.setText(
+        "Analyzing…"
+        )
+
+        # Indeterminate progress while the worker runs.
+        self.progress_bar.setRange(0, 0)
+
+        self.pipeline_result = None
+
+        self.pipeline_worker = AnalysisWorker(
+        samples=self.samples,
+        sample_rate=self.sample_rate,
+        mode=self.pipeline_mode,
+        analyze_all=self.batch_checkbox.isChecked(),
+        reference_bits=reference_bits,
+        fec_scheme=self.fec_combo.currentText(),
+        ml_enabled=self.ml_checkbox.isChecked(),
+        parent=self,
+        )
+
+        self.pipeline_worker.finished_with_result.connect(
+        self._on_pipeline_finished
+        )
+
+        self.pipeline_worker.failed.connect(
+        self._on_pipeline_failed
+        )
+
+        logger.info(
+        "Starting V2 analysis (%s, batch=%s)",
+        self.pipeline_mode,
+        self.batch_checkbox.isChecked(),
+        )
+
+        self.pipeline_worker.start()
+
+    def _on_pipeline_failed(self, message: str):
+        """Background analysis raised: show it and restore the UI."""
+
+        self.analyze_button.setEnabled(True)
+
+        self.analyze_button.setText("Analyze Signal")
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        logger.error("Analysis failed: %s", message)
+
+        QMessageBox.critical(
+        self,
+        "Analysis failed",
+        message,
+        )
+
+    def _on_pipeline_finished(self, payload: dict):
+        """Merge the V2 pipeline result into the GUI state and views."""
+
+        self.analyze_button.setEnabled(True)
+
+        self.analyze_button.setText("Analyze Signal")
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(1)
+
+        self.pipeline_result = payload
+
+        self._pipeline_provenance = payload.get("provenance")
+
+        self.export_json_button.setEnabled(True)
+
+        self.provenance_button.setEnabled(
+        self._pipeline_provenance is not None
+        )
+
+        try:
+            self._apply_pipeline_result(payload)
         except Exception as exc:
+            logger.exception("Failed to render pipeline result")
             QMessageBox.critical(
             self,
             "Analysis failed",
-            str(exc)
+            str(exc),
             )
 
-            return
+    def _apply_pipeline_result(self, payload: dict):
+        """Map AnalysisResult/BatchResult dict onto the existing panels."""
 
-            # --------------------------------------------------------
-            # Modulation classification
-            # --------------------------------------------------------
+        batch = payload.get("analyzed_candidates") is not None
 
-        try:
+        if batch:
+            # The batch payload carries a detection list plus one
+            # sub-result per analyzed candidate. Show the strongest
+            # candidate's detail and keep the table multi-candidate.
+            detections = payload.get("detections") or []
 
-            modulation, modulation_features = (
-            classify_modulation(
-            self.samples,
-            self.sample_rate
-            )
-            )
+            candidates = payload.get("analyzed_candidates") or []
 
+            self._pipeline_candidates = candidates
 
-            self.modulation_result = modulation
-            self.modulation_features = (
-            modulation_features
-            )
-
-        except Exception as exc:
-            self.modulation_result = "Unknown"
-            self.modulation_features = {}
-
-            print(
-            "Modulation classification error:",
-            exc
+            self.analysis = self._analysis_from_pipeline(
+            detections,
+            payload.get("input") or {},
             )
 
-            # --------------------------------------------------------
-            # Update GUI
-            # --------------------------------------------------------
+            # Populate the candidate selector (blocking its signal so
+            # populating does not re-trigger selection).
+            self.candidate_combo.blockSignals(True)
+
+            self.candidate_combo.clear()
+
+            for candidate in candidates:
+
+                cls = (candidate.get("classification") or {}).get(
+                "modulation",
+                "?",
+                )
+
+                idx = candidate.get("candidate_index", 0)
+
+                self.candidate_combo.addItem(
+                f"#{idx + 1}: {cls}",
+                userData=idx,
+                )
+
+            self.candidate_combo.blockSignals(False)
+
+            self.candidate_combo.setVisible(
+            len(candidates) > 0
+            )
+
+            if candidates:
+                first = candidates[0]
+
+                self._pipeline_candidate_index = first.get(
+                "candidate_index",
+                0,
+                )
+
+                self._apply_candidate_detail(first)
+
+            else:
+                self.modulation_result = "Unknown"
+                self.modulation_features = {}
+
+        else:
+            self._pipeline_candidates = None
+
+            self._pipeline_candidate_index = None
+
+            self.candidate_combo.blockSignals(True)
+
+            self.candidate_combo.clear()
+
+            self.candidate_combo.blockSignals(False)
+
+            self.candidate_combo.setVisible(False)
+
+            detections = payload.get("detections") or []
+
+            self.analysis = self._analysis_from_pipeline(
+            detections,
+            payload.get("input") or {},
+            )
+
+            self._apply_candidate_detail(payload)
 
         self.update_analysis_parameters()
 
         self.update_signal_table()
 
         self.update_visualizations()
+
+        warnings = payload.get("warnings") or []
+
+        summary = self._pipeline_summary_text(payload)
+
+        if warnings:
+            QMessageBox.warning(
+            self,
+            "Analysis complete (with warnings)",
+            summary + "\n\nWarnings:\n- " + "\n- ".join(warnings[:8]),
+            )
+        else:
+            QMessageBox.information(
+            self,
+            "Analysis complete",
+            summary,
+            )
+
+    def _analysis_from_pipeline(
+    self,
+    detections: list,
+    input_info: dict,
+    ) -> dict:
+        """Convert pipeline detections into the V1-table shape."""
+
+        signals = []
+
+        for index, det in enumerate(detections, start=1):
+            peak_power = det.get("peak_power")
+
+            peak_db = (
+                10.0 * np.log10(max(peak_power, 1e-30))
+                if peak_power is not None
+                else float("-inf")
+            )
+
+            signals.append({
+                "id": index,
+                "frequency": float(det.get("center_frequency", 0.0)),
+                "lower_frequency": float(det.get("start_frequency", 0.0)),
+                "upper_frequency": float(det.get("end_frequency", 0.0)),
+                "bandwidth": float(det.get("bandwidth", 0.0)),
+                "peak_magnitude_db": float(peak_db),
+            })
+
+        stats = {
+            "sample_rate": float(
+            input_info.get("sample_rate", self.sample_rate or 0.0)
+            ),
+            "num_samples": int(
+            input_info.get("num_samples", 0)
+            ),
+            "duration": (
+            input_info.get("num_samples", 0)
+            / max(input_info.get("sample_rate", self.sample_rate or 1.0), 1.0)
+            ),
+            "rms": 0.0,
+            "peak": 0.0,
+        }
+
+        return {
+            **stats,
+            "frequency": None,
+            "magnitude": None,
+            "magnitude_db": None,
+            "is_iq": True,
+            "noise_floor_db": None,
+            "measurement_floor_db": None,
+            "noise_limited": False,
+            "threshold_db": None,
+            "signal_detected": len(signals) > 0,
+            "dominant_frequency": (
+            signals[0]["frequency"] if signals else None
+            ),
+            "lower_frequency": (
+            signals[0]["lower_frequency"] if signals else None
+            ),
+            "upper_frequency": (
+            signals[0]["upper_frequency"] if signals else None
+            ),
+            "bandwidth": (
+            signals[0]["bandwidth"] if signals else None
+            ),
+            "snr_db": None,
+            "detected_signals": signals,
+        }
+
+    def _apply_candidate_detail(self, candidate: dict):
+        """Apply classification/sync/demod/BER of one candidate result."""
+
+        classification = candidate.get("classification") or {}
+
+        self.modulation_result = classification.get(
+        "modulation",
+        "Unknown",
+        )
+
+        self.modulation_features = classification.get("features") or {}
+
+        self.selected_modulation = self.modulation_result
+
+        self.selected_modulation_features = self.modulation_features
+
+        symbol_rate = candidate.get("symbol_rate") or {}
+
+        if symbol_rate:
+            self.timing_symbol_rate = float(
+            symbol_rate.get("symbol_rate_hz", 0.0)
+            )
+
+            self.timing_sps = float(
+            symbol_rate.get("samples_per_symbol", 0.0)
+            )
+
+            self.timing_confidence = float(
+            symbol_rate.get("confidence", 0.0)
+            ) / 100.0 if symbol_rate.get("confidence", 0.0) > 1.5 else float(
+            symbol_rate.get("confidence", 0.0)
+            )
+
+            self.timing_offset = int(
+            (candidate.get("synchronization") or {}).get(
+            "timing_offset",
+            0,
+            )
+            )
+
+        self._pipeline_demod_summary = candidate.get("demodulation")
+
+        self._pipeline_ber_summary = candidate.get("ber")
+
+        self._pipeline_sync_summary = candidate.get("synchronization")
+
+        self._pipeline_ml_summary = candidate.get("ml")
+
+        demod = self._pipeline_demod_summary or {}
+
+        self._pipeline_fec_summary = demod.get("fec")
+
+    def _on_candidate_selected(self, index: int):
+        """Batch mode: re-target the detail panels at another candidate."""
+
+        if not self._pipeline_candidates:
+            return
+
+        candidate_index = self.candidate_combo.itemData(index)
+
+        for candidate in self._pipeline_candidates:
+
+            if candidate.get("candidate_index", 0) == candidate_index:
+
+                self._pipeline_candidate_index = candidate_index
+
+                self._apply_candidate_detail(candidate)
+
+                self.update_analysis_parameters()
+
+                return
+
+    def _pipeline_summary_text(self, payload: dict) -> str:
+        """Human-readable completion summary for the dialog."""
+
+        batch = payload.get("analyzed_candidates") is not None
+
+        classification = self.modulation_result
+
+        symbol_rate = self.timing_symbol_rate
+
+        sps = self.timing_sps
+
+        lines = [
+        f"Pipeline: V2 ({self.pipeline_mode}{', all candidates' if batch else ''})",
+        f"Modulation: {classification}",
+        ]
+
+        if symbol_rate:
+            lines.append(f"Symbol rate: {symbol_rate:.2f} symbols/s")
+
+        if sps:
+            lines.append(f"Samples/symbol: {sps:.2f}")
+
+        demod = self._pipeline_demod_summary or {}
+
+        if demod.get("num_symbols"):
+            lines.append(
+            f"Demodulated: {demod.get('num_symbols')} symbols / "
+            f"{demod.get('num_bits')} bits"
+            )
+
+        ber = self._pipeline_ber_summary
+
+        if ber:
+            lines.append(f"BER: {ber.get('ber', 0):.6g}")
+
+        else:
+            lines.append("BER: no reference loaded")
+
+        fec = self._pipeline_fec_summary
+
+        if fec:
+            lines.append(
+            f"FEC ({fec.get('scheme')}): corrected "
+            f"{fec.get('corrected_errors', 0)} errors"
+            )
+
+        ml = self._pipeline_ml_summary
+
+        if ml:
+            lines.append(
+            f"ML (CNN): {ml.get('predicted_class', '?')} "
+            f"{float(ml.get('confidence', 0.0)) * 100:.0f}%"
+            )
+            if not ml.get("trained", False):
+                lines.append(
+                "ML (CNN): UNTRAINED artifact — scores unvalidated"
+                )
+            if not ml.get("trained", False):
+                lines.append(
+                "ML (CNN): UNTRAINED artifact — scores unvalidated"
+                )
+
+        return "\n".join(lines)
+
+        # --------------------------------------------------------
+        # Modulation classification
+        # --------------------------------------------------------
 
         # ========================================================
         # ANALYSIS PARAMETERS
@@ -1190,6 +1825,128 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
+        # V2 pipeline: symbol timing summary
+        # ----------------------------------------------------
+
+        if self.timing_sps:
+            self.parameter_sps.setText(
+            f"Samples/Symbol: {self.timing_sps:.2f}"
+            )
+
+        if self.timing_symbol_rate:
+            self.parameter_symbol_rate.setText(
+            f"Symbol Rate: {self.timing_symbol_rate:.2f} symbols/s"
+            )
+
+            confidence = self.timing_confidence
+
+            if confidence is not None:
+                self.parameter_timing_confidence.setText(
+                f"Timing Confidence: {confidence * 100:.1f}%"
+                )
+
+        # ----------------------------------------------------
+        # V2 pipeline: BER, decision margin, FEC, sync detail
+        # ----------------------------------------------------
+
+        ber = self._pipeline_ber_summary
+
+        if ber is not None:
+
+            self.parameter_ber.setText(
+            f"BER: {float(ber.get('ber', 1.0)):.6g} "
+            f"({ber.get('bit_errors', '?')}/"
+            f"{ber.get('compared_bits', '?')} bits)"
+            )
+
+        demod = self._pipeline_demod_summary or {}
+
+        if demod.get("num_symbols") is not None:
+
+            self.parameter_symbol_count.setText(
+            f"Recovered Symbols/Bits: "
+            f"{demod.get('num_symbols')} / {demod.get('num_bits')}"
+            )
+
+        if demod.get("decision_margin") is not None:
+
+            self.parameter_decision_margin.setText(
+            f"Decision Margin: "
+            f"{float(demod['decision_margin']):.4f}"
+            )
+
+        else:
+
+            self.parameter_decision_margin.setText(
+            "Decision Margin: —"
+            )
+
+        fec = self._pipeline_fec_summary
+
+        if fec:
+
+            self.parameter_fec.setText(
+            f"FEC: {fec.get('scheme')} (corrected "
+            f"{fec.get('corrected_errors', 0)} errors, "
+            f"{fec.get('uncorrectable_blocks', 0)} uncorrectable)"
+            )
+
+        elif self.fec_combo.currentText() != "none":
+
+            self.parameter_fec.setText(
+            f"FEC: {self.fec_combo.currentText()} "
+            f"(no FEC stage output)"
+            )
+
+        else:
+
+            self.parameter_fec.setText(
+            "FEC: none configured"
+            )
+
+        sync = self._pipeline_sync_summary or {}
+
+        ml_summary = getattr(self, "_pipeline_ml_summary", None)
+
+        if ml_summary:
+            top = ml_summary.get("top3") or []
+            top_text = " ".join(
+            f"{item['class']} {item['score']:.2f}" for item in top[:3]
+            )
+            if not ml_summary.get("trained", False):
+                top_text += "  [UNTRAINED — scores near-random; disable]"
+            self.parameter_ml.setText(
+            f"ML Prediction: {ml_summary.get('predicted_class', '?')} "
+            f"({float(ml_summary.get('confidence', 0.0)) * 100:.0f}%, "
+            f"{ml_summary.get('num_frames', '?')} frames)  {top_text}"
+            )
+
+        elif self.ml_checkbox.isChecked():
+            self.parameter_ml.setText(
+            "ML Prediction: unavailable (artifact missing or capture "
+            "too short)"
+            )
+
+        else:
+            self.parameter_ml.setText("ML Prediction: off")
+
+        freq_offset = sync.get("frequency_offset_hz")
+
+        phase_offset = sync.get("phase_offset_rad")
+
+        self.parameter_sync_freq.setText(
+        f"Freq Offset: {float(freq_offset):.3f} Hz"
+        if freq_offset is not None
+        else "Freq Offset: —"
+        )
+
+        self.parameter_sync_phase.setText(
+        f"Phase Offset: {float(np.degrees(phase_offset)):.2f} deg"
+        if phase_offset is not None
+        else "Phase Offset: —"
+        )
+
+        # ----------------------------------------------------
         # Selected signal
         # ----------------------------------------------------
 
@@ -1309,6 +2066,9 @@ class MainWindow(QMainWindow):
         self.qam16_ber_validation = None
         self.bfsk_ber_validation = None
 
+        self._pipeline_demod_summary = None
+        self._pipeline_ber_summary = None
+
         self.parameter_ber.setText(
         "BER Validation: No reference loaded"
         )
@@ -1357,25 +2117,14 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
-        # Print to terminal for debugging
+        # Log selection for debugging
         # ----------------------------------------------------
 
-        print(
-        "\nSelected signal:"
-        )
-
-        print(
-        f"Signal {signal_id}"
-        )
-
-        print(
-        f"Frequency: "
-        f"{frequency:.2f} Hz"
-        )
-
-        print(
-        f"Bandwidth: "
-        f"{bandwidth:.2f} Hz"
+        logger.info(
+        "Selected signal %d: frequency %.2f Hz, bandwidth %.2f Hz",
+        signal_id,
+        frequency,
+        bandwidth,
         )
 
         # ========================================================
@@ -1434,19 +2183,62 @@ class MainWindow(QMainWindow):
             )
             )
 
-            try:
+            # Prefer the RECOVERED symbol constellation when the V2
+            # pipeline captured it: that is the actual analysis
+            # deliverable (the raw-IQ scatter is a shapeless smear for
+            # any pulsed-shaped signal).
+
+            constellation_symbols = None
+
+            demod = self._pipeline_demod_summary or {}
+
+            symbols_payload = (demod.get("constellation") or {}).get(
+            "symbols"
+            )
+
+            if symbols_payload:
+
+                try:
+
+                    constellation_symbols = np.asarray(
+                    [complex(re_, im_) for re_, im_ in symbols_payload],
+                    dtype=np.complex128,
+                    )
+
+                except (TypeError, ValueError):
+
+                    constellation_symbols = None
+
+            if constellation_symbols is not None:
+
+                from prototype.visualization.plots import (
+                create_symbol_constellation_figure,
+                )
 
                 self.constellation_plot.set_figure(
-                create_constellation_figure(
-                self.samples
+                create_symbol_constellation_figure(
+                constellation_symbols,
+                title=(
+                f"Recovered Constellation ({self.modulation_result})"
+                ),
                 )
                 )
 
-            except ValueError as exc:
+            else:
 
-                self.show_constellation_message(
-                str(exc)
-                )
+                try:
+
+                    self.constellation_plot.set_figure(
+                    create_constellation_figure(
+                    self.samples
+                    )
+                    )
+
+                except ValueError as exc:
+
+                    self.show_constellation_message(
+                    str(exc)
+                    )
 
         except Exception as exc:
 
@@ -1510,6 +2302,53 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.analysis = None
         self.selected_signal = None
+
+        # V2 pipeline state
+        self._pipeline_demod_summary = None
+        self._pipeline_ber_summary = None
+        self._pipeline_sync_summary = None
+        self._pipeline_fec_summary = None
+        self._pipeline_ml_summary = None
+        self._pipeline_candidates = None
+        self._pipeline_candidate_index = None
+        self._pipeline_provenance = None
+        self.pipeline_result = None
+
+        self.parameter_ml.setText(
+        "ML Prediction: off"
+        )
+
+        self.export_json_button.setEnabled(False)
+
+        self.provenance_button.setEnabled(False)
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        self.candidate_combo.blockSignals(True)
+
+        self.candidate_combo.clear()
+
+        self.candidate_combo.blockSignals(False)
+
+        self.candidate_combo.setVisible(False)
+
+        self.parameter_decision_margin.setText(
+        "Decision Margin: —"
+        )
+
+        self.parameter_fec.setText(
+        "FEC: —"
+        )
+
+        self.parameter_sync_freq.setText(
+        "Freq Offset: —"
+        )
+
+        self.parameter_sync_phase.setText(
+        "Phase Offset: —"
+        )
 
         self.analyze_button.setEnabled(
         False
@@ -1633,17 +2472,17 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            isolated, filter_info = (
-            isolate_signal(
-            self.samples,
-            self.sample_rate,
+            result = isolate_signal(
+            Signal(
+            samples=self.samples,
+            sample_rate=self.sample_rate,
+            ),
             self.selected_signal[
             "frequency"
             ],
             self.selected_signal[
             "bandwidth"
             ]
-            )
             )
 
         except Exception as exc:
@@ -1654,26 +2493,25 @@ class MainWindow(QMainWindow):
             )
             return
 
-            # Store isolated signal
-        self.isolated_signal = isolated
+            # The downstream demodulation path consumes plain complex
+            # ndarrays; unwrap the V2 IsolationResult.
+        self.isolated_signal = result.signal.samples
 
         self.analyze_selected_button.setEnabled(
         True
         )
 
-        self.isolated_filter_info = filter_info
+        self.isolated_filter_info = {
+        "center_frequency": result.center_frequency,
+        "filter_low": result.low_cutoff,
+        "filter_high": result.high_cutoff,
+        }
 
-        print("\nIsolated signal")
-        print("----------------")
-        print(
-        f"Center frequency: "
-        f"{filter_info['center_frequency']:.2f} Hz"
-        )
-
-        print(
-        f"Filter range: "
-        f"{filter_info['filter_low']:.2f} - "
-        f"{filter_info['filter_high']:.2f} Hz"
+        logger.info(
+        "Isolated signal: center %.2f Hz, filter range %.2f - %.2f Hz",
+        self.isolated_filter_info["center_frequency"],
+        self.isolated_filter_info["filter_low"],
+        self.isolated_filter_info["filter_high"],
         )
 
         # Enable future analysis
@@ -1740,6 +2578,12 @@ class MainWindow(QMainWindow):
             self.qam16_ber_validation = None
             self.bfsk_ber_validation = None
 
+            self._pipeline_demod_summary = None
+            self._pipeline_ber_summary = None
+            self._pipeline_sync_summary = None
+            self._pipeline_fec_summary = None
+            self._pipeline_ml_summary = None
+
             # ----------------------------------------------------
             # Unsupported / unknown modulation
             # ----------------------------------------------------
@@ -1757,6 +2601,9 @@ class MainWindow(QMainWindow):
                 "BPSK",
                 "QPSK",
                 "16-QAM",
+                "8-PSK",
+                "OOK",
+                "ASK",
                 "BFSK",
             }
 
@@ -1803,28 +2650,17 @@ class MainWindow(QMainWindow):
 
                 a = self.selected_analysis
 
-                print()
-                print("Selected Signal Analysis")
-                print("------------------------")
-                print(
-                    f"Dominant frequency: "
-                    f"{a['dominant_frequency']:.2f} Hz"
-                )
-
-                if a["bandwidth"] is not None:
-                    print(
-                        f"Bandwidth: "
-                        f"{a['bandwidth']:.2f} Hz"
-                    )
-
-                print(
-                    f"Modulation: "
-                    f"{self.selected_modulation}"
-                )
-
-                print(
-                    "Digital demodulation: skipped "
-                    "(unsupported/unknown modulation)"
+                logger.info(
+                "Selected Signal Analysis: dominant %.2f Hz, "
+                "bandwidth %s, modulation %s — digital demodulation "
+                "skipped (unsupported/unknown modulation)",
+                a["dominant_frequency"],
+                (
+                f"{a['bandwidth']:.2f} Hz"
+                if a["bandwidth"] is not None
+                else "n/a"
+                ),
+                self.selected_modulation,
                 )
 
                 QMessageBox.information(
@@ -1853,7 +2689,8 @@ class MainWindow(QMainWindow):
             # waveform, the transmitter profile is 100 symbols/s.
             # Therefore use the known V1 symbol rate for BFSK.
             #
-            # BPSK/QPSK/16-QAM continue using the generic estimator.
+            # BPSK/QPSK/16-QAM/8-PSK/OOK continue using the generic
+            # estimator.
             # ----------------------------------------------------
 
             timing = None
@@ -1896,6 +2733,148 @@ class MainWindow(QMainWindow):
                 )
 
             a = self.selected_analysis
+
+            # ----------------------------------------------------
+            # 8-PSK (V2 digital kernel)
+            # ----------------------------------------------------
+
+            if self.selected_modulation == "8-PSK":
+
+                from prototype.modulation.digital import demodulate_psk8
+
+                psk8_result = demodulate_psk8(
+                    self.isolated_signal,
+                    self.timing_sps,
+                    self.timing_offset,
+                )
+
+                self._pipeline_demod_summary = {
+                    "modulation": "8-PSK",
+                    "num_symbols": psk8_result["num_symbols"],
+                    "num_bits": psk8_result["num_bits"],
+                    "decision_margin": psk8_result["decision_margin"],
+                }
+
+                self.parameter_modulation.setText(
+                    "Modulation: 8-PSK"
+                )
+
+                self.parameter_symbol_count.setText(
+                    f"Recovered Symbols/Bits: "
+                    f"{psk8_result['num_symbols']} / "
+                    f"{psk8_result['num_bits']}"
+                )
+
+                self.constellation_plot.set_figure(
+                    create_constellation_figure(
+                        psk8_result["corrected_symbols"],
+                        title="8-PSK Symbol-Rate Constellation",
+                    )
+                )
+
+                logger.info(
+                "8-PSK demodulated: %d symbols, %d bits, margin %.3f, "
+                "phase estimate %.4f rad (blind pi/4 fold applies)",
+                psk8_result["num_symbols"],
+                psk8_result["num_bits"],
+                psk8_result["decision_margin"],
+                psk8_result["phase_estimate_rad"],
+                )
+
+                QMessageBox.information(
+                    self,
+                    "Analysis complete",
+                    (
+                        f"Modulation: 8-PSK\n\n"
+                        f"Dominant frequency: "
+                        f"{a['dominant_frequency']:.2f} Hz\n\n"
+                        f"Samples/symbol: {self.timing_sps:.2f}\n\n"
+                        f"Recovered: {psk8_result['num_symbols']} symbols "
+                        f"/ {psk8_result['num_bits']} bits\n\n"
+                        "Note: blind 8-PSK phase recovery folds modulo "
+                        "45 degrees; payload bits may be Gray-shifted "
+                        "without a preamble."
+                    )
+                )
+
+                return
+
+            # ----------------------------------------------------
+            # OOK / ASK (V2 digital kernel)
+            # ----------------------------------------------------
+
+            if self.selected_modulation in ("OOK", "ASK"):
+
+                from prototype.modulation.digital import demodulate_ook
+
+                ook_result = demodulate_ook(
+                    self.isolated_signal,
+                    self.timing_sps,
+                    self.timing_offset,
+                )
+
+                self._pipeline_demod_summary = {
+                    "modulation": self.selected_modulation,
+                    "num_symbols": ook_result["num_symbols"],
+                    "num_bits": ook_result["num_bits"],
+                    "decision_margin": ook_result["decision_margin"],
+                }
+
+                self.parameter_modulation.setText(
+                    f"Modulation: {self.selected_modulation}"
+                )
+
+                self.parameter_symbol_count.setText(
+                    f"Recovered Symbols/Bits: "
+                    f"{ook_result['num_symbols']} / "
+                    f"{ook_result['num_bits']}"
+                )
+
+                figure = Figure(figsize=(5, 4), tight_layout=True)
+
+                ax = figure.add_subplot(111)
+
+                magnitudes = np.abs(ook_result["symbols"])
+
+                ax.step(
+                    np.arange(magnitudes.size),
+                    magnitudes,
+                    where="mid",
+                )
+
+                ax.set_title(
+                    f"{self.selected_modulation} Symbol Magnitudes"
+                )
+
+                ax.set_xlabel("Symbol Index")
+
+                ax.set_ylabel("Magnitude")
+
+                ax.grid(True, alpha=0.3)
+
+                self.constellation_plot.set_figure(figure)
+
+                logger.info(
+                "%s demodulated: %d symbols, %d bits, margin %.3f",
+                self.selected_modulation,
+                ook_result["num_symbols"],
+                ook_result["num_bits"],
+                ook_result["decision_margin"],
+                )
+
+                QMessageBox.information(
+                    self,
+                    "Analysis complete",
+                    (
+                        f"Modulation: {self.selected_modulation}\n\n"
+                        f"Dominant frequency: "
+                        f"{a['dominant_frequency']:.2f} Hz\n\n"
+                        f"Recovered: {ook_result['num_symbols']} symbols "
+                        f"/ {ook_result['num_bits']} bits"
+                    )
+                )
+
+                return
 
             # ----------------------------------------------------
             # BPSK
@@ -2033,14 +3012,71 @@ class MainWindow(QMainWindow):
 
             # ----------------------------------------------------
             # 16-QAM
+            #
+            # Uses the proven V2 QAM chain (matched RRC, residual-
+            # CFO derotation, lattice-fit timing, static decision-
+            # directed phase). The legacy generic demodulator
+            # mis-rotates QAM constellations and reports ~0.5 BER.
             # ----------------------------------------------------
 
             elif self.selected_modulation == "16-QAM":
 
-                self.qam16_demodulation = demodulate_qam16(
-                    self.isolated_signal,
-                    self.timing_sps,
-                    self.timing_offset
+                from prototype.core.synchronization import (
+                    synchronize_qam_signal,
+                )
+                from prototype.demodulation.demodulator import (
+                    demodulate_signal,
+                )
+                from prototype.modulation.demodulator import (
+                    normalize_qam16_symbols,
+                )
+
+                _qam_sync = synchronize_qam_signal(
+                    Signal(
+                        samples=self.isolated_signal,
+                        sample_rate=self.sample_rate,
+                    ),
+                    symbol_rate=self.timing_symbol_rate,
+                )
+
+                _qam_result = demodulate_signal(
+                    _qam_sync.signal,
+                    "16-QAM",
+                    samples_per_symbol=1.0,
+                    synchronized=True,
+                )
+
+                _sym = _qam_sync.signal.samples
+
+                _quad_balance = float(
+                    np.abs(np.mean(_sym ** 2))
+                    / np.mean(np.abs(_sym) ** 2)
+                )
+
+                self.qam16_demodulation = {
+                    "modulation": "16-QAM",
+                    "symbols": _sym,
+                    "num_symbols": _qam_result.num_symbols,
+                    "num_bits": _qam_result.num_bits,
+                    "decision_margin":
+                        _qam_result.decision_margin,
+                    "quadrature_balance": _quad_balance,
+                }
+
+                self._pipeline_demod_summary = {
+                    "modulation": "16-QAM",
+                    "num_symbols": _qam_result.num_symbols,
+                    "num_bits": _qam_result.num_bits,
+                    "decision_margin":
+                        _qam_result.decision_margin,
+                }
+
+                self.timing_symbol_rate = float(
+                    _qam_sync.symbol_rate
+                )
+
+                self.timing_offset = int(
+                    _qam_sync.timing_offset
                 )
 
                 if self.current_file is not None:
@@ -2053,16 +3089,21 @@ class MainWindow(QMainWindow):
 
                     if reference_bits is not None:
 
-                        recovered_symbols = (
-                            self.qam16_demodulation[
-                                "symbols"
-                            ]
+                        symbols = normalize_qam16_symbols(
+                            _qam_sync.signal.samples
                         )
 
                         best_result = None
 
-                        # Try all four common carrier phase
-                        # rotations.
+                        # Blind 90-degree phase folds x a
+                        # symbol-aligned origin search: the pulse-
+                        # shaping group delay offsets the recovered
+                        # stream by whole symbols, so the origin
+                        # must be searched in symbol steps.
+                        max_offset = min(
+                            16, symbols.size - 1
+                        )
+
                         for rotation_index in range(4):
 
                             rotation = (
@@ -2072,7 +3113,7 @@ class MainWindow(QMainWindow):
                             )
 
                             rotated_symbols = (
-                                recovered_symbols
+                                symbols
                                 * np.exp(
                                     -1j * rotation
                                 )
@@ -2084,59 +3125,80 @@ class MainWindow(QMainWindow):
                                 )
                             )
 
-                            compared_count = min(
-                                len(candidate_bits),
-                                len(reference_bits)
-                            )
-
-                            if compared_count == 0:
-                                continue
-
-                            candidate_bits = (
-                                candidate_bits[
-                                    :compared_count
-                                ]
-                            )
-
-                            reference_compare = (
-                                reference_bits[
-                                    :compared_count
-                                ]
-                            )
-
-                            errors = int(
-                                np.sum(
-                                    candidate_bits
-                                    != reference_compare
-                                )
-                            )
-
-                            ber = (
-                                errors
-                                / compared_count
-                            )
-
-                            if (
-                                best_result is None
-                                or errors
-                                < best_result["errors"]
+                            for sym_off in range(
+                                -max_offset,
+                                max_offset + 1
                             ):
-                                best_result = {
-                                    "errors": errors,
-                                    "ber": float(ber),
-                                    "compared_bits":
-                                        compared_count,
-                                    "recovered_bits":
-                                        len(candidate_bits),
-                                    "reference_bits":
-                                        len(reference_bits),
-                                    "rotation_index":
-                                        rotation_index,
-                                    "rotation_degrees":
-                                        rotation_index * 90,
-                                    "reference_path":
-                                        reference_path,
-                                }
+
+                                if sym_off >= 0:
+                                    shifted = (
+                                        candidate_bits[
+                                            4 * sym_off:
+                                        ]
+                                    )
+
+                                    reference_compare = (
+                                        reference_bits
+                                    )
+
+                                else:
+                                    shifted = (
+                                        candidate_bits
+                                    )
+
+                                    reference_compare = (
+                                        reference_bits[
+                                            4 * (-sym_off):
+                                        ]
+                                    )
+
+                                compared_count = min(
+                                    len(shifted),
+                                    len(reference_compare)
+                                )
+
+                                if compared_count == 0:
+                                    continue
+
+                                errors = int(
+                                    np.sum(
+                                        shifted[
+                                            :compared_count
+                                        ]
+                                        != reference_compare[
+                                            :compared_count
+                                        ]
+                                    )
+                                )
+
+                                ber = (
+                                    errors
+                                    / compared_count
+                                )
+
+                                if (
+                                    best_result is None
+                                    or errors
+                                    < best_result["errors"]
+                                ):
+                                    best_result = {
+                                        "errors": errors,
+                                        "ber": float(ber),
+                                        "compared_bits":
+                                            compared_count,
+                                        "recovered_bits":
+                                            len(shifted),
+                                        "reference_bits":
+                                            len(reference_bits),
+                                        "rotation_index":
+                                            rotation_index,
+                                        "rotation_degrees":
+                                            rotation_index * 90,
+                                        "origin_offset_symbols":
+                                            sym_off,
+                                        "reference_path":
+                                            reference_path,
+                                    }
 
                         self.qam16_ber_validation = (
                             best_result
@@ -2219,70 +3281,69 @@ class MainWindow(QMainWindow):
             # Terminal output
             # ----------------------------------------------------
 
-            print()
-            print("Selected Signal Analysis")
-            print("------------------------")
+            logger.info("Selected Signal Analysis")
+            logger.info("------------------------")
 
-            print(
+            logger.info(
                 f"Dominant frequency: "
                 f"{a['dominant_frequency']:.2f} Hz"
             )
 
             if a["bandwidth"] is not None:
-                print(
+                logger.info(
                     f"Bandwidth: "
                     f"{a['bandwidth']:.2f} Hz"
                 )
 
-            print(
+            logger.info(
                 f"Modulation: "
                 f"{self.selected_modulation}"
             )
 
-            print(
+            logger.info(
                 f"Amplitude CV: "
                 f"{self.selected_modulation_features['amplitude_cv']:.3f}"
             )
 
-            print(
+            logger.info(
                 f"R2 phase coherence: "
                 f"{self.selected_modulation_features['r2_phase_coherence']:.3f}"
             )
 
-            print(
+            logger.info(
                 f"R4 phase coherence: "
                 f"{self.selected_modulation_features['r4_phase_coherence']:.3f}"
             )
 
-            print(
+            logger.info(
                 f"Instantaneous-frequency std: "
                 f"{self.selected_modulation_features['instantaneous_frequency_std_hz']:.2f} Hz"
             )
 
-            print(
+            logger.info(
                 f"Estimated samples/symbol: "
                 f"{self.timing_sps:.2f}"
             )
 
-            print(
+            logger.info(
                 f"Estimated symbol rate: "
                 f"{self.timing_symbol_rate:.2f} symbols/s"
             )
 
-            print(
+            logger.info(
                 f"Timing confidence: "
                 f"{self.timing_confidence * 100:.1f}%"
             )
 
             if timing is not None:
-                print(
+                logger.info(
                     f"Timing offset: "
                     f"{self.timing_offset} samples "
                     f"(eye opening: "
                     f"{timing.eye_opening:.2f})"
                 )
             else:
-                print(
+                logger.info(
                     f"Timing offset: "
                     f"{self.timing_offset} samples "
                     f"(V1 BFSK timing profile)"
@@ -2294,29 +3355,29 @@ class MainWindow(QMainWindow):
 
             if self.selected_modulation == "BPSK":
 
-                print(
+                logger.info(
                     f"Recovered symbols: "
                     f"{len(self.symbol_samples)}"
                 )
 
-                print(
+                logger.info(
                     f"BPSK hard-decision bits: "
                     f"{len(self.bpsk_demodulation.bits)}"
                 )
 
-                print(
+                logger.info(
                     f"BPSK decision margin: "
                     f"{self.bpsk_demodulation.decision_margin:.3f}"
                 )
 
-                print(
+                logger.info(
                     f"BPSK quadrature ratio: "
                     f"{self.bpsk_demodulation.quadrature_ratio:.3f}"
                 )
 
                 if self.ber_validation is None:
 
-                    print(
+                    logger.info(
                         "BER validation: "
                         "no companion reference bits found."
                     )
@@ -2325,12 +3386,12 @@ class MainWindow(QMainWindow):
 
                     validation = self.ber_validation
 
-                    print(
+                    logger.info(
                         f"BER reference: "
                         f"{validation.reference_path}"
                     )
 
-                    print(
+                    logger.info(
                         "BER compared bits: "
                         f"{validation.compared_bit_count} "
                         f"(recovered "
@@ -2339,13 +3400,13 @@ class MainWindow(QMainWindow):
                         f"{validation.reference_bit_count})"
                     )
 
-                    print(
+                    logger.info(
                         "BER direct/inverted errors: "
                         f"{validation.direct_bit_errors} / "
                         f"{validation.inverted_bit_errors}"
                     )
 
-                    print(
+                    logger.info(
                         f"BER result: "
                         f"{validation.bit_errors} errors, "
                         f"{validation.ber:.6g} "
@@ -2368,34 +3429,34 @@ class MainWindow(QMainWindow):
 
             elif self.selected_modulation == "QPSK":
 
-                print(
+                logger.info(
                     f"Recovered symbols: "
                     f"{self.qpsk_demodulation['num_symbols']}"
                 )
 
-                print(
+                logger.info(
                     f"QPSK recovered bits: "
                     f"{self.qpsk_demodulation['num_bits']}"
                 )
 
-                print(
+                logger.info(
                     f"QPSK phase estimate: "
                     f"{self.qpsk_demodulation['phase_estimate_rad']:.4f} rad"
                 )
 
-                print(
+                logger.info(
                     f"QPSK decision margin: "
                     f"{self.qpsk_demodulation['decision_margin']:.3f}"
                 )
 
-                print(
+                logger.info(
                     f"QPSK quadrature balance: "
                     f"{self.qpsk_demodulation['quadrature_balance']:.3f}"
                 )
 
                 if self.qpsk_ber_validation is None:
 
-                    print(
+                    logger.info(
                         "BER validation: "
                         "no companion reference bits found."
                     )
@@ -2404,7 +3465,7 @@ class MainWindow(QMainWindow):
 
                     validation = self.qpsk_ber_validation
 
-                    print(
+                    logger.info(
                         f"BER compared bits: "
                         f"{validation['compared_bits']} "
                         f"(recovered "
@@ -2413,12 +3474,12 @@ class MainWindow(QMainWindow):
                         f"{validation['reference_bits']})"
                     )
 
-                    print(
+                    logger.info(
                         f"QPSK phase rotation selected: "
                         f"{validation['rotation_degrees']}°"
                     )
 
-                    print(
+                    logger.info(
                         f"BER result: "
                         f"{validation['errors']} errors, "
                         f"{validation['ber']:.6g}"
@@ -2442,29 +3503,29 @@ class MainWindow(QMainWindow):
 
             elif self.selected_modulation == "16-QAM":
 
-                print(
+                logger.info(
                     f"Recovered symbols: "
                     f"{self.qam16_demodulation['num_symbols']}"
                 )
 
-                print(
+                logger.info(
                     f"16-QAM recovered bits: "
                     f"{self.qam16_demodulation['num_bits']}"
                 )
 
-                print(
+                logger.info(
                     f"16-QAM decision margin: "
                     f"{self.qam16_demodulation['decision_margin']:.3f}"
                 )
 
-                print(
+                logger.info(
                     f"16-QAM quadrature balance: "
                     f"{self.qam16_demodulation['quadrature_balance']:.3f}"
                 )
 
                 if self.qam16_ber_validation is None:
 
-                    print(
+                    logger.info(
                         "BER validation: "
                         "no companion reference bits found."
                     )
@@ -2473,7 +3534,7 @@ class MainWindow(QMainWindow):
 
                     validation = self.qam16_ber_validation
 
-                    print(
+                    logger.info(
                         f"BER compared bits: "
                         f"{validation['compared_bits']} "
                         f"(recovered "
@@ -2482,12 +3543,12 @@ class MainWindow(QMainWindow):
                         f"{validation['reference_bits']})"
                     )
 
-                    print(
+                    logger.info(
                         f"16-QAM phase rotation selected: "
                         f"{validation['rotation_degrees']}°"
                     )
 
-                    print(
+                    logger.info(
                         f"BER result: "
                         f"{validation['errors']} errors, "
                         f"{validation['ber']:.6g}"
@@ -2509,30 +3570,30 @@ class MainWindow(QMainWindow):
 
             elif self.selected_modulation == "BFSK":
 
-                print(
+                logger.info(
                     f"Recovered symbols: "
                     f"{self.bfsk_demodulation['num_symbols']}"
                 )
 
-                print(
+                logger.info(
                     f"BFSK recovered bits: "
                     f"{len(self.bfsk_demodulation['bits'])}"
                 )
 
-                print(
+                logger.info(
                     f"BFSK frequencies: "
                     f"{BFSK_FREQ_0:.1f} Hz / "
                     f"{BFSK_FREQ_1:.1f} Hz"
                 )
 
-                print(
+                logger.info(
                     f"BFSK decision margin: "
                     f"{self.bfsk_demodulation['decision_margin']:.3f}"
                 )
 
                 if self.bfsk_ber_validation is None:
 
-                    print(
+                    logger.info(
                         "BER validation: "
                         "no companion reference bits found."
                     )
@@ -2541,12 +3602,12 @@ class MainWindow(QMainWindow):
 
                     validation = self.bfsk_ber_validation
 
-                    print(
+                    logger.info(
                         f"BER reference: "
                         f"{validation['reference_path']}"
                     )
 
-                    print(
+                    logger.info(
                         "BER compared bits: "
                         f"{validation['compared_bits']} "
                         f"(recovered "
@@ -2555,7 +3616,7 @@ class MainWindow(QMainWindow):
                         f"{validation['reference_bits']})"
                     )
 
-                    print(
+                    logger.info(
                         f"BER result: "
                         f"{validation['errors']} errors, "
                         f"{validation['ber']:.6g}"
@@ -2604,12 +3665,12 @@ class MainWindow(QMainWindow):
 
             else:
 
-                print(
+                logger.info(
                     f"Recovered symbols: "
                     f"{len(self.symbol_samples)}"
                 )
 
-                print(
+                logger.info(
                     "Demodulation: "
                     "not implemented for this modulation yet."
                 )
@@ -2932,3 +3993,210 @@ class MainWindow(QMainWindow):
             )
 
         return "Demodulation not implemented"
+
+        # ========================================================
+        # RAW IQ OPENING
+        # ========================================================
+
+    def _open_raw_iq(self, path: str):
+        """Load a raw interleaved IQ file.
+
+        Returns ``(samples, sample_rate)``, or ``None`` when the user
+        cancels the parameter prompt. Raises on loader errors.
+        """
+
+        from prototype.io.loaders import load_signal, load_sidecar
+
+        # A sidecar may already provide everything; peek so we only
+        # prompt for what is actually missing.
+        sidecar: dict = {}
+
+        try:
+            sidecar = load_sidecar(path)
+        except Exception:
+            sidecar = {}
+
+        known_rate = sidecar.get("sample_rate") is not None
+
+        sample_rate = None
+
+        if not known_rate:
+
+            rate_text, ok = QInputDialog.getText(
+            self,
+            "Raw IQ sample rate",
+            f"Sample rate in Hz for {Path(path).name}",
+            text="8000",
+            )
+
+            if not ok or not rate_text.strip():
+                return None
+
+            sample_rate = float(rate_text)
+
+            if sample_rate <= 0:
+                raise ValueError(
+                f"Sample rate must be positive, got {sample_rate}"
+                )
+
+        known_dtype = sidecar.get("dtype") is not None
+
+        dtype = None
+
+        if not known_dtype:
+
+            dtype_text, ok = QInputDialog.getItem(
+            self,
+            "Raw IQ sample format",
+            f"Sample format for {Path(path).name} "
+            "(interleaved I/Q unless complex*):",
+            [
+            "int16",
+            "complex64",
+            "complex128",
+            "float32",
+            "float64",
+            "int8",
+            "uint8",
+            "int32",
+            ],
+            0,
+            False,
+            )
+
+            if not ok:
+                return None
+
+            dtype = str(dtype_text)
+
+        kwargs: dict = {
+        "endianness": sidecar.get("endianness"),
+        "iq_order": sidecar.get("iq_order"),
+        "center_frequency_hz": sidecar.get("center_frequency_hz"),
+        }
+
+        if not known_rate:
+            # Prompted rate is an explicit override.
+            kwargs["sample_rate"] = sample_rate
+
+        if not known_dtype:
+            # Prompted dtype is an explicit override.
+            kwargs["dtype"] = dtype
+
+        samples_obj = load_signal(path, **kwargs)
+
+        return samples_obj.samples, float(samples_obj.sample_rate)
+
+        # ========================================================
+        # EXPORT + PROVENANCE
+        # ========================================================
+
+    def export_result_json(self):
+        """Save the full V2 payload (all stages + provenance) as JSON."""
+
+        if self.pipeline_result is None:
+            QMessageBox.information(
+            self,
+            "Nothing to export",
+            "Run an analysis first.",
+            )
+            return
+
+        import json
+
+        default_name = "analysis_result.json"
+
+        if self.current_file is not None:
+            from pathlib import Path as _Path
+
+            default_name = _Path(self.current_file).stem + "_analysis.json"
+
+        path, _ = QFileDialog.getSaveFileName(
+        self,
+        "Export analysis result",
+        default_name,
+        "JSON files (*.json)",
+        )
+
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                self.pipeline_result,
+                handle,
+                indent=2,
+                default=str,
+                )
+
+        except Exception as exc:
+            QMessageBox.critical(
+            self,
+            "Export failed",
+            str(exc),
+            )
+            return
+
+        QMessageBox.information(
+        self,
+        "Export complete",
+        f"Analysis result written to\n{path}",
+        )
+
+    def show_provenance(self):
+        """Per-stage timings, configuration, versions of the last run."""
+
+        provenance = self._pipeline_provenance
+
+        if not provenance:
+            QMessageBox.information(
+            self,
+            "Provenance",
+            "No provenance recorded yet (run an analysis first).",
+            )
+            return
+
+        lines = []
+
+        software = provenance.get("software_version", "?")
+
+        commit = provenance.get("git_commit")
+
+        lines.append(
+        f"Spectra {software}"
+        + (f" (git {commit})" if commit else "")
+        )
+
+        lines.append(
+        f"Python {provenance.get('python_version', '?')}"
+        )
+
+        started = provenance.get("started_utc", "?")
+
+        lines.append(f"Started: {started}")
+
+        lines.append("")
+
+        lines.append("Stages:")
+
+        for step in provenance.get("steps") or []:
+
+            lines.append(
+            f"  {step.get('name', '?'):16s} "
+            f"{float(step.get('duration_ms', 0.0)):9.1f} ms  "
+            f"[{step.get('status', '?')}]"
+            )
+
+        total_ms = sum(
+        float(step.get("duration_ms", 0.0))
+        for step in provenance.get("steps") or []
+        )
+
+        lines.append(f"  {'TOTAL':16s} {total_ms:9.1f} ms")
+
+        QMessageBox.information(
+        self,
+        "Analysis provenance",
+        "\n".join(lines),
+        )

@@ -283,7 +283,7 @@ def validate(
         )
 
 
-def main():
+def test_test_demodulation_pipeline():
 
     print("=" * 70)
     print("V2 DEMODULATION PIPELINE TEST")

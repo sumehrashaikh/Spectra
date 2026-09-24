@@ -228,7 +228,7 @@ def run_test(
     return result
 
 
-def main():
+def test_test_classification_pipeline():
 
     print("=" * 70)
     print("V2 CLASSIFICATION PIPELINE TEST")
