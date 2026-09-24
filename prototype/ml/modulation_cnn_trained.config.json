@@ -1,0 +1,115 @@
+{
+  "class_name": "Sequential",
+  "input_shape": [
+    512,
+    2
+  ],
+  "num_classes": 16,
+  "labels": [
+    "BPSK",
+    "QPSK",
+    "8PSK",
+    "16QAM",
+    "64QAM",
+    "PAM4",
+    "BFSK",
+    "4FSK",
+    "8FSK",
+    "MSK",
+    "GMSK",
+    "OOK",
+    "ASK4",
+    "AM-DSB",
+    "AM-SSB",
+    "Noise"
+  ],
+  "labels_source": "ml.dataset classes (training ground truth)",
+  "normalization": "unit_rms",
+  "batch_norm_epsilon": 0.001,
+  "conv_padding": "valid",
+  "pooling": "max, stride 2",
+  "activation_head": "softmax",
+  "trained": true,
+  "training": {
+    "frames_per_class": 40,
+    "epochs": 10,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "seed": 7,
+    "train_samples": 512,
+    "val_samples": 128,
+    "best_val_accuracy": 0.3125,
+    "final_val_accuracy": 0.3125,
+    "per_class_val_accuracy": {
+      "BPSK": 0.0,
+      "QPSK": 0.0,
+      "8PSK": 0.0,
+      "16QAM": 0.625,
+      "64QAM": 0.0,
+      "PAM4": 0.0,
+      "BFSK": 0.125,
+      "4FSK": 0.25,
+      "8FSK": 0.5,
+      "MSK": 0.25,
+      "GMSK": 0.0,
+      "OOK": 0.0,
+      "ASK4": 0.75,
+      "AM-DSB": 0.625,
+      "AM-SSB": 1.0,
+      "Noise": 0.875
+    },
+    "history": [
+      {
+        "epoch": 1,
+        "loss": 8.033257860767403,
+        "val_accuracy": 0.1796875
+      },
+      {
+        "epoch": 2,
+        "loss": 3.3820717721694304,
+        "val_accuracy": 0.1953125
+      },
+      {
+        "epoch": 3,
+        "loss": 2.639607936729864,
+        "val_accuracy": 0.234375
+      },
+      {
+        "epoch": 4,
+        "loss": 2.093743652122228,
+        "val_accuracy": 0.25
+      },
+      {
+        "epoch": 5,
+        "loss": 1.9400455933349912,
+        "val_accuracy": 0.265625
+      },
+      {
+        "epoch": 6,
+        "loss": 1.9124397057192621,
+        "val_accuracy": 0.2890625
+      },
+      {
+        "epoch": 7,
+        "loss": 1.6448062737666462,
+        "val_accuracy": 0.296875
+      },
+      {
+        "epoch": 8,
+        "loss": 1.4845335717407184,
+        "val_accuracy": 0.2734375
+      },
+      {
+        "epoch": 9,
+        "loss": 1.5961999291153106,
+        "val_accuracy": 0.2890625
+      },
+      {
+        "epoch": 10,
+        "loss": 1.4383526101705049,
+        "val_accuracy": 0.3125
+      }
+    ]
+  },
+  "note": "Trained in-project on synthetic frames from ml.dataset (repo RRC + channel simulator); validated on a synthetic holdout only. Real-world performance is unmeasured."
+}

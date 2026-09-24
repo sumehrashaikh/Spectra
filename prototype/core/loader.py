@@ -1,12 +1,107 @@
 from pathlib import Path
+import struct
 import wave
 
 import numpy as np
+
+from prototype.core.logging_config import logger
 
 try:
     from scipy.signal import hilbert
 except ImportError:
     hilbert = None
+
+
+def _load_wav_float_via_scipy(file_path: Path):
+    """
+    Read an IEEE-float WAV via scipy and apply the same channel
+    convention as the PCM path (stereo → IQ, mono → Hilbert).
+    """
+
+    try:
+        from scipy.io import wavfile as _wavfile
+    except ImportError as exc:  # pragma: no cover
+        raise ValueError(
+            "scipy is required to read IEEE-float WAV files."
+        ) from exc
+
+    try:
+        sample_rate, data = _wavfile.read(str(file_path))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid WAV file: {file_path}"
+        ) from exc
+
+    data = np.asarray(data)
+
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+
+    if data.shape[0] == 0:
+        raise ValueError("WAV file contains no samples.")
+
+    if data.dtype.kind == "f":
+        scaled = data.astype(np.float64)
+
+        if not np.all(np.isfinite(scaled)):
+            scaled = np.nan_to_num(
+            scaled,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+            )
+    else:
+        # scipy decoded an integer PCM format; rescale like the PCM path
+        if data.dtype.kind == "i":
+            info = np.iinfo(data.dtype)
+            scaled = data.astype(np.float64) / float(abs(info.min))
+        elif data.dtype.kind == "u":
+            info = np.iinfo(data.dtype)
+            midpoint = (float(info.max) + 1.0) / 2.0
+            scaled = (data.astype(np.float64) - midpoint) / midpoint
+        else:
+            raise ValueError(
+                f"Unsupported WAV sample format: {data.dtype}"
+            )
+
+    channels = scaled.shape[1]
+
+    if channels == 1:
+
+        logger.info("WAV mode: MONO real signal (float)")
+
+        if hilbert is None:
+            raise ImportError(
+                "scipy is required for mono RF/WAV "
+                "analytic-signal conversion."
+            )
+
+        samples = hilbert(
+            scaled[:, 0]
+        ).astype(np.complex128)
+
+    elif channels == 2:
+
+        logger.info("WAV mode: STEREO IQ (float)")
+
+        samples = (
+            scaled[:, 0]
+            + 1j * scaled[:, 1]
+        )
+
+    else:
+        raise ValueError(
+            "Unsupported WAV channel count. "
+            "Only mono and stereo WAV files "
+            "are currently supported."
+        )
+
+    if samples.size == 0:
+        raise ValueError("WAV file contains no samples.")
+
+    samples = samples - np.mean(samples)
+
+    return samples, float(sample_rate)
 
 
 def load_wav(path: str):
@@ -47,6 +142,11 @@ def load_wav(path: str):
             "rb"
         )
     except wave.Error as exc:
+        # Python's wave module rejects IEEE-float WAVs (format tag 3).
+        # Those are common for IQ captures, so fall back to scipy's
+        # reader which supports float32/float64 WAV natively.
+        if "unknown format: 3" in str(exc):
+            return _load_wav_float_via_scipy(file_path)
         raise ValueError(
             f"Invalid WAV file: {file_path}"
         ) from exc
@@ -67,10 +167,61 @@ def load_wav(path: str):
         )
 
     # --------------------------------------------------------
+    # IEEE-float WAV (format tag 3) is not handled by the PCM
+    # branches below; detect it by re-reading the fmt chunk.
+    # --------------------------------------------------------
+
+    is_float_format = False
+
+    try:
+        with open(file_path, "rb") as fh:
+            header = fh.read(4096)
+
+        fmt_index = header.find(b"fmt ")
+
+        if fmt_index >= 0 and fmt_index + 16 <= len(header):
+            (
+            audio_format,
+            _nchannels,
+            _rate,
+            _byterate,
+            _align,
+            bits,
+            ) = struct.unpack_from(
+            "<HHIIHH",
+            header,
+            fmt_index + 8,
+            )
+
+            is_float_format = (
+            audio_format == 3 and bits == 64
+            ) or (
+            audio_format == 3 and bits == 32
+            )
+
+    except OSError:
+        # header unreadable: assume PCM; the main read already succeeded
+        is_float_format = False
+
+    # --------------------------------------------------------
     # Convert PCM → floating point
     # --------------------------------------------------------
 
-    if sample_width == 1:
+    if is_float_format:
+
+        dtype = np.float32 if sample_width == 4 else np.float64
+
+        data = np.frombuffer(
+        raw,
+        dtype=dtype,
+        ).astype(np.float64)
+
+        if not np.all(np.isfinite(data)):
+            # sanitize so the complex math stays finite; the NaN check
+            # below still guards the final samples
+            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    elif sample_width == 1:
 
         data = np.frombuffer(
             raw,
@@ -121,9 +272,7 @@ def load_wav(path: str):
 
     if channels == 1:
 
-        print(
-            "WAV mode: MONO real signal"
-        )
+        logger.info("WAV mode: MONO real signal")
 
         real_signal = data[:, 0]
 
@@ -148,17 +297,7 @@ def load_wav(path: str):
 
     elif channels == 2:
 
-        print(
-            "WAV mode: STEREO IQ"
-        )
-
-        print(
-            "Channel 0 = I"
-        )
-
-        print(
-            "Channel 1 = Q"
-        )
+        logger.info("WAV mode: STEREO IQ (channel 0 = I, channel 1 = Q)")
 
         samples = (
             data[:, 0]

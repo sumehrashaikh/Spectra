@@ -1,187 +1,258 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+
+from .signal import Signal
+
+
+@dataclass
+class IsolationResult:
+    """
+    Result of signal isolation and digital down conversion.
+    """
+
+    signal: Signal
+    center_frequency: float
+    bandwidth: float
+    low_cutoff: float
+    high_cutoff: float
+
+    def summary(self) -> dict:
+        return {
+            "center_frequency": self.center_frequency,
+            "bandwidth": self.bandwidth,
+            "low_cutoff": self.low_cutoff,
+            "high_cutoff": self.high_cutoff,
+            "num_samples": self.signal.num_samples,
+            "sample_rate": self.signal.sample_rate,
+            "duration": self.signal.duration,
+        }
+
+
+def frequency_shift(
+    signal: Signal,
+    frequency_offset: float,
+) -> Signal:
+    """
+    Shift a signal in frequency.
+
+    Positive frequency_offset shifts the signal downward
+    by that amount.
+
+    Example:
+        500 Hz signal + frequency_offset=500 Hz
+        -> approximately 0 Hz.
+    """
+
+    if not isinstance(signal, Signal):
+        raise TypeError(
+            "frequency_shift() requires a Signal object."
+        )
+
+    samples = signal.samples
+    sample_rate = signal.sample_rate
+
+    time = np.arange(
+        signal.num_samples,
+        dtype=np.float64,
+    ) / sample_rate
+
+    oscillator = np.exp(
+        -1j * 2.0 * np.pi * frequency_offset * time
+    )
+
+    shifted_samples = samples * oscillator
+
+    metadata = signal.metadata.copy()
+    metadata["frequency_shift_hz"] = float(
+        frequency_offset
+    )
+
+    return Signal(
+        samples=shifted_samples,
+        sample_rate=sample_rate,
+        metadata=metadata,
+    )
+
+
+def lowpass_filter(
+    signal: Signal,
+    cutoff_hz: float,
+    filter_order: int = 6,
+) -> Signal:
+    """
+    Apply a Butterworth low-pass filter.
+
+    The filter is applied using zero-phase filtering
+    when SciPy is available.
+    """
+
+    if not isinstance(signal, Signal):
+        raise TypeError(
+            "lowpass_filter() requires a Signal object."
+        )
+
+    if cutoff_hz <= 0:
+        raise ValueError(
+            "Cutoff frequency must be positive."
+        )
+
+    nyquist = signal.sample_rate / 2.0
+
+    if cutoff_hz >= nyquist:
+        raise ValueError(
+            "Cutoff frequency must be below the Nyquist frequency."
+        )
+
+    if filter_order < 1:
+        raise ValueError(
+            "Filter order must be at least 1."
+        )
+
+    try:
+        from scipy.signal import butter, sosfiltfilt
+    except ImportError as exc:
+        raise ImportError(
+            "SciPy is required for low-pass filtering."
+        ) from exc
+
+    normalized_cutoff = cutoff_hz / nyquist
+
+    sos = butter(
+        filter_order,
+        normalized_cutoff,
+        btype="lowpass",
+        output="sos",
+    )
+
+    # Filter real and imaginary components separately.
+    filtered_real = sosfiltfilt(
+        sos,
+        np.real(signal.samples),
+    )
+
+    filtered_imag = sosfiltfilt(
+        sos,
+        np.imag(signal.samples),
+    )
+
+    filtered_samples = (
+        filtered_real
+        + 1j * filtered_imag
+    )
+
+    metadata = signal.metadata.copy()
+    metadata["lowpass_cutoff_hz"] = float(
+        cutoff_hz
+    )
+    metadata["filter_order"] = int(
+        filter_order
+    )
+
+    return Signal(
+        samples=filtered_samples,
+        sample_rate=signal.sample_rate,
+        metadata=metadata,
+    )
 
 
 def isolate_signal(
-    samples,
-    sample_rate,
-    center_frequency,
-    bandwidth,
-    guard_factor=1.5
-):
+    signal: Signal,
+    center_frequency: float,
+    bandwidth: float,
+    filter_margin: float = 1.25,
+    filter_order: int = 6,
+) -> IsolationResult:
     """
-    Isolate an automatically detected signal.
+    Isolate a detected signal and move it to baseband.
 
-    Handles both:
-    - ordinary real RF signals
-    - complex baseband IQ signals
+    Steps:
+
+        Wideband signal
+             ↓
+        Frequency shift
+             ↓
+        Baseband signal
+             ↓
+        Low-pass filter
+             ↓
+        Isolated signal
     """
 
-    if samples is None or len(samples) == 0:
-        raise ValueError("Signal is empty.")
+    if not isinstance(signal, Signal):
+        raise TypeError(
+            "isolate_signal() requires a Signal object."
+        )
 
-    nyquist = sample_rate / 2
-
-    # --------------------------------------------------------
-    # COMPLEX IQ BASEBAND
-    # --------------------------------------------------------
-
-    if np.iscomplexobj(samples):
-
-        # Baseband signal centered near DC.
-        if abs(center_frequency) < sample_rate * 0.05:
-
-            # ``bandwidth`` describes the detected occupied *two-sided*
-            # interval.  A low-pass cutoff must first reach the furthest
-            # detected edge from DC, then leave transition/pulse-shaping
-            # room outside that edge.  The old expression used only a
-            # scaled half-bandwidth as the cutoff, which could clip a
-            # slightly offset IQ signal and its timing information.
-            detected_half_bandwidth = max(
-                float(bandwidth) / 2.0,
-                sample_rate / 10000,
-            )
-
-            furthest_detected_edge = (
-                abs(float(center_frequency))
-                + detected_half_bandwidth
-            )
-
-            # Add a generous, scale-aware guard on either side of the
-            # detected interval.  This is based solely on the detector's
-            # occupied-bandwidth estimate; it does not assume a symbol rate
-            # or samples-per-symbol value.
-            guard_hz = (
-                max(float(guard_factor), 0.0)
-                * detected_half_bandwidth
-            )
-
-            cutoff = max(
-                furthest_detected_edge + guard_hz,
-                sample_rate / 2000
-            )
-
-            cutoff = min(
-                cutoff,
-                nyquist * 0.9
-            )
-
-            normalized = (
-                cutoff / nyquist
-            )
-
-            sos = butter(
-                6,
-                normalized,
-                btype="lowpass",
-                output="sos"
-            )
-
-            i_filtered = sosfiltfilt(
-                sos,
-                samples.real
-            )
-
-            q_filtered = sosfiltfilt(
-                sos,
-                samples.imag
-            )
-
-            filtered = (
-                i_filtered
-                + 1j * q_filtered
-            )
-
-            return filtered, {
-                "mode": "IQ low-pass",
-                "filter_low": -cutoff,
-                "filter_high": cutoff,
-                "center_frequency":
-                    float(center_frequency),
-                "bandwidth":
-                    float(2 * cutoff),
-            }
-
-    # --------------------------------------------------------
-    # GENERAL BAND-PASS
-    # --------------------------------------------------------
-
-    half_bandwidth = max(
-        bandwidth * guard_factor / 2,
-        sample_rate / 10000
-    )
-
-    low = (
-        center_frequency
-        - half_bandwidth
-    )
-
-    high = (
-        center_frequency
-        + half_bandwidth
-    )
-
-    low = max(
-        low,
-        1.0
-    )
-
-    high = min(
-        high,
-        nyquist - 1.0
-    )
-
-    if low >= high:
-
+    if bandwidth < 0:
         raise ValueError(
-            "Invalid filter bandwidth."
+            "Bandwidth cannot be negative."
         )
 
-    low_norm = low / nyquist
-    high_norm = high / nyquist
+    if filter_margin <= 0:
+        raise ValueError(
+            "Filter margin must be positive."
+        )
 
-    sos = butter(
-        6,
-        [
-            low_norm,
-            high_norm
-        ],
-        btype="bandpass",
-        output="sos"
+    nyquist = signal.sample_rate / 2.0
+
+    # A zero bandwidth can occur with a single-bin tone.
+    # Give the filter a small practical bandwidth in that case.
+    effective_bandwidth = max(
+        bandwidth,
+        signal.sample_rate / signal.num_samples,
     )
 
-    if np.iscomplexobj(samples):
+    cutoff_hz = (
+        effective_bandwidth
+        / 2.0
+        * filter_margin
+    )
 
-        i_filtered = sosfiltfilt(
-            sos,
-            samples.real
-        )
+    # Keep the cutoff safely below Nyquist.
+    cutoff_hz = min(
+        cutoff_hz,
+        nyquist * 0.95,
+    )
 
-        q_filtered = sosfiltfilt(
-            sos,
-            samples.imag
-        )
+    # 1. Move the detected carrier to DC.
+    baseband = frequency_shift(
+        signal,
+        center_frequency,
+    )
 
-        filtered = (
-            i_filtered
-            + 1j * q_filtered
-        )
+    # 2. Remove frequencies outside the isolated signal.
+    isolated = lowpass_filter(
+        baseband,
+        cutoff_hz,
+        filter_order=filter_order,
+    )
 
-    else:
+    metadata = isolated.metadata.copy()
 
-        filtered = sosfiltfilt(
-            sos,
-            samples
-        )
+    metadata["isolated"] = True
+    metadata["original_center_frequency_hz"] = float(
+        center_frequency
+    )
+    metadata["original_bandwidth_hz"] = float(
+        bandwidth
+    )
+    metadata["isolation_cutoff_hz"] = float(
+        cutoff_hz
+    )
 
-    return filtered, {
-        "mode": "Band-pass",
-        "filter_low":
-            float(low),
-        "filter_high":
-            float(high),
-        "center_frequency":
-            float(center_frequency),
-        "bandwidth":
-            float(high - low),
-    }
+    isolated = Signal(
+        samples=isolated.samples,
+        sample_rate=isolated.sample_rate,
+        metadata=metadata,
+    )
+
+    return IsolationResult(
+        signal=isolated,
+        center_frequency=float(center_frequency),
+        bandwidth=float(bandwidth),
+        low_cutoff=-cutoff_hz,
+        high_cutoff=cutoff_hz,
+    )

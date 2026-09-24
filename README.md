@@ -1,160 +1,138 @@
-<<<<<<< HEAD
-# SIH Signal Analyzer
+# SPECTRA — RF / Signal Analysis Platform
 
-Prototype signal-analysis application for the SIH project.
+Spectra loads IQ/WAV captures, detects signals, isolates candidates,
+extracts parameters, estimates symbol rate, synchronizes carrier and
+timing, classifies modulation, demodulates, and reports BER — from the
+Python API, the command line, or the desktop GUI.
 
-The current prototype is built with Python, NumPy, SciPy, Matplotlib and PySide6.
+**Scope and validation status (read this first).** Spectra is an
+engineering prototype validated exclusively on *synthetic* signals. It
+is **not** certified, flight-qualified, mission-qualified, or approved
+for operational deployment by any organization. Benchmark numbers in
+this repository characterize the processing chain on simulated
+channels; they are not real-world or hardware validation.
 
----
+## Quick start
 
-## Current Capabilities
+```bash
+# from the repository root (package folder: prototype/)
+pip install -e .
 
-### Input
+# CLI self-check (synthetic QPSK through the full pipeline)
+spectra validate
 
-- WAV file loading
-- Mono WAV support
-- Stereo IQ WAV support
+# Analyze a capture (WAV or raw IQ)
+spectra analyze path/to/capture.wav
+spectra analyze capture.c64 --sample-rate 8000 --dtype complex64
 
-### Visualization
+# Detection / classification / parameters only
+spectra detect capture.wav
+spectra classify capture.wav --synchronized
+spectra parameters capture.wav
 
-- Time-domain waveform
-- FFT spectrum
-- Waterfall / spectrogram
-- IQ constellation
+# Demodulation + BER against a transmitted-bit reference (NPZ: bits=...)
+spectra demodulate capture.wav --reference capture.reference.npz
 
-### Signal analysis
+# HTML + JSON report
+spectra report capture.wav --html report.html --json results.json
 
-- Sample-rate extraction
-- RMS and peak measurement
-- Spectral peak detection
-- Signal detection
-- Multiple-signal detection
-- Signal selection
-- Signal isolation
-- Dominant-frequency estimation
-- Initial bandwidth estimation
-- Noise-floor estimation
+# SNR benchmark (synthetic AWGN channel)
+spectra benchmark --modulation QPSK --snr-db 30,20,10,0
 
-### Modulation
+# Desktop GUI
+spectra gui                  # or: python -m prototype.main
+```
 
-Current baseline classifier supports:
+Every analytic command accepts `--json <path>` for machine-readable
+output and `--mode quick|balanced|deep|realtime` for processing depth.
 
-- BPSK
-- QPSK
-- 16-QAM
-- BFSK
+## Python API
 
-### Timing
+```python
+from prototype.pipeline import analyze_samples
 
-A baseline autocorrelation-based symbol-rate estimator is included.
+result = analyze_samples(samples, sample_rate, reference_bits=bits)
+data = result.to_dict()   # JSON-serializable structured results
+```
 
-IMPORTANT:
-Timing recovery is still experimental for noisy IQ data.
+`data["classification"]["modulation"]`, `data["symbol_rate"]`,
+`data["synchronization"]`, `data["demodulation"]`, `data["ber"]`,
+`data["provenance"]` — every estimate carries confidence and method;
+stages that cannot produce evidence return `None` or `"Unknown"` and a
+warning. Nothing is fabricated.
 
----
+Optional ML assist (`config.ml.enabled = True`) adds `data["ml"]`: a
+CNN's modulation scores computed by a NumPy-only runtime. It is
+supplementary evidence alongside the rule-based classifier, never a
+replacement; see `docs/USER_GUIDE.md` ("Machine learning").
 
-# Requirements
+## Supported inputs
 
-Python 3.13+
+- WAV (PCM 8/16/32-bit, float32): mono → Hilbert-analytic, stereo → IQ
+- Raw interleaved IQ: complex64/128, float32/64, int8/uint8/int16/int32,
+  either endianness, I-first or Q-first
+- Separate I/Q files
+- JSON sidecars (`<name>.meta.json`) for raw captures (sample rate,
+  dtype, center frequency, …)
+- Chunked streaming via `prototype.io.loaders.stream_raw_iq`
+- Optional SDR hardware: not integrated (offline-only tool). The loader
+  abstraction accepts any file-based capture.
 
-Recommended environment:
+## Supported modulation pipeline
 
-```powershell
-python -m venv .venv
+| Modulation | Detection | Classification | Sync | Demodulation | BER |
+|---|---|---|---|---|---|
+| BPSK | yes | yes | M²-power + timing | yes | yes (polarity-searched) |
+| QPSK | yes | yes | M⁴-power + timing + 90° ambiguity search | yes | yes |
+| 16-QAM | yes | yes | M⁴-power + timing | yes | yes (unambiguous) |
+| BFSK | yes | yes (bimodal-IF rule) | timing via run-length rate | yes (coherent tones) | yes |
+| Unknown | yes | first-class result | n/a | refused (never guessed) | n/a |
 
-Activate it in PowerShell:
+## Architecture
 
-.\.venv\Scripts\Activate.ps1
+```
+prototype/
+├── core/           Signal model, exceptions, config, provenance,
+│                   preprocessing, isolation/DDC, sync, BER
+├── io/             Acquisition: WAV/raw-IQ/pair loaders, sidecars, streaming
+├── dsp/            PSD/STFT, filters (FIR/IIR/polyphase), baseband, correlation
+├── detection/      FFT candidate detection + artifact suppression
+├── parameters/     Parameter extraction, symbol-rate estimators
+├── classification/ Waveform-feature + constellation-geometry classifiers
+├── demodulation/   Modulation dispatch, QPSK ambiguity resolution
+├── modulation/     Demodulator kernels (V1-derived, validated)
+├── fec/            CRC16/32, Hamming(7,4), repetition, K=7 conv+Viterbi, interleaver
+├── simulation/     Channel impairment simulator (ground-truthed)
+├── reporting/      JSON / CSV / HTML export
+├── benchmarking/   SNR sweep harness
+├── ml/             ML subsystem: NumPy CNN runtime, synthetic dataset
+│                   generator, gradient-checked trainer, conversion tool
+├── visualization/  Matplotlib figures (spectrum/waterfall/constellation)
+├── gui/            PySide6 desktop application
+├── pipeline.py     End-to-end orchestration + provenance
+└── cli.py          Command-line interface
+```
 
-Install dependencies:
+See `docs/ARCHITECTURE.md` for the data-flow diagrams and design
+decisions, and `AGENTBRAIN.md` for the engineering journal.
 
-python -m pip install numpy scipy matplotlib PySide6 scikit-learn
+## Development
 
-Running the Prototype
+```bash
+pip install -e .[dev]
+python -m pytest -q          # full test suite
+```
 
-From the project root:
+## Documentation index
 
-C:\Users\eiraa\SIH_Project
+- `docs/ARCHITECTURE.md` — modules, data flow, design decisions
+- `docs/USER_GUIDE.md` — task-oriented usage (CLI + API)
+- `docs/GUI_USER_GUIDE.md` — launch-and-operate guide for the desktop GUI
+- `docs/VALIDATION.md` — what is and is not validated (validation matrix)
+- `CHANGELOG.md` — release history
+- `AGENTBRAIN.md` — engineering journal / agent continuity
 
-run:
+## License
 
-python prototype\main.py
-Test 1 — Simple WAV
-
-Use:
-
-prototype\data\input\test_signal.wav
-
-This test contains two tones:
-
-3000 Hz
-7000 Hz
-
-Expected behavior:
-
-Spectrum shows the two tones
-Waterfall shows both tones
-Detected Signals shows approximately 3000 Hz and 7000 Hz
-Selecting a signal allows isolation
-Test 2 — BPSK IQ
-
-Use:
-
-prototype\data\input\bpsk_iq.wav
-
-Expected behavior:
-
-Stereo WAV is interpreted as I/Q
-IQ constellation becomes available
-Signal is detected around baseband
-BPSK baseline classification is available
-
-Known generation parameters:
-
-Sample rate: 8000 samples/s
-Symbol rate: 100 symbols/s
-Samples/symbol: 80
-SNR: 15 dB
-
-NOTE:
-The current timing-recovery implementation may not yet recover the exact
-100 symbols/s value. This is a known development area.
-
-Basic Workflow
-Click Open WAV
-Select a test signal
-Click Analyze Signal
-Review detected signals
-Select a signal from the table
-Click Isolate Selected
-Click Analyze Selected
-
-Current Development Status
-Completed
-WAV input
-Basic signal visualization
-Spectrum
-Waterfall
-Signal detection
-Multiple signal detection
-Signal selection
-Signal isolation
-IQ constellation support
-Baseline modulation classifier
-In Progress
-Robust symbol-rate estimation
-Timing recovery
-Per-signal modulation analysis
-Robust SNR estimation
-Planned
-BPSK/QPSK/QAM/FSK demodulation
-Bitstream extraction
-De-interleaving
-FEC decoding
-Bit-stream correlation
-CNN/LSTM based modulation classification
-Raw IQ format support
-Final integrated GUI
-=======
-# SIH-Signal-Analyzer
->>>>>>> 723010e2c510f090c2795c1f4db05a861c88b9fd
+Proprietary — see project governance. No telemetry, no network I/O;
+all processing is offline.
