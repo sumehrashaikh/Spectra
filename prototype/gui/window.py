@@ -50,6 +50,7 @@ QTableWidget,
 QTableWidgetItem,
 QVBoxLayout,
 QWidget,
+QLineEdit,
 )
 
 
@@ -1065,8 +1066,221 @@ class MainWindow(QMainWindow):
         )
 
         # ========================================================
-        # OPEN WAV
+        # SOURCE SELECTOR + GNU RADIO CONFIGURATION (Phase 1)
         # ========================================================
+
+        source_layout = QHBoxLayout()
+
+        self.source_selector = QComboBox()
+
+        self.source_selector.addItems(
+        ["WAV", "Raw IQ", "GNU Radio"]
+        )
+
+        self.source_selector.setToolTip(
+        "Select the source of the samples to analyze: WAV file, raw IQ "
+        "file, or GNU Radio capture (Phase 1: selector only, no acquisition "
+        "started yet)."
+        )
+
+        self.source_selector.currentIndexChanged.connect(
+        self._on_source_changed
+        )
+
+        source_layout.addWidget(
+        QLabel("Source:")
+        )
+
+        source_layout.addWidget(
+        self.source_selector
+        )
+
+        source_layout.addStretch()
+
+        main_layout.addLayout(
+        source_layout
+        )
+
+        # ----------------------------------------------------
+        # GNU Radio configuration panel (Phase 1: config only,
+        # acquisition not started)
+        # ----------------------------------------------------
+
+        self.gnuradio_frame = QFrame()
+
+        self.gnuradio_frame.setFrameShape(
+        QFrame.Shape.StyledPanel
+        )
+
+        self.gnuradio_layout = QVBoxLayout(
+        self.gnuradio_frame
+        )
+
+        self.gnuradio_layout.setSpacing(
+        6
+        )
+
+        self.gnuradio_layout.setContentsMargins(
+        8, 8, 8, 8
+        )
+
+        self._gnuradio_controls_visible = False
+
+        config_label = QLabel(
+        "GNU Radio configuration"
+        )
+
+        config_label.setStyleSheet(
+        "font-weight: bold;"
+        )
+
+        self.gnuradio_layout.addWidget(
+        config_label
+        )
+
+        # Device / source name
+
+        self.gnuradio_source_name = QLineEdit(
+        "synthetic-bpsk"
+        )
+
+        self.gnuradio_source_name.setPlaceholderText(
+        "e.g. rtl-sdr-0, hackrf-one, synthetic-bpsk"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Device/source name:")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_source_name
+        )
+
+        # Sample rate
+
+        self.gnuradio_sample_rate = QLineEdit(
+        "1000000.0"
+        )
+
+        self.gnuradio_sample_rate.setPlaceholderText(
+        "Samples/second (e.g. 1e6 for 1 MS/s)"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Sample rate (Hz):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_sample_rate
+        )
+
+        # Center frequency
+
+        self.gnuradio_center_freq = QLineEdit(
+        "800000000.0"
+        )
+
+        self.gnuradio_center_freq.setPlaceholderText(
+        "e.g. 800e6 for 800 MHz"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Center frequency (Hz):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_center_freq
+        )
+
+        # Gain
+
+        self.gnuradio_gain = QLineEdit(
+        "12.0"
+        )
+
+        self.gnuradio_gain.setPlaceholderText(
+        "e.g. 12.0"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Gain (dB):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_gain
+        )
+
+        # Chunk count
+
+        self.gnuradio_max_chunks = QLineEdit(
+        "0"
+        )
+
+        self.gnuradio_max_chunks.setPlaceholderText(
+        "0 = unlimited"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Max chunks:")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_max_chunks
+        )
+
+        # Chunk size
+
+        self.gnuradio_chunk_size = QLineEdit(
+        "1048576"
+        )
+
+        self.gnuradio_chunk_size.setPlaceholderText(
+        "Samples per chunk (e.g. 1048576)"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Chunk size (samples):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_chunk_size
+        )
+
+        self.gnuradio_layout.addStretch()
+
+        main_layout.addWidget(
+        self.gnuradio_frame
+        )
+
+        # ----
+        # Source selector handler (Phase 1: visibility only).
+        # ----
+
+    def _on_source_changed(self, index: int):
+        """React to source selector change: reveal/hide the GNU Radio
+        config panel.  No acquisition is started from here."""
+
+        # Force a fresh read of the selection: do not rely on a possibly
+        # stale ``currentText()`` snapshot inside the slot.
+        selected = str(self.source_selector.currentText())
+
+        is_gnuradio = selected == "GNU Radio"
+
+        self._gnuradio_controls_visible = is_gnuradio
+
+        # Hide the GNU Radio frame unless GNU Radio is selected.
+        self.gnuradio_frame.setVisible(is_gnuradio)
+
+        # Disable the GNU Radio controls so no one can "tweak" the
+        # panel while another source is selected (not enforced here;
+        # acquisition not started this phase anyway).
+        for _widget in self.gnuradio_frame.findChildren(QWidget):
+            if isinstance(_widget, QLineEdit) or isinstance(_widget, QComboBox):
+                _widget.setEnabled(is_gnuradio)
+
+    # ========================================================
+    # OPEN WAV
+    # ========================================================
 
     def open_wav(self):
         """Open a WAV or raw IQ capture.
