@@ -40,6 +40,7 @@ accuracy, or suitability for any safety-, mission-, or
 | 15 | CLI | `spectra validate` (run manually) | QPSK + BER < 0.05 on synthetic WAV | passed: true | PASS |
 | 16 | CLI | `spectra report --html --json` | files produced | 8.0 KB HTML, 4.7 KB JSON | PASS |
 | 17 | Benchmark | `spectra benchmark --modulation QPSK --snr-db 30,20,10,0` | documented behavior curve | correct ≥20 dB; degraded 10 dB; Unknown 0 dB (honest) | PASS (documented) |
+| 18 | Protocol / frame layer | `tests/test_protocol.py` (6) + `tests/test_protocol_pipeline.py` (4) | sync word found + payload recovered; no-sync → Unknown (never guessed); JSON/CSV export serializes the field | as expected | PASS |
 
 ## 3. Benchmarks (synthetic AWGN, 256 symbols, RRC α=0.35, fs=8 kHz)
 

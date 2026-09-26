@@ -21,6 +21,7 @@ ml = ["scikit-learn>=1.2.0"]
 # Only needed to re-run the one-time Keras-pickle conversion tool
 # (prototype.ml.tools.convert_keras_pickle); runtime inference is NumPy-only.
 ml-tools = ["h5py>=3.8"]
+gnuradio = ["gnuradio>=3.10"]
 docs = ["python-docx>=0.8.11"]
 dev = [
     "pytest>=7.0.0",

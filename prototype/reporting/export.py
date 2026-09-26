@@ -128,6 +128,7 @@ _SECTION_KEYS = [
     ("synchronization", "Synchronization"),
     ("classification", "Classification"),
     ("demodulation", "Demodulation"),
+    ("protocol", "Protocol / Frame"),
     ("ber", "BER"),
     ("warnings", "Warnings"),
     ("provenance", "Provenance"),

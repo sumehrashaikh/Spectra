@@ -4,7 +4,10 @@ The CNN is optional evidence: every test here must pass without a
 deep-learning framework, using only NumPy and the packaged artifacts.
 """
 
+from __future__ import annotations
+
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,6 +21,58 @@ from prototype.ml.cnn import (
     normalize_frames,
     predict_modulation,
 )
+
+
+# ------------------------------------------------------------------
+# Fixture location (repository-independent)
+# ------------------------------------------------------------------
+
+def _resolve_repo_root() -> Path:
+    """Return this repository's source root (the directory that
+    contains ``prototype/``).
+
+    The captured signals live at the repository root. This helper
+    always resolves the root no matter which directory the tests were
+    launched from (developer: ``pytest`` from the repo root or from
+    ``prototype/``; teammate: fresh clone; CI: container checkout).
+    """
+    candidate = Path(__file__).resolve().parent.parent.parent
+    # Quite often the repository root is the current working directory
+    # (e.g. ``pytest`` run from the repo root), in which case the
+    # container layout matches the developer layout.
+    if (candidate / "prototype" / "ml" / "cnn.py").is_file():
+        return candidate
+    raise RuntimeError(
+        "Could not resolve the repository root from the test file "
+        "location. Expected <repo>/prototype/ml/cnn.py. "
+        f"Checked {candidate}."
+    )
+
+
+def _find_gui_qam16_wav() -> Path:
+    """Locate the synthetic capture used by the ML stage tests.
+
+    Layout of the shipped checkout:
+
+        <repo>/prototype/
+        ├── gui_qam16.wav
+        └── tests/
+             └── test_ml_cnn.py
+
+    The path is resolved relative to the repository root (one level
+    above ``tests/``) instead of using the current working directory,
+    so the same test passes for a developer, a teammate cloning the
+    repository, or in CI.
+    """
+    repo_root = _resolve_repo_root()
+    for candidate in (repo_root / "prototype" / "gui_qam16.wav",):
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "gui_qam16.wav not found. Expected a copy of the synthetic "
+        f"capture at {repo_root / 'prototype'}. "
+        "This fixture is required by the ML stage tests."
+    )
 
 
 # --------------------------------------------------------------
@@ -243,18 +298,30 @@ def test_dataset_generator_shapes_and_labels():
     assert bool(np.all(np.isfinite(frames)))
 
 
+def _load_gui_qam16_capture():
+    """Load the synthetic capture used by the ML stage tests.
+
+    The path is resolved relative to the repository root, not the
+    current working directory, so the test behaves identically when
+    run from the repository root, from inside ``prototype/``, from a
+    teammate's clone, or in CI.
+    """
+    from prototype.core.loader import load_wav
+
+    samples, sample_rate = load_wav(str(_find_gui_qam16_wav()))
+    return samples, sample_rate
+
+
 def test_pipeline_ml_stage_off_by_default():
     from dataclasses import replace
 
     from prototype.core.config import processing_mode_config
+    from prototype.pipeline import analyze_samples
 
     config = processing_mode_config("balanced")
     assert config.ml.enabled is False
 
-    from prototype.core.loader import load_wav
-    from prototype.pipeline import analyze_samples
-
-    samples, sample_rate = load_wav("gui_qam16.wav")
+    samples, sample_rate = _load_gui_qam16_capture()
     result = analyze_samples(samples, sample_rate, config=config)
     assert result.ml is None
 
@@ -263,10 +330,9 @@ def test_pipeline_ml_stage_enabled_payload():
     from dataclasses import replace
 
     from prototype.core.config import processing_mode_config
-    from prototype.core.loader import load_wav
     from prototype.pipeline import analyze_samples
 
-    samples, sample_rate = load_wav("gui_qam16.wav")
+    samples, sample_rate = _load_gui_qam16_capture()
     base = processing_mode_config("balanced")
     config = replace(base, ml=replace(base.ml, enabled=True))
 
