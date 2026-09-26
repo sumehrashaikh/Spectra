@@ -26,15 +26,15 @@
    │  parameters          symbol rate (delay-multiply │ |x|^2 | FSK run-length)        │
    │  core/synchronization│ carrier (M-th power) → timing (sampling-phase search)      │
    │  classification      fine (constellation geometry) ◄──────────────────────────┘  │
-   │        │                                                                        │
-   │  demodulation        demodulate_signal() dispatch → modulation kernels          │
+   │        │                                                                        │   │  demodulation        demodulate_signal() dispatch → modulation kernels          │
    │        │                                                                        │
    │  modulation/ber      polarity-aware / rotation-aware BER vs reference           │
    │        │                                                                        │
    │  fec (optional)      explicit scheme: decode_bits(bits, scheme)                 │
+   │  protocol (optional)  explicit FrameConfig → sync-word search → payload + CRC   │
    └────────────────────────────────────────┬────────────────────────────────────────┘
                                             │
-                     ┌──────────────────────▼───────────────────────┐
+                                             ┌──────────────────────▼───────────────────────┐
                      │            OUTPUT / PERSISTENCE              │
                      │  AnalysisResult dataclass → to_dict()        │
                      │  reporting/export: JSON | CSV | HTML         │
@@ -55,6 +55,7 @@
 | `dsp/filters.py` | FIR/IIR design+apply, polyphase resample | — |
 | `dsp/baseband.py` | Analytic signal, IF, mixing, IQ correction, clipping | `IQImbalance` |
 | `dsp/correlation.py` | xcorr, normalized xcorr, sync-word search | — |
+| `protocol/parser.py` | Frame decoder: sync-word search, payload extraction, CRC | `FrameConfig`, `FrameDecodeResult` |
 | `detection/detector.py` | Multi-candidate spectral detection | `SignalCandidate`, `DetectionResult` |
 | `core/isolator.py` | DDC + channel filtering | `IsolationResult` |
 | `parameters/extractor.py` | RF parameters (freq, BW, power, SNR) | `SignalParameters` |
@@ -131,3 +132,8 @@ footer and README repeat the limitation.
   `Signal` with `CaptureMetadata`; extend `load_signal()` dispatch.
 - **SDR hardware**: implement a source producing chunks consumable by
   `analyze_samples` per block; the pipeline is capture-agnostic.
+- **New protocol / frame format**: declare a `FrameConfig` (`name`,
+  `sync_word`, `data_bytes`, optional `crc`) and attach it to
+  `AnalysisConfig.protocol`. The pipeline runs the frame stage automatically
+  after the FEC pass; the GUI shows the recovered protocol row. No pipeline
+  or module changes are required to add a new protocol.

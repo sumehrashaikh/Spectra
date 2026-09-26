@@ -63,6 +63,19 @@ versioning: semantic.
   `candidate_timeline` attached to batch payloads; indeterminate progress
   bar during analysis; Export-JSON and Provenance (per-stage timings,
   versions, git commit) actions.
+- **Protocol / frame layer** (`prototype/protocol/`): a shared, explicit-
+  configuration frame decoder that runs *after* demodulation (and after
+  an optional FEC pass) on the recovered bit stream. It reuses the
+  normalized-correlation sync-word search in `dsp.correlation` and
+  declares protocols via `FrameConfig` (name, sync word, payload size,
+  optional CRC). Add a protocol without touching the pipeline: the
+  pipeline exposes `AnalysisConfig.protocol` and `analyze_capture()`
+  accepts it. Results (`result.protocol`) carry a first-class
+  `Unknown`/no-sync outcome, an honest confidence, and the payload;
+  CLI gains `--sync-word` + `--data-bytes`, and the GUI gains a
+  "Protocol" parameter row that reports the matched protocol and
+  whether sync was found. Verified: synthetic frame recovered;
+  no-sync capture reported `Unknown` (never guessed).
 - **16-QAM end-to-end blind recovery** — a QAM-specific
   synchronization chain (`core/synchronization.py::synchronize_qam_signal`):
   sub-bin residual carrier-frequency correction (4th-power tone with

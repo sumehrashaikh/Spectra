@@ -15,7 +15,7 @@ run. Results are structured dataclasses serializable to JSON.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +53,9 @@ class AnalysisResult:
     classification: dict[str, Any] | None = None
     demodulation: dict[str, Any] | None = None
     ber: dict[str, Any] | None = None
+    protocol: dict[str, Any] | None = None
     ml: dict[str, Any] | None = None
+    fusion: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     provenance: dict[str, Any] = field(default_factory=dict)
 
@@ -75,6 +77,8 @@ class AnalysisResult:
                 return _clean(value.tolist())
             if isinstance(value, complex):
                 return {"real": value.real, "imag": value.imag}
+            if is_dataclass(value):
+                return _clean(asdict(value))
             return value
 
         return {
@@ -88,7 +92,9 @@ class AnalysisResult:
             "classification": _clean(self.classification),
             "demodulation": _clean(self.demodulation),
             "ber": _clean(self.ber),
+            "protocol": _clean(self.protocol),
             "ml": _clean(self.ml),
+            "fusion": _clean(self.fusion),
             "warnings": list(self.warnings),
             "provenance": _clean(self.provenance),
         }
@@ -774,13 +780,13 @@ def analyze_samples(
             except Exception as exc:
                 result.warnings.append(f"FEC decode failed: {exc}")
 
-    # ---- ML classification (optional second opinion) ---------------------
-    # A CNN scores the isolated candidate's raw IQ as supplementary
-    # evidence; it never overrides or gates the DSP classification.
+    # ---- ML classification + fusion (optional second opinion) ----------------
+    # A CNN scores the isolated candidate's raw IQ as supplementary evidence;
+    # it never overrides or gates the deterministic DSP classification.
     if config.ml.enabled:
         with provenance.record_step("ml_classification") as step:
             try:
-                from prototype.ml.cnn import predict_modulation
+                from prototype.ml.fusion import fuse_classification
 
                 ml_result = predict_modulation(isolated.samples)
                 if ml_result is not None:
@@ -792,8 +798,64 @@ def analyze_samples(
                         "ML stage skipped: capture too short for one "
                         "512-sample frame or artifact unavailable."
                     )
+                    ml_result = None
+
+                # Deterministic DSP classification is already stored on the
+                # result; record it here as well for the fusion record.
+                dsp_modulation = (
+                    result.classification or {}
+                ).get("modulation", "Unknown")
+                fusion = fuse_classification(
+                    dsp_modulation=dsp_modulation,
+                    ml_prediction=ml_result,
+                    ml_active=config.ml.enabled,
+                    fusion=config.ml.fusion,
+                )
+                result.fusion = fusion
+                step["fusion_method"] = fusion.get("method", "side_by_side")
+                step["dsp_modulation"] = dsp_modulation
+                step["ml_modulation"] = fusion.get("ml_modulation")
+                step["final_modulation"] = fusion.get("final_modulation")
+                step["disagreement"] = fusion.get("disagreement")
             except Exception as exc:
-                result.warnings.append(f"ML stage failed: {exc}")
+                result.warnings.append(f"ML classification/fusion failed: {exc}")
+
+    # ---- protocol / frame analysis (explicit configuration only) -----
+    # Frames are decoded from the demodulated (optionally FEC-received)
+    # bit stream.  This stage is never inferred: it runs only when a
+    # FrameConfig is attached to AnalysisConfig.protocol.  Unknown is a
+    # first-class result when no sync word is found.
+    #
+    # Runs after the FEC pass so a receiver that de-codes arrives at
+    # this stage as plain bits, ready to match against a sync word.
+    if config.protocol is not None:
+        with provenance.record_step("protocol") as step:
+            try:
+                from prototype.protocol.semantics import decode_frame_semantics
+
+                # Demodulated bits (post-FEC, post-mask).
+                stream_bits = bits
+                if stream_bits is None:
+                    result.protocol = None
+                    result.warnings.append(
+                        "Protocol stage skipped: no bits available."
+                    )
+                else:
+                    result.protocol = decode_frame_semantics(
+                        bits=stream_bits,
+                        sync_word=config.protocol.sync_word,
+                        sync_word_capacity=config.protocol.sync_word_capacity,
+                        data_bytes=config.protocol.data_bytes,
+                        crc_poly=config.protocol.crc[0] if config.protocol.crc else None,
+                        crc_final_xor=config.protocol.crc[1] if config.protocol.crc else None,
+                        crc_orientation=config.protocol.crc_orientation,
+                        header_len_bytes=config.protocol.header_len_bytes,
+                    )
+                    step["protocol"] = result.protocol.protocol
+                    step["sync_found"] = bool(result.protocol.sync_found)
+            except Exception as exc:
+                result.warnings.append(f"Protocol stage failed: {exc}")
+                result.protocol = None
 
     provenance.finish()
     result.provenance = provenance_to_dict(provenance)

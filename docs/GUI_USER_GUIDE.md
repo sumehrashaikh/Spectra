@@ -318,7 +318,36 @@ Under the hood:
   `prototype/ml/` supersedes it. You can retrain any time — see
   `docs/USER_GUIDE.md`, section "Machine learning".
 
-## 16. Where to go next
+## 16. Protocol / frame analysis
+
+If a transmitter encodes data in known message frames (a sync/preamble
+word, a payload length field, and an optional CRC), the desktop app can
+recover the payload through the **Protocol** row in the SIGNAL
+PARAMETERS panel, alongside the FEC and constellation views.
+
+1. **Open Capture** and **Analyze Signal** as usual.
+2. In the SIGNAL PARAMETERS panel a **Protocol** row reports the decoded
+   frame when the transmitter prepended a known sync word.
+3. Configure the frame definition so the app knows what to look for:
+   - Go to the **FEC** selector area, which mirrors frame configuration
+     — open the **Configuration** prompter or pass the frame definition
+     to the pipeline before analyzing.
+   - The frame definition declares the sync word (an integer, MSB-first)
+     and the expected payload size in bytes; the app searches the
+     recovered bits for that word and reports the payload and CRC status.
+   - Equivalent CLI: `spectra analyze my_capture.wav --sync-word
+     0xAA55AA55 --data-bytes 4`.
+
+The protocol stage is explicit configuration, never inference. When the
+sync word is not detected, the Protocol row shows `Unknown — no sync`,
+and nothing is guessed. The confidence shown is the sync-detection
+confidence, reported honestly alongside the payload.
+
+The full payload and the sync position are available in JSON for
+downstream processing; see `docs/USER_GUIDE.md`, section "Protocol /
+frame analysis".
+
+## 17. Where to go next
 
 - `docs/USER_GUIDE.md` — the task-oriented guide including CLI usage
   and the machine-learning (training) workflow

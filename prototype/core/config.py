@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any
+from pathlib import Path
 
 from .exceptions import ConfigurationError
+from prototype.protocol.config import FrameConfig
+from prototype.ml.fusion import FusionConfig
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,8 @@ class MLConfig:
     enabled: bool = False
     max_frames: int = 8  # (512, 2) windows scored per capture
     artifact: str | None = None  # None -> packaged default artifact
+    fusion: FusionConfig = field(default_factory=FusionConfig)
+    labels_json: str | Path | None = None  # optional human label map
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,7 @@ class AnalysisConfig:
     demodulation: DemodulationConfig = field(default_factory=DemodulationConfig)
     fec: FECConfig = field(default_factory=FECConfig)
     ml: MLConfig = field(default_factory=MLConfig)
+    protocol: "FrameConfig" | None = None  # none -> no frame analysis
     candidate_index: int = 0  # which detected candidate to analyze (0 = strongest)
     max_samples: int | None = None  # truncate very long captures
 
@@ -210,7 +216,10 @@ def config_to_dict(config: AnalysisConfig) -> dict[str, Any]:
         "classification": config.classification.__dict__.copy(),
         "demodulation": config.demodulation.__dict__.copy(),
         "fec": config.fec.__dict__.copy(),
-        "ml": config.ml.__dict__.copy(),
+        "ml": {**config.ml.__dict__.copy(), "fusion": config.ml.fusion.__dict__.copy()},
+        "protocol": (
+            config.protocol.__dict__.copy() if config.protocol is not None else None
+        ),
         "candidate_index": config.candidate_index,
         "max_samples": config.max_samples,
     }

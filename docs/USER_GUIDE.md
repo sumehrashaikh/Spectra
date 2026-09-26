@@ -273,7 +273,60 @@ python -m prototype.ml.train --frames-per-class 60 --epochs 15 \
 A future `labels.json` next to the artifact remaps the 16 output
 indices to real class names without touching weights.
 
-## 11. Feature checklist
+## 11. Protocol / frame analysis
+
+When a transmitter uses a known message framing (sync/preamble word,
+data-length field, and optionally a CRC), the frame layer recovers the
+structured payload. The pipeline does **not** guess protocols: it only
+runs the frame stage when you attach an explicit frame definition.
+
+Configuration
+-------------
+
+Frame definitions are plain configuration — add one per protocol with
+`prototype.protocol.make_frame_config`:
+
+```python
+from prototype.protocol import make_frame_config, FrameConfig
+
+cfg = make_frame_config(
+    name="TelemetryFrame",
+    sync_word=0xAA55AA55,   # 32-bit preamble, MSB-first
+    data_bytes=4,           # payload after the sync word
+    crc=(0x07, 0x00),       # (poly, final_xor), optional
+)
+
+from prototype.core.config import processing_mode_config
+from dataclasses import replace
+
+from prototype.pipeline import analyze_capture
+
+config = replace(
+    processing_mode_config("balanced"),
+    protocol=cfg,
+)
+result = analyze_capture("my_capture.wav", config=config)
+```
+
+The pipeline applies the frame definition to the *recovered, demodulated
+(bits)*, and clearly reports `Unknown` when the sync word is not
+detected — it never invents a protocol. Results include the payload
+bytes, the sync-confidence, the position where the sync word landed, and
+any CRC status.
+
+Command line
+------------
+
+```bash
+spectra analyze my_capture.wav --sync-word 0xAA55AA55 --data-bytes 4
+spectrum_samples report my_capture.wav --sync-word 0xAA55AA55 \
+    --data-bytes 4 --html frame_report.html --json frame_payload.json
+```
+
+The `--json` output then carries a `protocol` section (see §8 for JSON
+export). Without a frame definition the pipeline reports `protocol: null`.
+
+## 12. Feature checklist
 
 | Feature | GUI | CLI | Python API |
 |---|---|---|---|
@@ -290,3 +343,4 @@ indices to real class names without touching weights.
 | JSON / HTML / CSV export | ✓ (JSON) | ✓ | ✓ |
 | ML (CNN) classification, NumPy runtime | ✓ (toggle) | config | ✓ |
 | ML training (synthetic dataset, gradient-checked) | — | — | ✓ |
+| Protocol/frame decode (explicit FrameConfig) | ✓ (Protocol row) | ✓ (flags) | ✓ |
