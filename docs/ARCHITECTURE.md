@@ -31,6 +31,7 @@
    │  modulation/ber      polarity-aware / rotation-aware BER vs reference           │
    │        │                                                                        │
    │  fec (optional)      explicit scheme: decode_bits(bits, scheme)                 │
+   |  fec (interleaving)  block interleaving identification + deinterleave         |
    │  protocol (optional)  explicit FrameConfig → sync-word search → payload + CRC   │
    └────────────────────────────────────────┬────────────────────────────────────────┘
                                             │
@@ -102,8 +103,8 @@ Re-running with the same inputs and config reproduces the analysis
 (bit-exact given fixed seeds).
 
 **FEC is configured, not inferred.** The FEC registry is explicit;
-the pipeline applies FEC only when `AnalysisConfig.fec.scheme` is
-set. There is no "auto-detect coding" pretending to know a protocol.
+the pipeline applies explicit FEC only when `AnalysisConfig.fec.scheme` is
+set; automatic identification runs only in `AnalysisConfig.fec.mode = auto` (see Section 9). AUTO never overwrites an explicit manual scheme, and UNKNOWN never forces a weak candidate. There is no "auto-detect coding" pretending to know a protocol.
 
 **Validation honesty.** Everything in `tests/` and `benchmarking/`
 runs on synthetic signals with ground truth. `docs/VALIDATION.md`
