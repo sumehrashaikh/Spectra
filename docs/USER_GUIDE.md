@@ -197,17 +197,91 @@ They characterize the processing chain on simulated channels — they
 are not receiver acceptance tests and say nothing about specific
 hardware.
 
-## 9. Troubleshooting
+## 9. Automatic FEC identification (Phase 2)
 
-| Symptom | Cause | Fix |
+The V2 pipeline now runs an honest, deterministic, GUI-visible and
+CLI-visible automatic FEC identification pass after demodulation.
+Nothing is guessed past what the decoders actually measure.
+
+### 9.1 How it works
+
+Supported automatically evaluated schemes:
+
+- `none` - uncoded bitstream; kept as an honest weak hypothesis
+- `repetition3` - rate-1/3 majority-vote decoder
+- `hamming74` - systematic Hamming(7,4)
+- `conv12` - K=7 convolutional code, Viterbi decoding
+
+The identifier is a *candidate evaluator*, not a decoder. It only ever
+runs the existing `prototype.fec` decoders to measure how well a
+hypothesis fits the data. It never rewrites a supported FEC family
+(Phase 2). The evaluation is deterministic, explainable and conservative.
+
+- clean supported FEC candidate -> score **80**, AUTO_DETECTED
+- corrupted/ambiguous -> score 40, UNKNOWN
+- insufficient / invalid -> score 0, UNKNOWN
+
+`MIN_CONFIDENCE = 60` is the internal heuristic threshold. Confidence is
+a heuristic number, never a calibrated probability.
+
+### 9.2 GUI
+
+The main window carries a **FEC MODE** selector: `Auto`, `Manual`, `None`.
+
+- **Auto**: the pipeline runs automatic FEC identification after
+  demodulation. On strong evidence (clean code bits) the identified
+  scheme is used for decoding.
+- **Manual**: the explicit configured FEC scheme is used as-is and is
+  authoritative. `AUTO` never silently overwrites an explicit manual
+  choice.
+- **None**: no automatic identification and no automatic FEC decoding.
+
+The result panel shows:
+- auto status (AUTO_DETECTED / UNKNOWN / unresolved)
+- detected scheme, confidence, corrected errors, residual estimate,
+  validation
+- candidate evidence list
+
+### 9.3 CLI
+
+`--fec-mode auto | manual | none` on `analyze`/`report`:
+
+```bash
+spectra analyze file.wav --fec-mode auto
+spectra analyze file.wav --fec-mode manual --fec scheme=hamming74
+spectra analyze file.wav --fec-mode none
+```
+
+Identification fields (status, best_scheme, confidence, candidates,
+evidence, warnings) are included in the JSON and HTML report.
+
+### 9.4 Reporting / provenance
+
+`fec_identification` and block-interleaving identification are recorded as
+production provenance steps. CRC16/CRC32 stay error-detection-only.
+
+### 9.5 SIH / requirement matrix (Phase 3)
+
+| Requirement | Implementation status | Where |
 |---|---|---|
-| "requires a sample rate" | raw IQ without sidecar | enter it in the GUI prompt, or pass `--sample-rate` |
-| "not a multiple of the sample size" | wrong dtype for a raw IQ file | pick the correct format in the prompt / `--dtype` |
-| "no candidates detected" | threshold above signal | `--mode deep`, or check the file is IQ (not audio) |
-| classification flips between runs | borderline confidence | inspect features; increase capture length |
-| BER ≈ 0.5 on BPSK/QAM | ambiguity unresolved or sync failed | check `ambiguity_resolution`; verify with the constellation |
-| rate shows 24.99 for a 100 Hz signal | symbol-rate subharmonic mislock (short captures) | known limitation; trust the constellation, not the rate alone |
-| FEC shows a warning, no decode | bit count not a block multiple | pad/pick a matching scheme (repetition3 needs ×3, hamming74 ×7) |
+| AUTO / MANUAL / NONE block-interleaving mode | Implemented | `cli.py` `--interleaving-mode`; `core/config.py` `FECMode`; `pipeline.py` `interleaving_identification` step; `gui/window.py` selector |
+| Block interleaving identification (auto-detect depth) | Implemented | `fec/identification_interleaving.py` (row-column block only) |
+| Deinterleaving of detected depth | Implemented | `fec/interleaving.py`; applied in `pipeline.py` on AUTO_DETECTED |
+| GUI display of detected type / depth / status / confidence / candidates | Implemented | `gui/window.py` new labels + `update_analysis_parameters()` |
+| GUI selector (Auto / Manual / None) | Implemented | `gui/window.py` `interleaving_mode_combo` |
+| CLI expose detected depth/status/confidence/candidates in JSON | Implemented | `cli.py` propagates `interleaving_mode`; result dict carries `demodulation.interleaving_result` | 
+| Provenance / result serialization includes interleaving | Implemented | `pipeline.py` stores `demodulation.interleaving_result`; `to_dict()` serializes nested dicts |
+| New interleaver families (conv/diagonal/pseudo-random) | NOT added | block only, existing `deinterleave_bits` reused |
+| New FEC families (RS/LDPC/concatenated) | NOT added | explicit-scheme decode only, unchanged |
+| Modify DSP / classifier / synchronisation | NOT done | classification/modulation/synchronization untouched |
+
+### 9.6 Limitations
+
+Validated on synthetic fixed-seed packets with known references. Not
+real-world RF identification accuracy. Interleaving identification is now
+in scope for this phase; the structural identifier runs only on the
+demodulated bitstream (no waveform input) and reports AUTO_DETECTED only
+on genuine structural evidence.
 
 ## 10. Machine learning
 

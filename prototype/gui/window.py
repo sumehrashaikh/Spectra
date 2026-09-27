@@ -50,6 +50,7 @@ QTableWidget,
 QTableWidgetItem,
 QVBoxLayout,
 QWidget,
+QLineEdit,
 )
 
 
@@ -65,6 +66,7 @@ basic_stats,
 )
 
 from prototype.fec import list_schemes as list_fec_schemes
+from prototype.core.config import FECMode
 
 from prototype.core.loader import load_wav
 
@@ -207,6 +209,10 @@ class MainWindow(QMainWindow):
         self.pipeline_result = None
         self.pipeline_mode = "balanced"
 
+        # Automatic FEC identification result (Phase 2)
+        self._identification_result = None
+        self._identification_candidates = None
+
         # Last analysis provenance (stage timings, versions) — captured
         # at result-apply time and shown via "Provenance".
         self._pipeline_provenance = None
@@ -346,8 +352,58 @@ class MainWindow(QMainWindow):
         "is reported alongside the DSP result, never instead of it."
         )
 
-        # FEC decoding is explicit configuration, never guessed by the
-        # pipeline; the selector maps 1:1 onto the FEC framework.
+        # Automatic FEC identification policy: AUTO / MANUAL / NONE.
+        self.fec_mode_combo = QComboBox()
+
+        self.fec_mode_combo.addItem(FECMode.AUTO)
+
+        self.fec_mode_combo.addItem(FECMode.MANUAL)
+
+        self.fec_mode_combo.addItem(FECMode.NONE)
+
+        self.fec_mode_combo.setCurrentText(FECMode.AUTO)
+
+        self.fec_mode_combo.setToolTip(
+        "How automatic FEC identification / deinterleaving is applied: "
+        "Auto = run the block-interleaving identifier and decode on strong "
+        "evidence (never overwrites a manual scheme); Manual = apply the "
+        "configured interleave depth authoritatively; None = skip "
+        "identification and deinterleaving."
+        )
+
+        self.interleaving_mode_combo = QComboBox()
+
+        self.interleaving_mode_combo.addItem("Auto")
+
+        self.interleaving_mode_combo.addItem("Manual")
+
+        self.interleaving_mode_combo.addItem("None")
+
+        self.interleaving_mode_combo.setCurrentText("Auto")
+
+        self.interleaving_mode_combo.setToolTip(
+        "How the block interleaver is handled on the demodulated "
+        "bitstream: Auto = identify the interleaver and deinterleave on "
+        "strong structural evidence (no manual scheme overwritten); Manual "
+        "= apply the configured interleave depth authoritatively; None = "
+        "the received bitstream is passed through unchanged (no "
+        "identification, no deinterleaving)."
+        )
+
+        button_layout.addWidget(QLabel("INTERLEAVING MODE:"))
+
+        button_layout.addWidget(
+        self.interleaving_mode_combo
+        )
+
+        button_layout.addWidget(QLabel("FEC MODE:"))
+
+        button_layout.addWidget(
+        self.fec_mode_combo
+        )
+
+        button_layout.addWidget(QLabel("FEC:"))
+
         self.fec_combo = QComboBox()
 
         self.fec_combo.addItem("none")
@@ -360,8 +416,6 @@ class MainWindow(QMainWindow):
         "Forward error correction applied to demodulated bits. "
         "FEC is never guessed: pick the scheme the transmitter used."
         )
-
-        button_layout.addWidget(QLabel("FEC:"))
 
         button_layout.addWidget(
         self.fec_combo
@@ -992,6 +1046,58 @@ class MainWindow(QMainWindow):
         "FEC: —"
         )
 
+        self.parameter_auto_status = QLabel(
+        "Auto FEC: Not run"
+        )
+
+        self.parameter_auto_scheme = QLabel(
+        "Detected scheme: —"
+        )
+
+        self.parameter_auto_confidence = QLabel(
+        "Confidence: —"
+        )
+
+        self.parameter_auto_corrected = QLabel(
+        "Corrected errors: —"
+        )
+
+        self.parameter_auto_residual = QLabel(
+        "Residual estimate: —"
+        )
+
+        self.parameter_auto_validation = QLabel(
+        "Validation: —"
+        )
+
+        self.parameter_auto_source = QLabel(
+        "FEC source: —"
+        )
+
+        self.parameter_identify_candidates = QLabel(
+        "Identified candidates: —"
+        )
+
+        self.parameter_interleaving_mode = QLabel(
+        "Interleaving mode: —"
+        )
+
+        self.parameter_interleaving_type = QLabel(
+        "Detected type: —"
+        )
+
+        self.parameter_interleaving_depth = QLabel(
+        "Detected depth: —"
+        )
+
+        self.parameter_interleaving_status = QLabel(
+        "Status: —"
+        )
+
+        self.parameter_interleaving_confidence = QLabel(
+        "Confidence: —"
+        )
+
         self.parameter_sync_freq = QLabel(
         "Freq Offset: —"
         )
@@ -1028,6 +1134,19 @@ class MainWindow(QMainWindow):
         self.parameter_ber,
         self.parameter_decision_margin,
         self.parameter_fec,
+        self.parameter_auto_status,
+        self.parameter_auto_scheme,
+        self.parameter_auto_confidence,
+        self.parameter_auto_corrected,
+        self.parameter_auto_residual,
+        self.parameter_auto_validation,
+        self.parameter_auto_source,
+        self.parameter_identify_candidates,
+        self.parameter_interleaving_mode,
+        self.parameter_interleaving_type,
+        self.parameter_interleaving_depth,
+        self.parameter_interleaving_status,
+        self.parameter_interleaving_confidence,
         self.parameter_sync_freq,
         self.parameter_sync_phase,
         self.parameter_ml,
@@ -1065,8 +1184,221 @@ class MainWindow(QMainWindow):
         )
 
         # ========================================================
-        # OPEN WAV
+        # SOURCE SELECTOR + GNU RADIO CONFIGURATION (Phase 1)
         # ========================================================
+
+        source_layout = QHBoxLayout()
+
+        self.source_selector = QComboBox()
+
+        self.source_selector.addItems(
+        ["WAV", "Raw IQ", "GNU Radio"]
+        )
+
+        self.source_selector.setToolTip(
+        "Select the source of the samples to analyze: WAV file, raw IQ "
+        "file, or GNU Radio capture (Phase 1: selector only, no acquisition "
+        "started yet)."
+        )
+
+        self.source_selector.currentIndexChanged.connect(
+        self._on_source_changed
+        )
+
+        source_layout.addWidget(
+        QLabel("Source:")
+        )
+
+        source_layout.addWidget(
+        self.source_selector
+        )
+
+        source_layout.addStretch()
+
+        main_layout.addLayout(
+        source_layout
+        )
+
+        # ----------------------------------------------------
+        # GNU Radio configuration panel (Phase 1: config only,
+        # acquisition not started)
+        # ----------------------------------------------------
+
+        self.gnuradio_frame = QFrame()
+
+        self.gnuradio_frame.setFrameShape(
+        QFrame.Shape.StyledPanel
+        )
+
+        self.gnuradio_layout = QVBoxLayout(
+        self.gnuradio_frame
+        )
+
+        self.gnuradio_layout.setSpacing(
+        6
+        )
+
+        self.gnuradio_layout.setContentsMargins(
+        8, 8, 8, 8
+        )
+
+        self._gnuradio_controls_visible = False
+
+        config_label = QLabel(
+        "GNU Radio configuration"
+        )
+
+        config_label.setStyleSheet(
+        "font-weight: bold;"
+        )
+
+        self.gnuradio_layout.addWidget(
+        config_label
+        )
+
+        # Device / source name
+
+        self.gnuradio_source_name = QLineEdit(
+        "synthetic-bpsk"
+        )
+
+        self.gnuradio_source_name.setPlaceholderText(
+        "e.g. rtl-sdr-0, hackrf-one, synthetic-bpsk"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Device/source name:")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_source_name
+        )
+
+        # Sample rate
+
+        self.gnuradio_sample_rate = QLineEdit(
+        "1000000.0"
+        )
+
+        self.gnuradio_sample_rate.setPlaceholderText(
+        "Samples/second (e.g. 1e6 for 1 MS/s)"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Sample rate (Hz):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_sample_rate
+        )
+
+        # Center frequency
+
+        self.gnuradio_center_freq = QLineEdit(
+        "800000000.0"
+        )
+
+        self.gnuradio_center_freq.setPlaceholderText(
+        "e.g. 800e6 for 800 MHz"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Center frequency (Hz):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_center_freq
+        )
+
+        # Gain
+
+        self.gnuradio_gain = QLineEdit(
+        "12.0"
+        )
+
+        self.gnuradio_gain.setPlaceholderText(
+        "e.g. 12.0"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Gain (dB):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_gain
+        )
+
+        # Chunk count
+
+        self.gnuradio_max_chunks = QLineEdit(
+        "0"
+        )
+
+        self.gnuradio_max_chunks.setPlaceholderText(
+        "0 = unlimited"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Max chunks:")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_max_chunks
+        )
+
+        # Chunk size
+
+        self.gnuradio_chunk_size = QLineEdit(
+        "1048576"
+        )
+
+        self.gnuradio_chunk_size.setPlaceholderText(
+        "Samples per chunk (e.g. 1048576)"
+        )
+
+        self.gnuradio_layout.addWidget(
+        QLabel("Chunk size (samples):")
+        )
+
+        self.gnuradio_layout.addWidget(
+        self.gnuradio_chunk_size
+        )
+
+        self.gnuradio_layout.addStretch()
+
+        main_layout.addWidget(
+        self.gnuradio_frame
+        )
+
+        # ----
+        # Source selector handler (Phase 1: visibility only).
+        # ----
+
+    def _on_source_changed(self, index: int):
+        """React to source selector change: reveal/hide the GNU Radio
+        config panel.  No acquisition is started from here."""
+
+        # Force a fresh read of the selection: do not rely on a possibly
+        # stale ``currentText()`` snapshot inside the slot.
+        selected = str(self.source_selector.currentText())
+
+        is_gnuradio = selected == "GNU Radio"
+
+        self._gnuradio_controls_visible = is_gnuradio
+
+        # Hide the GNU Radio frame unless GNU Radio is selected.
+        self.gnuradio_frame.setVisible(is_gnuradio)
+
+        # Disable the GNU Radio controls so no one can "tweak" the
+        # panel while another source is selected (not enforced here;
+        # acquisition not started this phase anyway).
+        for _widget in self.gnuradio_frame.findChildren(QWidget):
+            if isinstance(_widget, QLineEdit) or isinstance(_widget, QComboBox):
+                _widget.setEnabled(is_gnuradio)
+
+    # ========================================================
+    # OPEN WAV
+    # ========================================================
 
     def open_wav(self):
         """Open a WAV or raw IQ capture.
@@ -1166,6 +1498,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
 
         self.progress_bar.setValue(0)
+        self._identification_result = None
+        self._identification_candidates = None
         self.parameter_ber.setText(
         "BER Validation: No reference loaded"
         )
@@ -1295,8 +1629,10 @@ class MainWindow(QMainWindow):
         mode=self.pipeline_mode,
         analyze_all=self.batch_checkbox.isChecked(),
         reference_bits=reference_bits,
+        fec_mode=self.fec_mode_combo.currentText(),
         fec_scheme=self.fec_combo.currentText(),
         ml_enabled=self.ml_checkbox.isChecked(),
+        interleaving_mode=self.interleaving_mode_combo.currentText(),
         parent=self,
         )
 
@@ -1365,6 +1701,8 @@ class MainWindow(QMainWindow):
             "Analysis failed",
             str(exc),
             )
+
+        self._update_auto_fec_display()
 
     def _apply_pipeline_result(self, payload: dict):
         """Map AnalysisResult/BatchResult dict onto the existing panels."""
@@ -1442,11 +1780,13 @@ class MainWindow(QMainWindow):
             detections = payload.get("detections") or []
 
             self.analysis = self._analysis_from_pipeline(
-            detections,
-            payload.get("input") or {},
-            )
+        detections,
+        payload.get("input") or {},
+        )
 
-            self._apply_candidate_detail(payload)
+        self._pipeline_input = payload.get("input") or {}
+
+        self._apply_candidate_detail(payload)
 
         self.update_analysis_parameters()
 
@@ -1470,6 +1810,7 @@ class MainWindow(QMainWindow):
             "Analysis complete",
             summary,
             )
+
 
     def _analysis_from_pipeline(
     self,
@@ -1592,6 +1933,17 @@ class MainWindow(QMainWindow):
 
         self._pipeline_fec_summary = demod.get("fec")
 
+        # Interleaving / block-interleaving identification result is stored
+        # under demodulation.interleaving_result (see pipeline.py).
+        self._interleaving_result = demod.get("interleaving_result")
+        self._interleaving_candidates = demod.get(
+        "interleaving_result",
+        {}
+        ).get("candidates", [])
+
+        self._identification_result = demod.get("fec_identification")
+        self._identification_candidates = demod.get("fec_identification_candidates")
+
     def _on_candidate_selected(self, index: int):
         """Batch mode: re-target the detail panels at another candidate."""
 
@@ -1648,11 +2000,27 @@ class MainWindow(QMainWindow):
             lines.append(f"BER: {ber.get('ber', 0):.6g}")
 
         else:
-            lines.append("BER: no reference loaded")
+            lines.append("BER: no reference loaded"            )
 
-        fec = self._pipeline_fec_summary
+            fec = self._pipeline_fec_summary
+
 
         if fec:
+            lines.append(
+            f"FEC ({fec.get('scheme')}): corrected "
+            f"{fec.get('corrected_errors', 0)} errors"
+            )
+
+        auto = demod.get("fec_identification")
+
+        if auto:
+            lines.append(
+            f"Auto FEC: {auto.get('status', 'unknown')} "
+            f"(scheme {auto.get('best_scheme')}, "
+            f"confidence {auto.get('confidence')}"
+            )
+
+
             lines.append(
             f"FEC ({fec.get('scheme')}): corrected "
             f"{fec.get('corrected_errors', 0)} errors"
@@ -1881,10 +2249,9 @@ class MainWindow(QMainWindow):
             "Decision Margin: —"
             )
 
-        fec = self._pipeline_fec_summary
+            fec = self._pipeline_fec_summary
 
         if fec:
-
             self.parameter_fec.setText(
             f"FEC: {fec.get('scheme')} (corrected "
             f"{fec.get('corrected_errors', 0)} errors, "
@@ -1903,6 +2270,133 @@ class MainWindow(QMainWindow):
             self.parameter_fec.setText(
             "FEC: none configured"
             )
+
+        # ---- automatic FEC identification (Phase 2) display ------------------
+
+        if self._identification_result is not None:
+
+            status_text = self._identification_result.get("status", "UNKNOWN")
+
+            self.parameter_auto_status.setText(
+            f"Auto FEC: {status_text}"
+            )
+
+            if status_text == "AUTO_DETECTED":
+                self.parameter_auto_scheme.setText(
+                f"Detected scheme: {self._identification_result.get('best_scheme')}")
+                self.parameter_auto_confidence.setText(
+                f"Confidence: {self._identification_result.get('confidence')}")
+            else:
+                self.parameter_auto_scheme.setText(
+                "Detected scheme: —")
+                self.parameter_auto_confidence.setText(
+                "Confidence: —")
+
+            self.parameter_auto_corrected.setText(
+            f"Corrected errors: "
+            f"{self._identification_result.get('corrected_error_count', 0)}"
+            )
+
+            self.parameter_auto_residual.setText(
+            f"Residual estimate: "
+            f"{self._identification_result.get('residual_error_count', 0)}"
+            )
+
+            self.parameter_auto_validation.setText(
+            f"Validation: {self._identification_result.get('validation_status', 'unknown')}")
+
+            # ---- block-interleaving identification (new) ------------------
+
+            il_result = self._interleaving_result
+
+            if il_result is not None:
+                il_status = il_result.get("status", "UNKNOWN")
+
+                self.parameter_interleaving_mode.setText(
+                f"Interleaving mode: {il_status}"
+                )
+
+                self.parameter_interleaving_type.setText(
+                f"Detected type: {il_result.get('best_type', '—')}"
+                )
+
+                depth = il_result.get("best_depth")
+                self.parameter_interleaving_depth.setText(
+                f"Detected depth: {depth if depth is not None else '—'}"
+                )
+
+                self.parameter_interleaving_status.setText(
+                f"Status: {il_status}"
+                )
+
+                self.parameter_interleaving_confidence.setText(
+                f"Confidence: {il_result.get('confidence', 0.0)}"
+                )
+
+                # Candidate evidence (compact, on one line).
+                candidates = self._interleaving_candidates or []
+                parts = []
+                for cand in candidates:
+                    parts.append(
+                    f"{cand.get('candidate')} {cand.get('score')}[{cand.get('evidence', {}).get('status', '')}]"
+                    )
+                self.parameter_identify_candidates.setText(
+                "Identified candidates: " + ("; ".join(parts) if parts else "—")
+                )
+
+            else:
+                self.parameter_interleaving_mode.setText(
+                "Interleaving mode: not run"
+                )
+                self.parameter_interleaving_type.setText(
+                "Detected type: —"
+                )
+                self.parameter_interleaving_depth.setText(
+                "Detected depth: —"
+                )
+                self.parameter_interleaving_status.setText(
+                "Status: —"
+                )
+                self.parameter_interleaving_confidence.setText(
+                "Confidence: —"
+                )
+                self.parameter_identify_candidates.setText(
+                "Identified candidates: —"
+                )
+
+            # FEC source: manual configuration is authoritative; auto
+            # inference is reported separately (never mispresented).
+            fec_cfg = self._pipeline_input.get("fec", {}) if self._pipeline_input else {}
+            fec_mode = fec_cfg.get("mode", "auto")
+
+            if fec_mode == "manual":
+                self.parameter_auto_source.setText("FEC source: User configured")
+            elif fec_mode == "none":
+                self.parameter_auto_source.setText("FEC source: None configured")
+            else:
+                self.parameter_auto_source.setText("FEC source: Auto detected")
+
+            # Candidate evidence table (compact, on one line).
+            candidates = self._identification_candidates or []
+            parts = []
+            for cand in candidates:
+                parts.append(
+                f"{cand.get('candidate')} {cand.get('score')}[{cand.get('evidence', {}).get('status', '')}]"
+                )
+            self.parameter_identify_candidates.setText(
+            "Identified candidates: " + ("; ".join(parts) if parts else "—")
+            )
+
+        else:
+            self.parameter_auto_status.setText("Auto FEC: Not run")
+            self.parameter_auto_scheme.setText("Detected scheme: —")
+            self.parameter_auto_confidence.setText("Confidence: —")
+            self.parameter_auto_corrected.setText("Corrected errors: —")
+            self.parameter_auto_residual.setText("Residual estimate: —")
+            self.parameter_auto_validation.setText("Validation: —")
+            self.parameter_auto_source.setText("FEC source: —")
+            self.parameter_identify_candidates.setText("Identified candidates: —")
+
 
         sync = self._pipeline_sync_summary or {}
 

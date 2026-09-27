@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from PySide6.QtCore import QThread, Signal as QtSignal
 
-from prototype.core.config import processing_mode_config
+from prototype.core.config import processing_mode_config, FECMode
 from prototype.core.logging_config import logger
 
 
@@ -81,6 +81,7 @@ class AnalysisWorker(QThread):
         fec_scheme: str | None = None,
         ml_enabled: bool = False,
         parent=None,
+        interleaving_mode: str = FECMode.AUTO,
     ) -> None:
         super().__init__(parent)
 
@@ -89,27 +90,58 @@ class AnalysisWorker(QThread):
         self._mode = str(mode)
         self._analyze_all = bool(analyze_all)
         self._reference_bits = reference_bits
+        self._fec_mode = self._normalize_fec_mode(fec_mode)
+        self._interleaving_mode = str(interleaving_mode)
         self._fec_scheme = fec_scheme
         self._ml_enabled = bool(ml_enabled)
+
+    @staticmethod
+    def _normalize_fec_mode(fec_mode: str | None) -> str:
+        """Normalize a FEC mode into the canonical AUTO/MANUAL/NONE space.
+
+        A bare scheme string (e.g. "hamming74") is treated as MANUAL.
+        """
+        if fec_mode is None:
+            return FECMode.AUTO
+        value = str(fec_mode).strip().lower()
+        if value in FECMode.values():
+            return value
+        # bare scheme -> treat as manual explicit FEC
+        return FECMode.MANUAL
 
     def run(self) -> None:  # noqa: D102 - Qt override
         try:
             # FEC is explicit configuration, never guessed; an unset
             # selector ("none") means the pipeline default (no FEC).
-            fec_scheme: str | None = (
-                None
-                if self._fec_scheme in (None, "", "none")
-                else str(self._fec_scheme)
-            )
+            # The mode is normalized here so AUTO/MANUAL/NONE map cleanly
+            # onto AnalysisConfig.fec.mode.
+            fec_mode = self._normalize_fec_mode(self._fec_mode)
+            fec_scheme = self._fec_scheme  # kept for compatibility
 
             from dataclasses import replace
 
             config = processing_mode_config(self._mode)
 
-            if fec_scheme is not None:
+            if fec_mode == FECMode.MANUAL and fec_scheme:
                 config = replace(
                     config,
-                    fec=replace(config.fec, scheme=fec_scheme),
+                    fec=replace(config.fec, mode=FECMode.MANUAL, scheme=fec_scheme),
+                )
+            elif fec_mode == FECMode.NONE:
+                config = replace(
+                    config,
+                    fec=replace(config.fec, mode=FECMode.NONE),
+                )
+            else:
+                # AUTO / unset -> identification runs; scheme stays None
+                # so identification, not an explicit decoder, decides.
+                config = replace(
+                    config,
+                    fec=replace(
+                        config.fec,
+                        mode=FECMode.AUTO,
+                        interleaving_mode=self._interleaving_mode,
+                    ),
                 )
 
             if self._ml_enabled:

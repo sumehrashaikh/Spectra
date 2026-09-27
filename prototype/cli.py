@@ -119,6 +119,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             sample_rate=gnuradio_signal.sample_rate,
             config=processing_mode_config(args.mode),
             reference_bits_path=args.reference,
+            interleaving_mode=args.interleaving_mode,
             input_info={
                 "source": gnuradio_signal.metadata.get("capture", {}).get(
                     "source_config",
@@ -136,6 +137,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             mode=args.mode,
             candidate_index=args.candidate,
             reference_bits_path=args.reference,
+            interleaving_mode=args.interleaving_mode,
             **_loader_kwargs(args),
         )
     _emit(result.to_dict(), args.json)
@@ -251,12 +253,12 @@ def cmd_demodulate(args: argparse.Namespace) -> int:
             data_bytes=args.data_bytes,
             description="Protocol frame configured from the CLI.",
         )
-
     result = analyze_capture(
         args.file,        mode=args.mode,
                    candidate_index=args.candidate,
                    reference_bits_path=args.reference,
                    protocol=protocol_config,
+                   interleaving_mode=args.interleaving_mode,
                    **_loader_kwargs(args),
                )
     payload = {
@@ -284,12 +286,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             data_bytes=args.data_bytes,
             description="Protocol frame configured from the CLI.",
         )
-
     result = analyze_capture(
         args.file,        mode=args.mode,
                    candidate_index=args.candidate,
                    reference_bits_path=args.reference,
                    protocol=protocol_config,
+                   interleaving_mode=args.interleaving_mode,
                    **_loader_kwargs(args),
                )
     data = result.to_dict()
@@ -510,6 +512,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Fusion policy: side_by_side (default) | dsp_over_ml | ml_over_dsp | max_confidence")
     p.add_argument("--labels", default=None,
                    help="JSON file mapping 16 CNN output indices to class names")
+    p.add_argument(
+    "--interleaving-mode",
+    default="auto",
+    choices=["auto", "manual", "none"],
+    help="Block-interleaving handling on the demodulated bitstream "
+         "(auto = identify + deinterleave on evidence; manual = apply "
+         "configured interleave depth; none = pass received bits through "
+         "unchanged). Maps to the pipeline's fec.interleaving_mode.",
+    )
     p.add_argument("--json", default="-", help="JSON output path ('-' = stdout)")
     p.set_defaults(func=cmd_analyze)
 
