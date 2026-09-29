@@ -51,12 +51,24 @@ logger = logging.getLogger("spectra.io.gnuradio")
 
 
 def gnuradio_available() -> bool:
-    """True when the GNU Radio Python package is importable."""
-    return _import_gnuradio()
+    """True when the GNU Radio package or subprocess runtime is available."""
+    if _import_gnuradio():
+        return True
+    try:
+        from dsp_gnuradio.bridge import check_gnuradio_available
+        avail, _ = check_gnuradio_available()
+        return bool(avail)
+    except Exception:
+        try:
+            from gnuradio_integration.dsp_gnuradio.bridge import check_gnuradio_available
+            avail, _ = check_gnuradio_available()
+            return bool(avail)
+        except Exception:
+            return False
 
 
 def make_gnuradio_source(
-    config: GNURadioAcquisitionConfig,
+    config: GNURadioAcquisitionConfig | GNURadioSourceConfig,
 ) -> "GNURadioSource | None":
     """Build a GNU Radio source if the runtime supports it, else None."""
     if not gnuradio_available():
@@ -66,7 +78,8 @@ def make_gnuradio_source(
     except Exception:  # noqa: BLE001
         logger.warning("GNU Radio source backend unavailable", exc_info=True)
         return None
-    return GNURadioSource(config)
+    source_cfg = config.source if hasattr(config, "source") else config
+    return GNURadioSource(source_cfg)
 
 
 def _import_gnuradio():

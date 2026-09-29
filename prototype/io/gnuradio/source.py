@@ -46,7 +46,9 @@ class GNURadioSource:  # noqa: D101 - keeps the name stable in tests
         center frequency, gain and any hardware device fields.
     """
 
-    def __init__(self, config: GNURadioSourceConfig) -> None:
+    def __init__(self, config: GNURadioSourceConfig | GNURadioAcquisitionConfig) -> None:
+        if hasattr(config, "source") and isinstance(config.source, GNURadioSourceConfig):
+            config = config.source
         self.config = config
         self._source_meta = SourceMetadata(
             source="stream",
@@ -94,25 +96,51 @@ class GNURadioSource:  # noqa: D101 - keeps the name stable in tests
     def read_chunk(self, *, chunk_size: int, chunk_index: int) -> np.ndarray:
         """Read one GNU Radio-style buffer (greedy).
 
-        GNU Radio nodes expose ``output_buffer``-style signatures in
-        hardware backends.  The synthetic backend implements the same
-        contract here.
-
-        Returns a flat ``(chunk_size * 2,)`` float32 interleaved I/Q.
+        Returns a flat ``(chunk_size, 2)`` float32 interleaved I/Q.
         """
-        n = max(1, int(chunk_size))
-        rng = np.random.default_rng(int(float(self.config.sample_rate) * 1e-3) ^ chunk_index)
-        real = rng.standard_normal(n) * 0.05
-        imag = rng.standard_normal(n) * 0.05
-        return np.column_stack([real, imag]).astype(np.float32)
+        c = self.read_chunk_complex(chunk_size=chunk_size, chunk_index=chunk_index)
+        return np.column_stack([np.real(c), np.imag(c)]).astype(np.float32)
 
     def read_chunk_complex(self, *, chunk_size: int, chunk_index: int) -> np.ndarray:
         """Read one GNU Radio-style buffer of complex samples."""
         n = max(1, int(chunk_size))
-        rng = np.random.default_rng(int(float(self.config.sample_rate) * 1e-3) ^ chunk_index)
-        real = rng.standard_normal(n) * 0.05
-        imag = rng.standard_normal(n) * 0.05
-        return (real + 1j * imag).astype(np.complex128)
+        rate = float(self.config.sample_rate) if self.config.sample_rate else 1_000_000.0
+        rng = np.random.default_rng((int(rate * 1e-3) ^ chunk_index) + 12345)
+        dev = str(getattr(self.config, "device_name", "") or "synthetic-bpsk").lower()
+
+        sps = 8
+        num_syms = (n // sps) + 1
+        if "qpsk" in dev:
+            b = rng.integers(0, 2, size=(num_syms, 2))
+            constel = np.array([1 + 1j, -1 + 1j, -1 - 1j, 1 - 1j], dtype=np.complex128) / np.sqrt(2.0)
+            idx = b[:, 0] * 2 + b[:, 1]
+            syms = constel[idx]
+        elif "16qam" in dev or "qam" in dev:
+            b = rng.integers(0, 4, size=(num_syms, 2))
+            re = 2 * b[:, 0] - 3
+            im = 2 * b[:, 1] - 3
+            syms = (re + 1j * im) / np.sqrt(10.0)
+        elif "bfsk" in dev or "fsk" in dev:
+            b = rng.integers(0, 2, num_syms)
+            syms = (2 * b - 1).astype(np.complex128)
+        else:  # Default BPSK
+            b = rng.integers(0, 2, num_syms)
+            syms = (2 * b - 1).astype(np.complex128)
+
+        upsampled = np.repeat(syms, sps)[:n]
+        if len(upsampled) < n:
+            pad = np.zeros(n - len(upsampled), dtype=np.complex128)
+            upsampled = np.concatenate([upsampled, pad])
+
+        # Frequency shift within passband (50 kHz offset)
+        f_offset = min(50_000.0, 0.1 * rate)
+        t = np.arange(n) / rate
+        carrier = np.exp(2j * np.pi * f_offset * t)
+        signal = upsampled * carrier
+
+        # Realistic channel noise (SNR ~ 28 dB)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 0.04
+        return (signal + noise).astype(np.complex128)
 
     # -- streaming -----------------------------------------------------
 
