@@ -117,8 +117,10 @@ def test_interleaving_mode_is_separate_from_fec_mode() -> None:
         # Select a different interleaving mode, leave FEC mode at AUTO.
         window.interleaving_mode_combo.setCurrentText("Manual")
         assert window.interleaving_mode_combo.currentText() == "Manual"
-        # The FEC mode combo is unaffected (values are FECMode strings).
-        assert window.fec_mode_combo.currentText() == "auto"
+        # The FEC mode combo is unaffected. Its label is title-case for
+        # readability and carries the canonical FECMode value as data.
+        assert window.fec_mode_combo.currentText() == "Auto"
+        assert window.fec_mode_combo.currentData() == "auto"
     finally:
         window.close()
         window.deleteLater()
@@ -128,10 +130,103 @@ def test_interleaving_mode_combines_with_fec_mode() -> None:
     """Interleaving mode and FEC mode can both be set without interference."""
     window = _make_window()
     try:
-        window.fec_mode_combo.setCurrentText("AUTO")
+        window.fec_mode_combo.setCurrentIndex(
+            window.fec_mode_combo.findData("auto")
+        )
         window.interleaving_mode_combo.setCurrentText("Manual")
-        assert window.fec_mode_combo.currentText() == "auto"
+        assert window.fec_mode_combo.currentData() == "auto"
         assert window.interleaving_mode_combo.currentText() == "Manual"
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# Extended de-interleaving family selector
+# ---------------------------------------------------------------------------
+
+
+def test_interleave_family_selector_exists() -> None:
+    """The family selector offers all four families and defaults to block."""
+    window = _make_window()
+    try:
+        combo = window.interleave_family_combo
+        assert combo is not None
+        assert combo.count() == 4
+        assert combo.currentData() == "block"
+        values = {combo.itemData(i) for i in range(combo.count())}
+        assert values == {"block", "convolutional", "diagonal", "pseudo_random"}
+        # disabled until Manual interleaving is selected
+        assert combo.isEnabled() is False
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_interleave_family_enabled_only_for_manual() -> None:
+    """The family selector is enabled only when Interleaving = Manual."""
+    window = _make_window()
+    try:
+        window.interleaving_mode_combo.setCurrentText("Manual")
+        assert window.interleave_family_combo.isEnabled() is True
+        window.interleaving_mode_combo.setCurrentText("Auto")
+        assert window.interleave_family_combo.isEnabled() is False
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# Recovered-information and sync-word read-out
+# ---------------------------------------------------------------------------
+
+
+def test_recovered_bits_and_sync_word_labels() -> None:
+    """Decoded bit count and sync-word/frame info reach the read-out."""
+    window = _make_window()
+    try:
+        window.analysis = {"signal_detected": True}
+        window._pipeline_demod_summary = {
+            "num_symbols": 10,
+            "num_bits": 20,
+            "decision_margin": 0.5,
+        }
+        window._pipeline_fec_summary = {
+            "scheme": "reedsolomon",
+            "corrected_errors": 1,
+            "uncorrectable_blocks": 0,
+            "decoded_bit_count": 256,
+            "source": "explicit_config",
+        }
+        window._pipeline_protocol_summary = {
+            "sync_found": True,
+            "sync_confidence": 0.93,
+            "payload_bytes": b"\x01\x02\x03",
+        }
+        window.update_analysis_parameters()
+
+        recovered = window.parameter_recovered_bits.text()
+        assert "256" in recovered and "decoded" in recovered
+        sync = window.parameter_sync_word.text()
+        assert "found" in sync and "3 payload bytes" in sync
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_recovered_bits_without_fec_and_sync_not_found() -> None:
+    """Honest fallbacks: received-only bits and a negative sync result."""
+    window = _make_window()
+    try:
+        window.analysis = {"signal_detected": True}
+        window._pipeline_demod_summary = {"num_symbols": 8, "num_bits": 16}
+        window._pipeline_fec_summary = None
+        window._pipeline_protocol_summary = {"sync_found": False}
+        window.update_analysis_parameters()
+
+        assert "16" in window.parameter_recovered_bits.text()
+        assert "received" in window.parameter_recovered_bits.text()
+        assert window.parameter_sync_word.text() == "Sync word: not found"
     finally:
         window.close()
         window.deleteLater()

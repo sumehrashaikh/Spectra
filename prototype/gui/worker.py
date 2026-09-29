@@ -78,10 +78,14 @@ class AnalysisWorker(QThread):
         mode: str = "balanced",
         analyze_all: bool = False,
         reference_bits: np.ndarray | None = None,
+        fec_mode: str | None = None,
         fec_scheme: str | None = None,
         ml_enabled: bool = False,
         parent=None,
         interleaving_mode: str = FECMode.AUTO,
+        interleave_depth: int = 1,
+        interleave_family: str = "block",
+        protocol_config: Any = None,
     ) -> None:
         super().__init__(parent)
 
@@ -92,6 +96,9 @@ class AnalysisWorker(QThread):
         self._reference_bits = reference_bits
         self._fec_mode = self._normalize_fec_mode(fec_mode)
         self._interleaving_mode = str(interleaving_mode)
+        self._interleave_depth = int(interleave_depth)
+        self._interleave_family = str(interleave_family)
+        self._protocol_config = protocol_config
         self._fec_scheme = fec_scheme
         self._ml_enabled = bool(ml_enabled)
 
@@ -109,6 +116,18 @@ class AnalysisWorker(QThread):
         # bare scheme -> treat as manual explicit FEC
         return FECMode.MANUAL
 
+    @staticmethod
+    def _normalize_interleaving_mode(mode: str | None) -> str:
+        """Normalize a GUI interleaving selection to AUTO/MANUAL/NONE.
+
+        The GUI combo uses title-case labels ("Auto"/"Manual"/"None");
+        the pipeline expects the canonical lowercase FECMode values.
+        """
+        if mode is None:
+            return FECMode.AUTO
+        value = str(mode).strip().lower()
+        return value if value in FECMode.values() else FECMode.AUTO
+
     def run(self) -> None:  # noqa: D102 - Qt override
         try:
             # FEC is explicit configuration, never guessed; an unset
@@ -117,6 +136,21 @@ class AnalysisWorker(QThread):
             # onto AnalysisConfig.fec.mode.
             fec_mode = self._normalize_fec_mode(self._fec_mode)
             fec_scheme = self._fec_scheme  # kept for compatibility
+            interleaving_mode = self._normalize_interleaving_mode(
+                self._interleaving_mode
+            )
+
+            # The GUI's Interleaving selector is authoritative for the
+            # block-interleaving handling, in every FEC mode (previously
+            # it was accepted and then silently discarded).
+            interleave_fields: dict[str, Any] = {
+                "interleaving_mode": interleaving_mode,
+            }
+            if interleaving_mode == FECMode.MANUAL:
+                interleave_fields["interleave_depth"] = max(
+                    2, int(self._interleave_depth)
+                )
+                interleave_fields["interleave_family"] = self._interleave_family
 
             from dataclasses import replace
 
@@ -125,12 +159,21 @@ class AnalysisWorker(QThread):
             if fec_mode == FECMode.MANUAL and fec_scheme:
                 config = replace(
                     config,
-                    fec=replace(config.fec, mode=FECMode.MANUAL, scheme=fec_scheme),
+                    fec=replace(
+                        config.fec,
+                        mode=FECMode.MANUAL,
+                        scheme=fec_scheme,
+                        **interleave_fields,
+                    ),
                 )
             elif fec_mode == FECMode.NONE:
                 config = replace(
                     config,
-                    fec=replace(config.fec, mode=FECMode.NONE),
+                    fec=replace(
+                        config.fec,
+                        mode=FECMode.NONE,
+                        **interleave_fields,
+                    ),
                 )
             else:
                 # AUTO / unset -> identification runs; scheme stays None
@@ -140,7 +183,7 @@ class AnalysisWorker(QThread):
                     fec=replace(
                         config.fec,
                         mode=FECMode.AUTO,
-                        interleaving_mode=self._interleaving_mode,
+                        **interleave_fields,
                     ),
                 )
 
@@ -150,16 +193,40 @@ class AnalysisWorker(QThread):
                     ml=replace(config.ml, enabled=True),
                 )
 
+            # Frame/sync-word analysis is opt-in: the protocol stage needs
+            # a transmitter-specific sync word, so the GUI passes a
+            # FrameConfig only when frame search is enabled.
+            if self._protocol_config is not None:
+                config = replace(config, protocol=self._protocol_config)
+
             if self._analyze_all:
                 from prototype.pipeline_batch import analyze_all_candidates
-
-                batch = analyze_all_candidates(
-                    samples=self._samples,
-                    sample_rate=self._sample_rate,
-                    reference_bits=self._reference_bits,
-                    config=config,
+                from prototype.core.provenance import (
+                    new_provenance,
+                    provenance_to_dict,
                 )
+
+                # Batch runs get a provenance manifest too, so the
+                # "Provenance" button and export are consistent with the
+                # single-candidate flow.
+                batch_provenance = new_provenance(
+                    configuration={"mode": self._mode, "analyze_all": True}
+                )
+
+                with batch_provenance.record_step("batch_analysis") as step:
+                    batch = analyze_all_candidates(
+                        samples=self._samples,
+                        sample_rate=self._sample_rate,
+                        reference_bits=self._reference_bits,
+                        config=config,
+                    )
+                    step["analyzed_candidates"] = len(batch.results)
+
+                batch_provenance.finish()
+
                 payload: Any = batch.to_dict()
+
+                payload["provenance"] = provenance_to_dict(batch_provenance)
 
                 _attach_batch_timeline(payload, self._sample_rate)
             else:

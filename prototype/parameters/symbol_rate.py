@@ -233,6 +233,60 @@ def generate_rrc_bpsk(
     )
 
 
+def _select_fundamental_line(
+    frequencies: np.ndarray,
+    power: np.ndarray,
+    strongest_frequency: float,
+    strongest_power: float,
+    min_symbol_rate: float,
+    max_symbol_rate: float,
+    max_harmonic: int = 8,
+    relative_ratio: float = 0.10,
+    min_ratio: float = 0.05,
+) -> tuple[float, float]:
+    """Recover the symbol rate when the strongest line is a *harmonic*.
+
+    The delay-multiply / ``|x|^2`` spectra of a communication signal carry
+    discrete lines at integer multiples of the symbol rate, and for sharp
+    (unshaped) pulses the strongest line can be a high-order harmonic (a
+    rectangular 16-QAM peaks around 5x the symbol rate).  Starting from the
+    strongest line, each subharmonic that is a real line becomes the new
+    estimate, so the search walks down to the fundamental (e.g. 600 -> 300
+    -> 200 -> 100 for a rectangular QPSK capture).
+
+    A subharmonic is accepted when it is both
+
+    * at least ``relative_ratio`` of the running estimate (the original
+      rule), and
+    * at least ``min_ratio`` of the **strongest** line (a fixed floor).
+
+    The fixed floor is the fix: the original loop compared only against the
+    ever-shrinking running estimate, so after correctly reaching 100 Hz it
+    could keep walking down and accept a noise-floor bin at 62.5 Hz
+    (500/8) on a rectangular 16-QAM capture.  Subharmonics below 5% of the
+    strongest line are noise, not symbol-rate lines.
+    """
+
+    selected_frequency = float(strongest_frequency)
+    selected_power = float(strongest_power)
+    floor = max(float(strongest_power), 1e-30) * min_ratio
+
+    for harmonic in range(2, max_harmonic + 1):
+        candidate = strongest_frequency / harmonic
+        if candidate < min_symbol_rate or candidate > max_symbol_rate:
+            continue
+        index = int(np.argmin(np.abs(frequencies - candidate)))
+        candidate_power = float(power[index])
+        if (
+            candidate_power >= floor
+            and candidate_power >= selected_power * relative_ratio
+        ):
+            selected_frequency = float(frequencies[index])
+            selected_power = candidate_power
+
+    return selected_frequency, selected_power
+
+
 def estimate_symbol_rate_from_cyclostationarity(
     samples: np.ndarray,
     sample_rate: float,
@@ -390,59 +444,17 @@ def estimate_symbol_rate_from_cyclostationarity(
     # strongest candidate.
     # ---------------------------------------------------------
 
-    selected_frequency = (
-        strongest_frequency
+    (
+        selected_frequency,
+        selected_power,
+    ) = _select_fundamental_line(
+        frequencies,
+        power,
+        strongest_frequency,
+        strongest_power,
+        min_symbol_rate,
+        max_symbol_rate,
     )
-
-    selected_power = (
-        strongest_power
-    )
-
-    for harmonic in range(2, 9):
-
-        candidate_frequency = (
-            strongest_frequency
-            / harmonic
-        )
-
-        if (
-            candidate_frequency
-            < min_symbol_rate
-        ):
-            continue
-
-        if (
-            candidate_frequency
-            > max_symbol_rate
-        ):
-            continue
-
-        index = int(
-            np.argmin(
-                np.abs(
-                    frequencies
-                    - candidate_frequency
-                )
-            )
-        )
-
-        candidate_power = float(
-            power[index]
-        )
-
-        # If the subharmonic retains significant energy,
-        # prefer it as the fundamental symbol rate.
-        if (
-            candidate_power
-            >= selected_power * 0.10
-        ):
-            selected_frequency = (
-                float(frequencies[index])
-            )
-
-            selected_power = (
-                candidate_power
-            )
 
     # Confidence is based on the selected peak relative
     # to the median spectral floor.
@@ -626,48 +638,20 @@ def estimate_symbol_rate_delay_multiply(
             method="delay_multiply",
         )
 
-    # Harmonic-aware selection: prefer a subharmonic of the
-    # strongest line when it retains significant energy, since
-    # the strongest line may be a harmonic of the symbol rate.
-    selected_frequency = strongest_frequency
-    selected_power = strongest_power
-
-    for harmonic in range(2, 9):
-
-        candidate_frequency = (
-            strongest_frequency
-            / harmonic
-        )
-
-        if candidate_frequency < min_symbol_rate:
-            continue
-
-        if candidate_frequency > max_symbol_rate:
-            continue
-
-        index = int(
-            np.argmin(
-                np.abs(
-                    frequencies
-                    - candidate_frequency
-                )
-            )
-        )
-
-        candidate_power = float(
-            power[index]
-        )
-
-        if (
-            candidate_power
-            >= selected_power * 0.10
-        ):
-            selected_frequency = (
-                float(frequencies[index])
-            )
-            selected_power = (
-                candidate_power
-            )
+    # Comb-fundamental selection: prefer the subharmonic whose
+    # harmonic comb best explains the observed lines, since the
+    # strongest line may be a harmonic of the symbol rate.
+    (
+        selected_frequency,
+        selected_power,
+    ) = _select_fundamental_line(
+        frequencies,
+        power,
+        strongest_frequency,
+        strongest_power,
+        min_symbol_rate,
+        max_symbol_rate,
+    )
 
     floor = float(
         np.median(

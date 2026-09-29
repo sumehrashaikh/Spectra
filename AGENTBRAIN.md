@@ -43,7 +43,7 @@ and timing → classify modulation → demodulate → measure BER → report.
 | GUI | `gui/window.py` | WORKING | PySide6, V1-derived, monolithic (~1600 lines) — refactor candidate |
 | DSP engine | `dsp/` | DONE+TESTED | Welch PSD (2-sided complex), STFT+inverse (exact for complex), FIR Kaiser, IIR SOS, polyphase resampling, baseband (analytic/IF/mixing/blind IQ correction/clipping), correlation+sync-word finder |
 | Channel sim | `simulation/channel.py` | DONE+TESTED | 12 impairments in fixed order, returns exact ground truth |
-| FEC | `fec/` | DONE+TESTED | CRC-16/32 append+check, Hamming(7,4) (all single-error positions verified), repetition3, K=7 r=1/2 conv (171,133)+Viterbi with predecessor-state traceback (perfect at 32 scattered errors/806 bits), block interleaver, explicit registry |
+| FEC | `fec/` | DONE+TESTED+INTEGRATED | CRC-16/32 append+check, Hamming(7,4) (all single-error positions verified), repetition3, K=7 r=1/2 conv (171,133)+Viterbi with predecessor-state traceback (perfect at 32 scattered errors/806 bits), block interleaver, explicit registry + automatic identification (prototype/fec/identification.py: none/repetition3/hamming74/conv12, deterministic 80/40/0 scores, MIN_CONFIDENCE=60, AUTO/MANUAL/NONE, fec_identification provenance) |
 | Pipeline | `pipeline.py` | DONE+TESTED | analyze_samples/analyze_capture: preprocess→detect→isolate→classify→rate→sync→fine-classify→demodulate→BER(ambiguity-searched)→optional FEC; per-stage provenance; graceful warnings |
 | Reporting | `reporting/export.py` | DONE+TESTED | JSON (numpy/complex-safe), flat CSV, self-contained HTML with disclaimer |
 | CLI | `cli.py` | DONE+TESTED | analyze/detect/classify/parameters/demodulate/report/benchmark/validate/version; loader overrides; JSON out |
@@ -519,3 +519,270 @@ and decisions, all verified:
 7. 16-QAM fine-stage e2e through `demodulate_signal(synchronized=True)`
    currently requires `samples_per_symbol` — thread it from symbol_rate
    summary (one-line fix candidate).
+
+### Session 13 — SIH-147 FEC / interleaving requirements closure (2026-09-29) — VERIFIED
+
+No SIH-147 document exists in the repo (grepped AGENTBRAIN / CHANGELOG /
+README / docs); the audit below is against the enumerated requirements and
+the actual code, not a spec file. FEC is still **never guessed**: the
+AUTO identifier reports first-class `UNKNOWN/UNRESOLVED` when the evidence
+does not clear its confidence rule.
+
+**Bugs found and fixed (not cosmetic)**
+- `fec/interleaving.py` pseudo-random interleaver: the `seed` argument was
+  **ignored** (every seed produced the same permutation) and
+  `pseudo_random_deinterleave` re-applied the forward permutation instead
+  of inverting it, so **round-trip failed**. Replaced with a seeded
+  injective affine key (`index*C + seed*K + D mod 2**32`, odd C/K => always
+  a true permutation) and a real inverse (`out[order] = received`).
+- `pipeline.py`: both FEC paths stored `fec_result.output_bits` (an **int
+  count**) under `decoded_bits`, silently discarding the recovered
+  bitstream (`OverflowError` on the next stage). Now the actual bit array
+  is stored, plus `decoded_bit_count`.
+- `pipeline.py::analyze_capture`: CLI `analyze` crashed
+  (`load_signal() got an unexpected keyword argument 'interleaving_mode'`);
+  `demodulate`/`report` read `args.interleaving_mode` that was never
+  defined. Added an `_add_fec_arguments()` helper and explicit
+  interleaving/FEC overrides mapped onto `FECConfig`.
+
+**Extended de-interleaving (all four families)**
+- `interleave_bits`/`deinterleave_bits` (block), `convolutional_*`,
+  `diagonal_*`, `pseudo_random_*` were already implemented but only block
+  was wired and none of conv/diagonal/pseudo-random had tests.
+- `FECConfig.interleave_family` (`block|convolutional|diagonal|pseudo_random`)
+  + `manual_deinterleave_plan()` dispatch; `interleave_depth` doubles as
+  the family parameter (depth / k / square width / seed). Inapplicable
+  plans warn instead of silently passing bits through.
+- Wired through pipeline MANUAL, CLI `--interleave-family`, and a GUI
+  "Family:" combo (enabled only for Manual). AUTO identification stays
+  block-only — no faked structural evidence for the other families.
+
+**Additional FEC schemes (new modules, same registry interface)**
+- `fec/reed_solomon.py`: shortened systematic RS over GF(256) (prim poly
+  0x11D), Berlekamp-Massey + Chien + GF Gauss-Jordan magnitude solve;
+  32 data + 8 parity bytes, t=4 symbol errors; uncorrectable blocks are
+  counted, not raised.
+- `fec/ldpc.py`: compact (3,6)-regular LDPC (16,8) from two invertible
+  circulants, hard-decision Gallager bit-flipping decoder.
+- `fec/concatenated.py`: serial RS(outer) + K=7 rate-1/2 convolutional
+  (inner), merging inner/outer stats.
+- Registered as `reedsolomon`, `ldpc`, `concatenated` alongside
+  `hamming74`, `repetition3`, `conv12` (all six round-trip through
+  `encode_bits`/`decode_bits`).
+
+**Recovered / correlation info**
+- Result now always carries `demodulation.received_bits` (pre-FEC),
+  `deinterleaved_bits`, `fec.decoded_bits` (real bitstream),
+  `fec.decoded_bit_count` and `fec_identification`; sync-word/frame
+  semantics stay in `result.protocol` (reuses `dsp.correlation`).
+- GUI: new "Recovered bits" and "Sync word" rows; the FEC/auto-FEC rows
+  were already present.
+
+**Tests added (all deterministic, no RF)**
+- `tests/test_interleaving_families.py` (26): round trips for all four
+  families, the pseudo-random seed/inverse regression, `FECConfig`
+  dispatch + plan reasoning, and end-to-end MANUAL pipeline recovery per
+  family.
+- `tests/test_fec_schemes_extended.py` (26): RS capacity/uncorrectable,
+  LDPC regularity + bit-flip correction, concatenated stats, registry
+  round trips, and a parametrized pipeline decode for all six schemes.
+- `tests/test_cli_interleaving.py`: `--interleave-family` choices/reject
+  and a config-mapping test for `--fec-scheme`/`--interleave-family`.
+- `tests/test_gui_interleaving.py`: family-combo presence/enablement and
+  the recovered-bits/sync-word read-out.
+
+**Verified**
+- `QT_QPA_PLATFORM=offscreen pytest -q` -> **373 passed, 1 skipped**
+  (was 291 passed, 1 skipped).
+- CLI e2e: `analyze gui_qam16.wav` -> 16-QAM, 2040 received bits, honest
+  `UNRESOLVED`/`UNKNOWN`, BER 0.0; `--fec-mode manual --fec-scheme conv12`
+  -> `explicit_config` decoded stream; incompatible-length RS/LDPC/CC
+  inputs surface a warning rather than crashing.
+
+**Remaining limitations (honest)**
+- LDPC is a small didactic (16,8) code (corrects 1 hard error/block), not
+  a large standards code; RS default geometry is fixed at 32/8.
+- AUTO FEC identification and AUTO de-interleaving remain block/legacy-
+  candidate-only; no genuine structural evidence exists yet for
+  conv/diagonal/pseudo-random detection.
+
+---
+
+## Session 8 (2026-09-29) — Final SIH feature + GUI pass: evidence-based AUTO FEC, codeword alignment, demo captures
+
+**Scope:** close the remaining SIH-147 requirements *and* verify the GUI reaches every
+implemented feature.  No GUI redesign, no second pipeline, no DSP rewrite.
+
+**1. AUTO FEC identification now uses real decoder evidence (was: fixed 4-candidate list)**
+- `fec/identification.py` candidate set is now
+  `none | repetition3 | hamming74 | conv12 | reedsolomon | ldpc | concatenated`.
+- New evaluators/scorers: `evaluate_reedsolomon`/`score_reedsolomon` (residual
+  syndrome status: `uncorrectable_blocks`), `evaluate_ldpc`/`score_ldpc` (bit-flip
+  count; only a **zero-flip**, i.e. already-valid codeword, is credited so LDPC stays
+  UNRESOLVED on anything ambiguous), `evaluate_concatenated`/`score_concatenated`
+  (inner Viterbi path metric **and** outer RS block status).
+- Measured false-positive rate on random bits: 0/100 for both RS and LDPC all-clean;
+  random streams still land at `UNKNOWN` (best score 40 < MIN_CONFIDENCE 60).
+- Verified: each clean codeword auto-detects as itself (RS 70, LDPC 80, concatenated 83,
+  conv12/hamming74/repetition3 80).  A concatenated codeword is *also* a valid conv12
+  codeword, so the identifier prefers the more specific hypothesis and **publishes the
+  ambiguity** (`evidence.also_consistent == ["conv12"]`, `evidence.ambiguous == true`).
+- Fixed a real result bug: `identify_fec` built a `decided_by` evidence dict that the
+  final assignment silently overwrote, so the JSON never explained the verdict.
+
+**2. Partial-codeword (truncated capture) decoding**
+- `fec/framework.py`: new `aligned_bits_size` / `aligned_size`, a `block_align` entry
+  per registered scheme, and `decode_bits(..., trim_partial_codeword=True)`.  A capture
+  whose tail was lost now decodes its whole codewords and reports
+  `FECResult.extra["trimmed_tail_bits"]` (the missing bits are never invented).
+  Concatenated alignment is `640k + 12` bits (inner Viterbi tail + whole 40-byte RS blocks).
+- Pipeline AUTO and MANUAL decode paths use it and surface `trimmed_tail_bits`.
+- The identification evaluators trim the same way, so RS/LDPC/concatenated can be
+  identified on real (misaligned) captures instead of being rejected outright.
+
+**3. Codeword alignment (this is what makes the coded chain decodable at all)**
+- New pipeline stage `codeword_alignment` + helper `_resolve_codeword_alignment`:
+  when a transmitted-bit reference is available it searches the receiver's blind
+  ambiguity (QPSK/16-QAM 90-degree folds x polarity x whole-symbol origin, mirroring the
+  BER stage's model) and returns the **aligned bitstream** for the deinterleaver/FEC stage.
+- Safety guards: a candidate is accepted only with fewer bit errors than the raw stream
+  *and* BER < 0.25, so a reference in the wrong domain (e.g. a payload reference against
+  an FEC-coded stream) cannot mangle the bits - every candidate scores ~0.5 there.
+- Without a reference nothing is resolved and the record says so (`aligned: false`).
+- Interleaver geometry is defined by the *transmitted* frame length, so MANUAL
+  deinterleaving zero-fills a truncated tail back to the reference length (reported as
+  `zero_filled_bits`); the affected codeword is then reported uncorrectable rather than
+  silently mis-decoded.
+
+**4. GUI completeness + two real GUI bugs**
+- Fixed (reported by the user): after "Analyze Signal" with *Analyze all candidates*
+  checked, the first candidate's detail was immediately overwritten by the batch
+  envelope -> modulation "Unknown", empty parameters, and the constellation fell back to
+  a raw-IQ smear ("constellation wrong after Analyze").  `_apply_pipeline_result` now
+  applies candidate detail **inside** the branch that has a candidate, with
+  `_reset_candidate_detail()` for an empty batch.
+- `pipeline_batch.BatchResult.to_dict()` now emits `parameters`, `protocol`, `ml`,
+  `fusion` and plain-Python values (`_as_plain`), so batch candidates show measured
+  parameters and the GUI never receives a dataclass (it crashed with
+  `'FrameDecodeResult' object has no attribute 'get'`).
+- Fixed the "Auto FEC" row: the pipeline stores `fec_identification` under
+  `demodulation`, but the GUI only looked at the top level, so the row always read
+  "not run".
+- New GUI control (was CLI-only): **Frame search** checkbox + sync-word field + payload
+  bytes, wired through `AnalysisWorker(protocol_config=...)` to `config.protocol`; the
+  "Detected type" row now also names a manually configured interleaving family.
+- FEC mode combo now shows `Auto/Manual/None` labels with canonical `FECMode` values as
+  item data; the worker receives `currentData()`.
+- Raw-IQ sample-rate prompt: explained + improved (the file has no header, so the rate
+  must be asked; a JSON sidecar can supply it; the dialog now defaults to the last rate
+  used in the session).
+
+**5. GNU Radio**
+- Verified live: `gnuradio` Python module is **not installed** on this machine, the tab
+  says so honestly, and Acquire falls back to the built-in synthetic source
+  (1,048,576 samples @ 1 MS/s, Analyze enabled).  `tests/test_gnuradio.py` +
+  `tests/test_gui_gnuradio.py`: 19 passed.
+
+**6. Deterministic demo captures (no RF hardware)**
+- `tests/demo_captures.py`: one transmitter chain builds payload -> FEC -> interleave ->
+  QAM/PSK map -> RRC -> upconvert -> timing/carrier/phase impairments -> AWGN, and can
+  write WAVs (`python tests/demo_captures.py`).
+- `tests/test_end_to_end_fec_demo.py` (21 tests) verifies the **full chain** on 16-QAM:
+  detection -> classification (16-QAM) -> demodulation -> alignment (0 bit errors vs the
+  transmitted stream) -> manual deinterleaving -> FEC decode -> **payload prefix matches
+  the transmitted payload** for conv12, Reed-Solomon and concatenated, with and without
+  block interleaving.  Plus an interleaver round trip through the receiver's own
+  `FECConfig.deinterleave_bits` for all four families x three schemes, and honest
+  negative tests (no reference -> no claim; a clean codeword may never be claimed when
+  alignment was not resolved).
+- Geometric facts discovered and encoded in the tests: the square diagonal interleaver
+  needs exactly `depth**2` code bits (RS uses depth 80 -> 6400); a concatenated frame is
+  always `4 (mod 8)`, so a depth-8 block interleaver can never frame it (depth 4 can).
+- `tests/test_gui_fec_demo.py` (8 tests): FEC/interleave controls reach the worker,
+  frame-search config + rejection, AUTO identification plumbing, batch-detail regression
+  (synthetic payload) and one real offscreen analysis filling the FEC/recovered/sync rows
+  plus every visualisation tab.
+
+**Verified**
+- `QT_QPA_PLATFORM=offscreen python -m pytest -q` -> **424 passed, 1 skipped**
+  (was 373 passed, 1 skipped).
+
+**Remaining limitations (honest)**
+- Blind QPSK/8-PSK symbol-origin alignment is unresolved: the demo recovers the coded
+  chain end to end for 16-QAM; QPSK/8-PSK demo cases only verify the RF/demod chain and
+  assert that no false decode is claimed.
+- Classification is unstable for short/dense bursts (the same 16-QAM capture is
+  sometimes classified as QPSK/OOK), which is why the demo matrix is the verified set
+  rather than every combination.
+- Interleaved captures can only be inverted when the transmitted frame length is known
+  (reference) or the capture is complete; there is no frame-sync preamble layer yet.
+- Interleaving AUTO detection is still block-only; LDPC stays deliberately conservative.
+- LDPC remains a small didactic (16,8) code; RS geometry is fixed at 32/8; validation is
+  still synthetic only.
+
+### Session 14 — SIH-147 final readiness pass: files / flow / GUI / CLI audit (2026-09-29) — VERIFIED
+
+**Goal**
+- Files check, flow check, and end-to-end verification that every feature is reachable
+  from the GUI and the CLI. Fix only genuine integration bugs; no new algorithms, no DSP
+  rewrite, no GUI redesign. Do not commit.
+
+**Bugs found and fixed (all were silent integration gaps, not DSP)**
+1. `pipeline.py` ML stage called `predict_modulation` without importing it. Enabling ML
+   (GUI checkbox or `--ml`) only ever appended `ML classification/fusion failed: name
+   'predict_modulation' is not defined` and produced no ML result. Added the import; this
+   also un-skipped a test (424+1 skipped -> 425 passed).
+2. `cli.py` `analyze` built a `FrameConfig` from `--sync-word/--data-bytes` and then never
+   forwarded it (unlike `demodulate`/`report`). `protocol=` is now passed.
+3. `cli.py` `analyze --ml/--ml-fusion/--labels` were dead flags. `analyze_capture` gained
+   `ml_enabled/ml_fusion/labels_path` and maps them onto `AnalysisConfig.ml`;
+   `predict_modulation`/`get_engine` accept an optional `labels_json`.
+4. `cli.py` `analyze --source gnuradio` referenced `analyze_samples` /
+   `processing_mode_config` without importing them and passed a `reference_bits_path`
+   argument `analyze_samples` does not accept. Branch now imports, loads the reference
+   bits, and applies the same FEC/interleaving/protocol/ML overrides.
+5. `cli.py` `demodulate` computed the protocol result and omitted it from its payload.
+6. Removed duplicate/dead `set_defaults(func=cmd_train)` lines.
+
+**Demo set (PS-requirement coverage)**
+- `tests/demo_captures.py`: added `build_fsk_capture()` (continuous-phase BFSK, BER 0.0),
+  `write_reference()` / `write_capture()` (emits the `<stem>.reference.npz` sidecar the
+  BER/alignment stage expects), and `reference_is_usable()`.
+- Rewrote `demo_cases()` so every entry is *demonstrable*: the receiver classifies the
+  intended modulation and coded cases decode cleanly. New set: 16-QAM nofec/conv12/
+  RS+block/concat+block/concat+pseudo-random; QPSK nofec/block/convolutional/diagonal80;
+  8-PSK block; plus BFSK. The exhaustive interleaver matrix (incl. diagonal/convolutional
+  combos that only work at the bit level) stays in the round-trip tests, not the demo set.
+- Why the reference sidecar is written for 16-QAM and coded captures only: the blind
+  phase/origin alignment is unresolved for *uncoded* QPSK/8-PSK, so a reference there
+  would only make the receiver report a misleading ~0.5 BER. Those cases honestly say
+  "No reference loaded".
+
+**GUI walkthrough (offscreen, all 11 demo captures)**
+- WAV load via `open_wav` (QFileDialog patched) -> Analyze -> all six tabs render
+  (Time Domain, Spectrum, Waterfall/STFT, Constellation, Detection/Results, GNU Radio).
+- Rows populated per case, e.g. 16-QAM RS+block: `FEC: reedsolomon (corrected 8 errors,
+  0 uncorrectable)`, `Recovered bits: 1024 (decoded, explicit_config)`, `interleaving
+  MANUALLY_CONFIGURED`, `BER: 0 (0/1280 bits)`, sync found, provenance present.
+- 16-QAM concat+pseudo_random decodes cleanly (1024 bits, BER 0) — the "other
+  de-interleaver" demonstration.
+- Export JSON contains the full payload + provenance; batch mode shows candidate-specific
+  detail (2 detections -> 2 candidates, combo populated); GNU Radio acquire works via the
+  synthetic fallback for both `synthetic-bpsk` and `synthetic-qpsk` (524288 samples each).
+
+**Verified**
+- `QT_QPA_PLATFORM=offscreen python -m pytest -q` -> **433 passed** (was 424 passed, 1 skipped).
+- Focused FEC/interleaving/GUI/CLI/ML set -> 236 passed; new `tests/test_final_integration.py`
+  (8 tests) locks the regressions above.
+- CLI probes: `analyze` with `--sync-word --ml` now reports protocol + ML + fusion; `version` OK.
+
+**Docs**
+- New `docs/SIH_REQUIREMENTS.md` (the authoritative matrix: ✅/🟡/❌ with evidence).
+- `docs/USER_GUIDE.md` §9.5 rewritten to the current status + pointer; §9.6 notes the
+  QPSK/8-PSK alignment and block-only auto-ID limits. `docs/VALIDATION.md` gains a pointer.
+- `CHANGELOG.md` [Unreleased] Fixed/Added/Verified updated for this pass.
+
+**Remaining limitations (honest)**
+- Codeword alignment is 16-QAM-only; uncoded QPSK/8-PSK cannot be BER-scored against a
+  reference. Automatic interleaving identification is block-only. LDPC is a didactic
+  (16,8) code. All validation remains synthetic; no real captures, no SDR hardware.

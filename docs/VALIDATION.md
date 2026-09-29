@@ -3,7 +3,12 @@
 **Date:** 2026-09-22
 **Software version:** 2.1.0
 **Environment:** Windows, Python 3.13.1, numpy/scipy (pip-installed), CPU only
-**Test command:** `python -m pytest -q` (136 passed)
+**Test command:** `python -m pytest -q` (136 passed at the time of this report)
+
+> The current requirement-level status for the SIH-147 work (FEC
+> identification, interleaving, frame search, GUI + CLI coverage) is kept
+> in [`docs/SIH_REQUIREMENTS.md`](SIH_REQUIREMENTS.md). As of 2026-09-29 the
+> suite is `QT_QPA_PLATFORM=offscreen python -m pytest -q` → 433 passed.
 
 ## 1. What "validated" means here
 
@@ -35,6 +40,7 @@ accuracy, or suitability for any safety-, mission-, or
 | 10 | DSP | `tests/test_dsp.py` (23 tests) | PSD peaks, filter rejection < −40 dB, exact IQ correction, sync-word find | as expected | PASS |
 | 11 | Channel | `tests/test_channel.py` (16 tests) | each impairment matches truth; AWGN SNR ±0.5 dB | as expected | PASS |
 | 12 | FEC | `tests/test_fec.py` (25 tests) | CRC detect, Hamming corrects every single-bit error, conv. corrects 32 scattered errors, interleave round-trip | as expected | PASS |
+| 12b | Automatic FEC identification | `tests/test_fec_identification.py` (26 tests) | clean repetition3/hamming74/conv12 -> AUTO_DETECTED (80 confidence), corrupted/ambiguous -> UNKNOWN, insufficient -> UNKNOWN, deterministic decision | PASS |
 | 13 | Symbol rate | `test_rectangular_bpsk_constant_envelope` etc. | rate ±1% for RRC-BPSK, rect-BPSK, QPSK, BFSK | max err 0.07% | PASS |
 | 14 | Config/Provenance/Reporting | `tests/test_core_modules.py` (20 tests) | serialization, step statuses, hashes | as expected | PASS |
 | 15 | CLI | `spectra validate` (run manually) | QPSK + BER < 0.05 on synthetic WAV | passed: true | PASS |

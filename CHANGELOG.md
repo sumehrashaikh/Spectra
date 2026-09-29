@@ -7,6 +7,19 @@ versioning: semantic.
 
 ### Added
 
+- **FEC / de-interleaving closure (SIH-147)**:
+  - Four de-interleaver families (`block`, `convolutional`, `diagonal`,
+    `pseudo-random`) are now selectable via `FECConfig.interleave_family`,
+    the pipeline MANUAL path, the new CLI `--interleave-family` flag, and a
+    GUI "Family:" selector. AUTO identification stays block-only — no
+    fabricated structural evidence for the other families.
+  - New FEC schemes in the existing registry: `reedsolomon` (shortened
+    systematic RS over GF(256), Berlekamp-Massey/Chien decode, t=4), `ldpc`
+    (compact (3,6)-regular LDPC with hard-decision bit-flipping), and
+    `concatenated` (RS outer + K=7 rate-1/2 convolutional inner).
+  - Result/GUI now expose the recovered information: the real decoded
+    bitstream plus `decoded_bit_count`, and dedicated "Recovered bits" and
+    "Sync word" rows.
 - **Machine-learning subsystem** (`prototype/ml/`): the provided
   `modulation_cnn.pkl` was audited statically (opcode walk, never
   unpickled — pickles are untrusted input) and identified as a Keras 3
@@ -87,7 +100,12 @@ versioning: semantic.
   ±16-symbol search alongside the existing 90° fold search. New full-
   pipeline regression `tests/test_end_to_end_qam16_full.py` asserts
   bit-exact recovery from an impaired capture.
-- **GUI runs the V2 pipeline on a background thread**
+- **GUI runs the V2 pipeline on a background thread
+- **Automatic FEC identification (Phase 2)**: `prototype/fec/identification.py` is a deterministic candidate evaluator (repetition3, hamming74, conv12, none). Clean supported FEC codewords are detected (80 confidence), corrupted/ambiguous inputs are UNKNOWN, insufficient input is UNKNOWN, `MIN_CONFIDENCE = 60`. Integration: `pipeline.py` runs `fec_identification` right after demodulation with `identify_fec(bits, reference_bits)`, decodes only when `AUTO_DETECTED`, and always preserves the result on `result.demodulation["fec_identification"]` plus the `fec_identification` provenance step.
+- **Configuration**: `AnalysisConfig.fec.mode` is `auto | manual | none` (enum-backed, frozen dataclass). AUTO = identification + decode on evidence (manual explicit scheme untouched), MANUAL = explicit scheme authoritative, NONE = no identification/decoding. Serialization and config-to-dict include the new mode.
+- **CLI**: `--fec-mode auto | manual | none`.
+- **GUI**: `FEC MODE` selector (Auto/Manual/None), result panel shows detected scheme, confidence, corrected errors, residual estimate, validation, and candidate evidence.
+**
   (`gui/worker.py`, `gui/window.py`): new `AnalysisWorker(QThread)`
   executes `pipeline.analyze_samples` or the multi-candidate batch
   (`pipeline_batch.analyze_all_candidates`, "Analyze all candidates"
@@ -111,6 +129,44 @@ versioning: semantic.
 
 ### Fixed
 
+- **ML stage never ran** (`pipeline.py`): the ML classification/fusion
+  stage called `predict_modulation` without importing it, so enabling the
+  CNN (GUI checkbox or CLI `--ml`) only ever appended "ML
+  classification/fusion failed: name 'predict_modulation' is not defined"
+  and produced no ML result. Added the missing import; the stage now runs
+  and records `result.ml` / `result.fusion`.
+- **CLI `analyze` silently ignored `--sync-word`** (`cli.py`): the command
+  built a `FrameConfig` from `--sync-word/--data-bytes` and then dropped it
+  (unlike `demodulate`/`report`). The protocol config is now forwarded, so
+  the frame/sync stage runs.
+- **CLI `analyze --ml/--ml-fusion/--labels` were dead flags** (`cli.py`,
+  `pipeline.py`): they were parsed but never reached `AnalysisConfig.ml`.
+  `analyze_capture` now accepts `ml_enabled`/`ml_fusion`/`labels_path` and
+  maps them onto the ML config, and `predict_modulation`/`get_engine`
+  accept an optional `labels_json` override.
+- **CLI `analyze --source gnuradio` raised** (`cli.py`): the branch used
+  `analyze_samples`/`processing_mode_config` without importing them and
+  passed a `reference_bits_path` argument `analyze_samples` does not
+  accept. It now imports both, loads the reference bits, and applies the
+  same FEC / interleaving / protocol / ML overrides as the file path.
+- **CLI `demodulate` omitted the protocol result** (`cli.py`): the
+  sync-word stage ran but its result was left out of the JSON payload.
+- **Duplicate/dead `set_defaults(func=cmd_train)` calls** removed from the
+  argument parser.
+- **Pseudo-random interleaver was neither seeded nor invertible**
+  (`fec/interleaving.py`): `seed` was ignored (all seeds produced the same
+  permutation) and `pseudo_random_deinterleave` re-applied the forward
+  permutation instead of inverting it, so round-trips failed. Replaced with
+  a seeded injective affine key and a true inverse.
+- **Recovered bitstream was discarded** (`pipeline.py`): both the auto and
+  explicit FEC paths stored the FEC output **bit count** under
+  `decoded_bits` instead of the recovered bits. Now the real bitstream is
+  stored alongside `decoded_bit_count`.
+- **CLI analyze/demodulate/report crashed on FEC/interleaving flags**
+  (`cli.py`, `pipeline.py`): `analyze` passed unsupported `load_signal`
+  kwargs, while `demodulate`/`report` read `args.interleaving_mode` that was
+  never defined. Added a shared `_add_fec_arguments()` helper and mapped the
+  overrides onto `FECConfig`.
 - **GUI "Isolate Selected" always failed** (`gui/window.py`): the slot
   still called the V1 ndarray API (`isolate_signal(samples, sample_rate,
   ...)`) while the V2 isolator expects a `Signal` and returns an
@@ -163,6 +219,31 @@ versioning: semantic.
 - Offscreen GUI verification: worker probe (1.5 s balanced),
   full-window probe (QPSK 99.4%, 100.0 sym/s, 4030 bits), deep
   batch headless (no warnings).
+
+### Added (final readiness pass, 2026-09-29)
+
+- **Deterministic demo set** (`tests/demo_captures.py`): eleven cases
+  covering PSK (QPSK, 8-PSK), QAM (16-QAM), FSK (BFSK), convolutional /
+  Reed-Solomon / concatenated FEC, and all four de-interleaver families
+  (block, convolutional, diagonal, pseudo-random). `write_capture()` also
+  emits the `<stem>.reference.npz` sidecar the BER/alignment stage expects,
+  so the GUI and CLI demonstrate the clean decoded chain where the backend
+  supports it. An FSK builder (`build_fsk_capture`) was added.
+- **`docs/SIH_REQUIREMENTS.md`** — the authoritative SIH-147 requirement
+  matrix with per-row evidence and honest limitations; the user guide §9.5
+  summary and this changelog link to it.
+- **`tests/test_final_integration.py`** (8 tests): regressions for the CLI /
+  pipeline integration bugs above, the ML stage, and the FSK + reference
+  sidecar demo coverage.
+
+### Verified (final readiness pass, 2026-09-29)
+
+- `QT_QPA_PLATFORM=offscreen python -m pytest -q` → **433 passed**.
+- Focused FEC / interleaving / GUI / CLI / ML set → 236 passed.
+- Offscreen GUI walkthrough over all 11 demo captures: every case classifies
+  correctly, all six visualisation tabs render, FEC/recovered/sync/BER rows
+  populate, provenance present, JSON export and batch candidate detail
+  verified, GNU Radio acquire works via the synthetic fallback.
 
 ## [2.2.0] - 2026-09-22
 

@@ -327,8 +327,16 @@ _TRAINED = Path(__file__).with_name("modulation_cnn_trained.npz")
 _engine: ModulationCNN | None = None
 
 
-def get_engine() -> ModulationCNN | None:
-    """Return the shared engine (or None if nothing is available)."""
+def get_engine(labels_json: str | Path | None = None) -> ModulationCNN | None:
+    """Return the shared engine (or None if nothing is available).
+
+    A ``labels_json`` override builds a one-off engine carrying that label
+    map; it is deliberately *not* cached in the process singleton so the
+    default (artifact-defined) labels are never mutated by a caller.
+    """
+
+    if labels_json is not None:
+        return _select_engine(labels_json)
 
     global _engine
     if _engine is None:
@@ -336,27 +344,32 @@ def get_engine() -> ModulationCNN | None:
     return _engine
 
 
-def _select_engine() -> ModulationCNN | None:
+def _select_engine(labels_json: str | Path | None = None) -> ModulationCNN | None:
     """Choose the artifact priority and report why."""
     for candidate in (_TRAINED, _DEFAULT):
         if candidate.is_file():
             try:
-                engine = ModulationCNN(candidate)
+                engine = ModulationCNN(candidate, labels_json=labels_json)
                 engine.artifact_name = candidate.name
                 return engine
             except Exception:
                 # Corrupt artifact: move on, the next candidate is tried.
                 continue
-def predict_modulation(samples: np.ndarray) -> dict | None:
+def predict_modulation(
+    samples: np.ndarray, labels_json: str | Path | None = None
+) -> dict | None:
     """Convenience API used by the pipeline's ML stage.
 
     Returns ``None`` only when nothing is available at all (no artifact,
     corrupt file, or capture too short). A *trained* artifact plus a
     short capture is a real signal that should be distinguished from a
     missing artifact, so the caller can warn the user differently.
+
+    ``labels_json`` optionally overrides the artifact's class labels for
+    this call only (used by the CLI ``--labels`` flag).
     """
 
-    engine = get_engine()
+    engine = get_engine(labels_json)
     if engine is None:
         return None
 
