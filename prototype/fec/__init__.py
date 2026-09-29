@@ -1,6 +1,8 @@
 """
 Forward error correction: CRC, Hamming(7,4), repetition, convolutional
-(K=7, rate 1/2) with Viterbi decoding, and block interleaving.
+(K=7, rate 1/2) with Viterbi decoding, shortened Reed-Solomon over
+GF(256), compact (3,6)-regular LDPC, serial concatenation (RS + CC), and
+block/convolutional/diagonal/pseudo-random interleaving.
 
 FEC usage is always *explicit* configuration, never guessed from data.
 """

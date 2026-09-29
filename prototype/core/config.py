@@ -9,11 +9,41 @@ use ``dataclasses.replace`` to derive modified copies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import numpy as np
+from prototype.fec import interleaving as _interleaving
+from prototype.fec.interleaving import deinterleave_bits
 from typing import Any
 from pathlib import Path
 
 from .exceptions import ConfigurationError
 from prototype.protocol.config import FrameConfig
+
+
+class FECMode:
+    """Enum-like mode constants for processing and FEC direction.
+
+    Values are plain strings so they round-trip cleanly through dicts,
+    JSON provenance, and GUI dropdowns.
+    """
+
+    AUTO = "auto"
+    MANUAL = "manual"
+    NONE = "none"
+
+    @classmethod
+    def values(cls) -> tuple[str, str, str]:
+        return (cls.AUTO, cls.MANUAL, cls.NONE)
+
+
+# Supported de-interleaver families (manual mode).  Each family draws its
+# parameter from ``FECConfig.interleave_depth``.
+INTERLEAVE_FAMILIES: tuple[str, ...] = (
+    "block",
+    "convolutional",
+    "diagonal",
+    "pseudo_random",
+)
+
 from prototype.ml.fusion import FusionConfig
 
 
@@ -106,9 +136,18 @@ class FECConfig:
     scheme: str | None = None  # None -> no FEC
     crc: str | None = None  # "crc16", "crc32", or None
     interleave_depth: int = 1
+    interleave_family: str = "block"
+    mode: str = FECMode.AUTO
+    interleaving_mode: str = FECMode.AUTO
 
     def __post_init__(self) -> None:
         from ..fec import list_schemes
+
+        if self.interleave_family not in INTERLEAVE_FAMILIES:
+            raise ConfigurationError(
+                f"Unknown interleave_family '{self.interleave_family}'. "
+                f"Available: {list(INTERLEAVE_FAMILIES)}"
+            )
 
         if self.scheme is not None and self.scheme not in list_schemes():
             raise ConfigurationError(
@@ -119,6 +158,85 @@ class FECConfig:
             raise ConfigurationError("crc must be 'crc16', 'crc32', or None")
         if self.interleave_depth < 1:
             raise ConfigurationError("interleave_depth must be >= 1")
+        if self.mode not in FECMode.values():
+            raise ConfigurationError(
+                f"Unknown FEC mode '{self.mode}'. "
+                f"Available: {sorted(FECMode.values())}"
+            )
+        if self.interleaving_mode not in FECMode.values():
+            raise ConfigurationError(
+                f"Unknown interleaving mode '{self.interleaving_mode}'. "
+                f"Available: {sorted(FECMode.values())}"
+            )
+
+    def identification_runs(self) -> bool:
+        """True when the automatic FEC identification step executes."""
+        return self.mode == FECMode.AUTO
+
+    def interleaving_depth(self) -> int:
+        """Block-interleaving depth effective for deinterleaving."""
+        return self.interleave_depth
+
+    def interleaving_runs(self) -> bool:
+        """True when automatic block-interleaving identification runs."""
+        return self.interleaving_mode == FECMode.AUTO
+
+    def deinterleave_bits(self, bits: np.ndarray) -> np.ndarray:
+        """Run the stored/manual deinterleaving for the configured family.
+
+        MANUAL: apply the configured family/depth (or seed) authoritatively.
+        NONE: as-is. AUTO: as-is (the pipeline deinterleaves inline once
+        identification returns AUTO_DETECTED; this helper never forces a
+        depth on its own).
+
+        The family parameter reuses ``interleave_depth`` across families:
+        depth for ``block``, number of streams ``k`` for ``convolutional``,
+        square width for ``diagonal`` and the permutation seed for
+        ``pseudo_random``.
+        """
+        arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+        applicable, _ = self.manual_deinterleave_plan(int(arr.size))
+        if not applicable:
+            return arr
+        param = int(self.interleave_depth)
+        family = self.interleave_family
+        if family == "convolutional":
+            return _interleaving.convolutional_deinterleave(arr, k=param)
+        if family == "diagonal":
+            return _interleaving.diagonal_deinterleave(arr, depth=param)
+        if family == "pseudo_random":
+            return _interleaving.pseudo_random_deinterleave(arr, seed=param)
+        # block (row-column) is the default
+        return deinterleave_bits(arr, depth=param, original_size=int(arr.size))
+
+    def manual_deinterleave_plan(self, nbits: int) -> tuple[bool, str]:
+        """Whether MANUAL deinterleaving applies to an ``nbits`` stream.
+
+        Returns ``(applicable, reason)``; ``reason`` is empty when the plan
+        applies and otherwise explains why no deinterleaving was performed
+        (so the pipeline can warn instead of silently passing bits through).
+        """
+        if self.interleaving_mode != FECMode.MANUAL:
+            return False, "interleaving mode is not manual"
+        param = int(self.interleave_depth)
+        family = self.interleave_family
+        if family == "pseudo_random":
+            return (nbits > 0), ("" if nbits > 0 else "empty bitstream")
+        if family == "convolutional":
+            if param < 2:
+                return False, "convolutional k must be >= 2"
+            if nbits % param != 0:
+                return False, f"{nbits} bits not divisible by convolutional k={param}"
+            return True, ""
+        if family == "diagonal":
+            if param < 2:
+                return False, "diagonal depth must be >= 2"
+            if nbits != param * param:
+                return False, f"{nbits} bits != diagonal depth^2={param * param}"
+            return True, ""
+        if param < 2:
+            return False, "block depth must be >= 2"
+        return True, ""
 
 
 @dataclass(frozen=True)

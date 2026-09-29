@@ -62,6 +62,50 @@ def _loader_kwargs(args: argparse.Namespace) -> dict:
     return kwargs
 
 
+def _add_fec_arguments(p: argparse.ArgumentParser) -> None:
+    """FEC / interleaving overrides shared by analyze, demodulate, report."""
+    p.add_argument(
+        "--interleaving-mode",
+        default="auto",
+        choices=["auto", "manual", "none"],
+        help="Block-interleaving handling on the demodulated bitstream "
+             "(auto = identify + deinterleave on evidence; manual = apply "
+             "the configured interleave depth; none = pass received bits "
+             "through unchanged). Maps to the pipeline's "
+             "fec.interleaving_mode.",
+    )
+    p.add_argument(
+        "--interleave-depth",
+        type=int,
+        default=None,
+        help="Interleaver parameter applied when --interleaving-mode "
+             "manual: block depth, convolutional streams k, diagonal "
+             "square width, or pseudo-random seed (must be >= 2 except "
+             "for a seed 0/1).",
+    )
+    p.add_argument(
+        "--interleave-family",
+        default=None,
+        choices=["block", "convolutional", "diagonal", "pseudo_random"],
+        help="De-interleaver family applied when --interleaving-mode "
+             "manual (default: block).",
+    )
+    p.add_argument(
+        "--fec-mode",
+        default=None,
+        choices=["auto", "manual", "none"],
+        help="FEC handling: auto = identify the scheme from evidence and "
+             "decode only when the evidence clears the confidence rule; "
+             "manual = decode with --fec-scheme; none = no FEC. Defaults "
+             "to the processing-mode preset when omitted.",
+    )
+    p.add_argument(
+        "--fec-scheme",
+        default=None,
+        help="Explicit FEC scheme (used with --fec-mode manual).",
+    )
+
+
 def _emit(payload: dict, json_path: str | None) -> None:
     text = json.dumps(payload, indent=2, default=str)
     if json_path and json_path != "-":
@@ -74,7 +118,8 @@ def _emit(payload: dict, json_path: str | None) -> None:
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    from prototype.pipeline import analyze_capture
+    from prototype.core.config import processing_mode_config
+    from prototype.pipeline import analyze_capture, analyze_samples
     from prototype.protocol import FrameConfig
 
     protocol_config = None
@@ -114,12 +159,45 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             return 2
 
         gnuradio_signal = signal_from_gnuradio_source(source, acquisition)
+
+        reference_bits = None
+        if args.reference is not None:
+            with np.load(args.reference, allow_pickle=False) as data:
+                reference_bits = np.asarray(data["bits"], dtype=np.uint8)
+
+        # analyze_samples takes an in-memory bit reference (not a path),
+        # and the FEC / interleaving / ML overrides map onto the config
+        # exactly as they do on the file path.
+        from dataclasses import replace
+
+        gr_config = processing_mode_config(args.mode)
+        fec_overrides: dict = {}
+        if args.fec_mode is not None:
+            fec_overrides["mode"] = str(args.fec_mode).strip().lower()
+        if args.fec_scheme is not None:
+            fec_overrides["scheme"] = args.fec_scheme
+        if args.interleaving_mode is not None:
+            fec_overrides["interleaving_mode"] = (
+                str(args.interleaving_mode).strip().lower()
+            )
+        if args.interleave_depth is not None:
+            fec_overrides["interleave_depth"] = int(args.interleave_depth)
+        if args.interleave_family is not None:
+            fec_overrides["interleave_family"] = (
+                str(args.interleave_family).strip().lower()
+            )
+        if fec_overrides:
+            gr_config = replace(gr_config, fec=replace(gr_config.fec, **fec_overrides))
+        if protocol_config is not None:
+            gr_config = replace(gr_config, protocol=protocol_config)
+        if getattr(args, "ml", None):
+            gr_config = replace(gr_config, ml=replace(gr_config.ml, enabled=True))
+
         result = analyze_samples(
             samples=gnuradio_signal.samples,
             sample_rate=gnuradio_signal.sample_rate,
-            config=processing_mode_config(args.mode),
-            reference_bits_path=args.reference,
-            interleaving_mode=args.interleaving_mode,
+            config=gr_config,
+            reference_bits=reference_bits,
             input_info={
                 "source": gnuradio_signal.metadata.get("capture", {}).get(
                     "source_config",
@@ -137,7 +215,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             mode=args.mode,
             candidate_index=args.candidate,
             reference_bits_path=args.reference,
+            protocol=protocol_config,
             interleaving_mode=args.interleaving_mode,
+            interleave_depth=args.interleave_depth,
+            interleave_family=args.interleave_family,
+            fec_mode=args.fec_mode,
+            fec_scheme=args.fec_scheme,
+            ml_enabled=getattr(args, "ml", None),
+            ml_fusion=getattr(args, "ml_fusion", None),
+            labels_path=getattr(args, "labels", None),
             **_loader_kwargs(args),
         )
     _emit(result.to_dict(), args.json)
@@ -259,6 +345,10 @@ def cmd_demodulate(args: argparse.Namespace) -> int:
                    reference_bits_path=args.reference,
                    protocol=protocol_config,
                    interleaving_mode=args.interleaving_mode,
+                   interleave_depth=args.interleave_depth,
+                   interleave_family=args.interleave_family,
+                   fec_mode=args.fec_mode,
+                   fec_scheme=args.fec_scheme,
                    **_loader_kwargs(args),
                )
     payload = {
@@ -267,6 +357,7 @@ def cmd_demodulate(args: argparse.Namespace) -> int:
         "synchronization": result.synchronization,
         "demodulation": result.demodulation,
         "ber": result.ber,
+        "protocol": result.protocol,
         "warnings": result.warnings,
     }
     _emit(payload, args.json)
@@ -292,6 +383,10 @@ def cmd_report(args: argparse.Namespace) -> int:
                    reference_bits_path=args.reference,
                    protocol=protocol_config,
                    interleaving_mode=args.interleaving_mode,
+                   interleave_depth=args.interleave_depth,
+                   interleave_family=args.interleave_family,
+                   fec_mode=args.fec_mode,
+                   fec_scheme=args.fec_scheme,
                    **_loader_kwargs(args),
                )
     data = result.to_dict()
@@ -512,15 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Fusion policy: side_by_side (default) | dsp_over_ml | ml_over_dsp | max_confidence")
     p.add_argument("--labels", default=None,
                    help="JSON file mapping 16 CNN output indices to class names")
-    p.add_argument(
-    "--interleaving-mode",
-    default="auto",
-    choices=["auto", "manual", "none"],
-    help="Block-interleaving handling on the demodulated bitstream "
-         "(auto = identify + deinterleave on evidence; manual = apply "
-         "configured interleave depth; none = pass received bits through "
-         "unchanged). Maps to the pipeline's fec.interleaving_mode.",
-    )
+    _add_fec_arguments(p)
     p.add_argument("--json", default="-", help="JSON output path ('-' = stdout)")
     p.set_defaults(func=cmd_analyze)
 
@@ -557,6 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Hex/integer sync word for protocol frame analysis")
     p.add_argument("--data-bytes", type=int, default=0,
                    help="Expected payload bytes after the sync word")
+    _add_fec_arguments(p)
     p.add_argument("--json", default="-")
     p.set_defaults(func=cmd_demodulate)
 
@@ -570,6 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["quick", "balanced", "deep", "realtime"])
     p.add_argument("--candidate", type=int, default=0)
     p.add_argument("--reference", default=None)
+    _add_fec_arguments(p)
     p.add_argument("--html", default=None, help="HTML report output path")
     p.add_argument("--json", default=None, help="JSON side output path")
     p.set_defaults(func=cmd_report)
@@ -639,10 +728,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--output", type=str, default="ml/modulation_cnn_trained.npz")
     p.add_argument("--skip-grad-check", action="store_true")
-    p.set_defaults(func=cmd_train)
-
-    p.set_defaults(func=cmd_train)
-
     p.set_defaults(func=cmd_train)
 
     p = subparsers.add_parser("validate", help="Pipeline self-check")

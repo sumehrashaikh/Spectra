@@ -8,7 +8,7 @@ a frequency-timeline summary suitable for spectrum-monitoring views.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
 import numpy as np
@@ -40,25 +40,56 @@ class BatchResult:
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-safe summary: full detail for analyzed candidates."""
+        """JSON-safe summary: full detail for analyzed candidates.
+
+        Every field is converted to plain Python containers, exactly as
+        the single-candidate ``AnalysisResult.to_dict`` does, so callers
+        (GUI, CLI, JSON export) never receive dataclasses or NumPy
+        scalars.
+        """
         return {
-            "input": dict(self.input_info),
-            "detections": [dict(d) for d in self.detections],
+            "input": _as_plain(self.input_info),
+            "detections": _as_plain(self.detections),
             "analyzed_candidates": [
                 {
                     "candidate_index": index,
-                    "selected_candidate": r.selected_candidate,
-                    "classification": r.classification,
-                    "symbol_rate": r.symbol_rate,
-                    "synchronization": r.synchronization,
-                    "demodulation": _strip_arrays(r.demodulation),
-                    "ber": r.ber,
-                    "warnings": r.warnings,
+                    "selected_candidate": _as_plain(r.selected_candidate),
+                    "parameters": _as_plain(r.parameters),
+                    "classification": _as_plain(r.classification),
+                    "symbol_rate": _as_plain(r.symbol_rate),
+                    "synchronization": _as_plain(r.synchronization),
+                    "demodulation": _strip_arrays(_as_plain(r.demodulation)),
+                    "ber": _as_plain(r.ber),
+                    "protocol": _as_plain(r.protocol),
+                    "ml": _as_plain(r.ml),
+                    "fusion": _as_plain(r.fusion),
+                    "warnings": list(r.warnings),
                 }
                 for index, r in self.results
             ],
             "warnings": list(self.warnings),
         }
+
+
+def _as_plain(value: Any) -> Any:
+    """Recursively convert dataclasses / NumPy values to plain Python."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _as_plain(asdict(value))
+    if isinstance(value, dict):
+        return {k: _as_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_plain(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _as_plain(value.tolist())
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, complex):
+        return {"real": value.real, "imag": value.imag}
+    return value
 
 
 def _strip_arrays(value: Any) -> Any:
@@ -138,6 +169,7 @@ def analyze_all_candidates(
                 config=config,
                 reference_bits=reference_bits,
                 input_info={"candidate_index": index},
+                capture_symbol_samples=True,
             )
         except Exception as exc:
             batch.warnings.append(f"Candidate {index}: analysis failed: {exc}")

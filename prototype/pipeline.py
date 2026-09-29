@@ -26,10 +26,16 @@ from prototype.core.config import (
     IsolationConfig,
     processing_mode_config,
     config_to_dict,
+    FECMode,
 )
 from prototype.core.exceptions import PipelineError
 from prototype.core.provenance import new_provenance, provenance_to_dict
 from prototype.core.signal import Signal
+from prototype.fec.identification_interleaving import (
+    AUTO_DETECTED,
+    identify_interleaving,
+)
+from prototype.fec.interleaving import deinterleave_bits
 
 logger = logging.getLogger("spectra.pipeline")
 
@@ -429,6 +435,136 @@ def _demodulate(
     return summary, np.asarray(result.bits)
 
 
+def _resolve_codeword_alignment(
+    modulation: str | None,
+    bits: np.ndarray,
+    reference_bits: np.ndarray,
+    synchronized_signal: Signal | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Resolve the receiver's blind ambiguity against a transmitted reference.
+
+    Mirrors the ambiguity model used by the BER stage (polarity / QPSK
+    rotation / 16-QAM rotation x symbol-origin) but *returns the bitstream*,
+    so the deinterleaver and FEC decoder can run on an aligned input.
+
+    A candidate is only accepted when it is a strict improvement over the
+    raw demodulated stream against the reference (fewer bit errors and a
+    BER below 0.25); otherwise the raw bits are returned with
+    ``aligned=False``.  That guard keeps a reference that does not describe
+    the demodulated domain (e.g. a payload reference against an FEC-coded
+    stream) from silently mangling the stream: every candidate scores ~0.5
+    there, so nothing is accepted.
+    """
+    arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    reference = np.asarray(reference_bits, dtype=np.uint8).reshape(-1)
+
+    def _errors(candidate: np.ndarray) -> tuple[int, int]:
+        n = min(candidate.size, reference.size)
+        return int(np.count_nonzero(candidate[:n] != reference[:n])), n
+
+    raw_errors, raw_compared = _errors(arr)
+    info: dict[str, Any] = {
+        "aligned": False,
+        "modulation": modulation,
+        "raw_bit_errors": raw_errors,
+        "raw_compared_bits": raw_compared,
+        "candidates_tried": 0,
+    }
+
+    if raw_compared == 0 or synchronized_signal is None:
+        info["reason"] = "no synchronized symbols or empty reference"
+        return arr, info
+
+    best_bits = arr
+    best_errors = raw_errors
+    best_label = "raw demodulated bits"
+    best_ber = raw_errors / raw_compared
+
+    def _consider(candidate: np.ndarray, label: str) -> None:
+        nonlocal best_bits, best_errors, best_label, best_ber
+        info["candidates_tried"] = int(info["candidates_tried"]) + 1
+        errors, compared = _errors(candidate)
+        if compared == 0:
+            return
+        candidate_ber = errors / compared
+        if errors < best_errors and candidate_ber < best_ber:
+            best_bits = candidate
+            best_errors = errors
+            best_label = label
+            best_ber = candidate_ber
+
+    symbols = np.asarray(synchronized_signal.samples)
+
+    if modulation in ("QPSK", "16-QAM"):
+        # Square PSK/QAM mappings leave a 90-degree phase fold and an
+        # integer-symbol origin ambiguity (pulse-shaping group delay), so
+        # both are searched in whole symbols.  This reuses the demodulator
+        # helpers the BER stage uses, so the resolved stream is exactly the
+        # one BER reports on.
+        if modulation == "QPSK":
+            from prototype.modulation.demodulator import qpsk_decision
+
+            decision = qpsk_decision
+            symbols_for_search = symbols
+            bits_per_symbol = 2
+        else:
+            from prototype.modulation.demodulator import (
+                normalize_qam16_symbols,
+                qam16_decision,
+            )
+
+            decision = qam16_decision
+            symbols_for_search = normalize_qam16_symbols(symbols)
+            bits_per_symbol = 4
+
+        max_offset = min(16, max(0, symbols_for_search.size - 1))
+
+        for k in range(4):
+            rotated = symbols_for_search * np.exp(1j * k * np.pi / 2.0)
+            rot_bits, _, _ = decision(rotated)
+            rot_bits = np.asarray(rot_bits, dtype=np.uint8)
+            if rot_bits.size == 0:
+                continue
+            for inverted in (0, 1):
+                candidate = rot_bits ^ 1 if inverted else rot_bits
+                for sym_off in range(-max_offset, max_offset + 1):
+                    shift = bits_per_symbol * sym_off
+                    shifted = candidate[shift:] if shift >= 0 else candidate
+                    if shifted.size == 0:
+                        continue
+                    label = (
+                        f"{modulation} rotation {k * 90} deg, "
+                        f"origin {sym_off:+d} symbols"
+                        f"{' + inversion' if inverted else ''}"
+                    )
+                    _consider(shifted, label)
+
+    else:
+        # Polarity is the only blind ambiguity for the remaining mappings.
+        _consider(arr ^ 1, "polarity inversion")
+
+    accepted = best_errors < raw_errors and best_ber < 0.25
+
+    info.update(
+        {
+            "aligned": bool(accepted),
+            "label": best_label,
+            "aligned_bit_errors": int(best_errors),
+            "aligned_compared_bits": int(raw_compared),
+            "aligned_ber": float(best_ber),
+            "reference_domain": "transmitted bits as demodulated (pre-deinterleave)",
+        }
+    )
+    if not accepted:
+        info["reason"] = (
+            "no candidate improved on the raw demodulated stream "
+            f"(raw bit errors {raw_errors}/{raw_compared})"
+        )
+        return arr, info
+
+    return best_bits, info
+
+
 def _evaluate_ber(
     modulation: str,
     bits: np.ndarray | None,
@@ -749,6 +885,174 @@ def analyze_samples(
             result.warnings.append(f"Demodulation failed: {exc}")
             bits = None
 
+    # Preserve the received (post-demodulation, pre-deinterleaving)
+    # bitstream: the result must always carry the original demodulated
+    # bits regardless of what the interleaving/FEC stages do next.
+    if bits is not None:
+        result.demodulation = result.demodulation or {}
+        result.demodulation["received_bits"] = bits
+
+    # ---- codeword alignment (transmitted-bit reference available) --------
+    # Blind carrier/timing recovery leaves an unobservable phase fold and
+    # a symbol-origin offset (pulse-shaping group delay).  When the caller
+    # supplies the transmitted bitstream as a reference (the same reference
+    # BER uses) the receiver can resolve that ambiguity *before* the
+    # deinterleaver/decoder run, which is what makes the coded chain
+    # decodable at all.  Without a reference the raw demodulated stream is
+    # passed on unchanged and this is recorded honestly.
+    if bits is not None and reference_bits is not None:
+        with provenance.record_step("codeword_alignment") as step:
+            try:
+                aligned_bits, alignment_info = _resolve_codeword_alignment(
+                    modulation, bits, reference_bits, synchronized_signal
+                )
+                result.demodulation = result.demodulation or {}
+                result.demodulation["codeword_alignment"] = alignment_info
+                step["aligned"] = bool(alignment_info.get("aligned"))
+                step["label"] = alignment_info.get("label")
+                if alignment_info.get("aligned"):
+                    bits = aligned_bits
+                    result.demodulation["aligned_bits"] = bits
+            except Exception as exc:  # never fatal: fall back to raw bits
+                logger.exception("codeword alignment failed")
+                result.demodulation = result.demodulation or {}
+                result.demodulation["codeword_alignment"] = {
+                    "aligned": False,
+                    "reason": f"alignment failed: {exc}",
+                }
+
+    # ---- block-interleaving identification / deinterleaving --------------
+    # Demodulated ``bits`` are the received bitstream after the
+    # row-column block interleaver (if the transmitter used one).
+    #
+    # AUTO: run the structural identifier. Only a genuine, depth-
+    # discriminative AUTO_DETECTED result may cause deinterleaving;
+    # without structural evidence or on insufficient evidence the bits
+    # stay unchanged and no depth is forced.
+    # MANUAL: apply the configured interleave_depth authoritatively;
+    # no identification is run.
+    # NONE: bits stay untouched.
+    with provenance.record_step("interleaving_identification") as step:
+        try:
+            fec_cfg = config.fec
+
+            if fec_cfg.interleaving_mode == FECMode.AUTO:
+                interleave_result = identify_interleaving(
+                    bits, min_depth=2, max_depth=16
+                )
+                result.warnings.extend(interleave_result.warnings)
+
+                if (
+                    interleave_result.status == AUTO_DETECTED
+                    and interleave_result.best_depth is not None
+                ):
+                    # Genuine structural evidence: deinterleave on a copy
+                    # so the received ``bits`` are never mutated.
+                    result.demodulation["interleaving_result"] = interleave_result.to_dict()
+                    deinterleaved = deinterleave_bits(
+                        bits,
+                        depth=int(interleave_result.best_depth),
+                        original_size=int(bits.size),
+                    )
+                    bits = deinterleaved
+                    result.demodulation["deinterleaved_bits"] = bits
+                    step["status"] = AUTO_DETECTED
+                    step["best_depth"] = int(interleave_result.best_depth)
+                    step["confidence"] = float(interleave_result.confidence)
+                else:
+                    # No structural evidence: bits unchanged; no depth forced.
+                    # Record the identifier result so callers can inspect
+                    # whether AUTO ran and what it found.
+                    step["status"] = interleave_result.status
+                    step["best_depth"] = interleave_result.best_depth
+                    result.demodulation["interleaving_result"] = interleave_result.to_dict()
+            elif fec_cfg.interleaving_mode == FECMode.MANUAL:
+                # MANUAL is authoritative: apply the configured family and
+                # depth directly (block / convolutional / diagonal /
+                # pseudo-random), with no identification run.
+                family = fec_cfg.interleave_family
+                padded = 0
+                # Interleaver geometry is defined by the TRANSMITTED frame
+                # size, so a capture whose tail was lost cannot be
+                # deinterleaved on its own (the permutation changes with
+                # the length).  When the transmitted reference is available
+                # the receiver zero-fills the missing tail back to the
+                # transmitted length - the standard partial-frame handling -
+                # and reports how many bits were filled; the affected
+                # codeword is then reported as uncorrectable instead of
+                # being silently mis-decoded.
+                if (
+                    reference_bits is not None
+                    and np.asarray(reference_bits).size > bits.size
+                ):
+                    padded = int(np.asarray(reference_bits).size - bits.size)
+                    bits = np.concatenate(
+                        [bits, np.zeros(padded, dtype=np.uint8)]
+                    )
+                    result.demodulation["zero_filled_bits"] = padded
+                applicable, reason = fec_cfg.manual_deinterleave_plan(int(bits.size))
+                result.demodulation["interleaving_result"] = {
+                    "status": "MANUALLY_CONFIGURED",
+                    "best_depth": fec_cfg.interleave_depth,
+                    "family": family,
+                    "confidence": 1.0,
+                    "candidates": [],
+                    "applicable": applicable,
+                    "evidence": {
+                        "mode": "manual_configured_family_apply",
+                        "family": family,
+                        "depth": fec_cfg.interleave_depth,
+                        "applicable": applicable,
+                        "reason": reason,
+                        "zero_filled_bits": padded,
+                    },
+                }
+                if applicable:
+                    if family == "block":
+                        # Keep the block path on the pipeline's own
+                        # deinterleave_bits reference for behaviour parity.
+                        bits = deinterleave_bits(
+                            bits,
+                            depth=int(fec_cfg.interleave_depth),
+                            original_size=int(bits.size),
+                        )
+                    else:
+                        bits = fec_cfg.deinterleave_bits(bits)
+                    result.demodulation["deinterleaved_bits"] = bits
+                else:
+                    # Inapplicable plan: keep the received bits untouched and
+                    # surface the reason instead of silently passing through.
+                    result.warnings.append(
+                        f"Manual {family} deinterleaving not applied: {reason}"
+                    )
+                step["status"] = "MANUALLY_CONFIGURED"
+                step["best_depth"] = fec_cfg.interleave_depth
+                step["family"] = family
+            elif fec_cfg.interleaving_mode == FECMode.NONE:
+                # NONE skips interleaving entirely; bits stay as received.
+                result.demodulation["interleaving_result"] = {
+                    "status": "NONE",
+                    "best_depth": None,
+                    "confidence": 0.0,
+                    "candidates": [],
+                    "evidence": {"mode": "none"},
+                }
+                step["status"] = "NONE"
+            else:
+                # AUTO with structurally weak / unresolved evidence: no
+                # deinterleaving, no forced depth. ``bits`` remains the
+                # received demodulated bitstream for BER and the FEC path.
+                result.demodulation["interleaving_result"] = {
+                    "status": getattr(interleave_result, "status", "UNRESOLVED"),
+                    "best_depth": getattr(interleave_result, "best_depth", None),
+                    "confidence": float(getattr(interleave_result, "confidence", 0.0)),
+                    "candidates": list(getattr(interleave_result, "candidates", [])),
+                    "evidence": dict(getattr(interleave_result, "evidence", {})),
+                }
+                step["status"] = getattr(interleave_result, "status", "UNRESOLVED")
+        except Exception as exc:
+            result.warnings.append(f"Interleaving identification failed: {exc}")
+
     # ---- BER ----------------------------------------------------------------
     if bits is not None and reference_bits is not None:
         with provenance.record_step("ber") as step:
@@ -763,18 +1067,86 @@ def analyze_samples(
             if result.ber:
                 step["ber"] = result.ber["ber"]
 
+    # ---- automatic FEC identification (AUTO mode only) ---------------------
+    # The identifier is a *candidate evaluator*: it runs the existing
+    # decoders to score hypotheses and only reports a scheme when the
+    # evidence clears its internal confidence rule.  UNKNOWN/UNRESOLVED
+    # is a valid, honest outcome and never a guess.
+    if bits is not None and config.fec.identification_runs():
+        with provenance.record_step("fec_identification") as step:
+            try:
+                from prototype.fec.identification import identify_fec
+
+                identification = identify_fec(bits, reference_bits)
+
+                result.demodulation = result.demodulation or {}
+                result.demodulation[
+                    "fec_identification"
+                ] = identification.to_dict()
+
+                step["status"] = identification.status
+                step["best_scheme"] = identification.best_scheme
+                step["confidence"] = float(identification.confidence)
+
+                if (
+                    identification.status == "AUTO_DETECTED"
+                    and identification.best_scheme
+                ):
+                    # Decode a copy of the bits; the received stream (and
+                    # the deinterleaved stream) are never mutated.
+                    from prototype.fec import decode_bits
+
+                    # ``trim_partial_codeword`` drops the truncated tail a
+                    # real capture always has and reports how much: decoding
+                    # whole codewords only, never inventing the missing bits.
+                    decoded, fec_result = decode_bits(
+                        np.asarray(bits).copy(),
+                        identification.best_scheme,
+                        trim_partial_codeword=True,
+                    )
+                    result.demodulation["fec"] = {
+                        "scheme": fec_result.scheme,
+                        "corrected_errors": fec_result.corrected_errors,
+                        "uncorrectable_blocks": (
+                            fec_result.uncorrectable_blocks
+                        ),
+                        # The recovered bitstream itself (never the count).
+                        "decoded_bits": decoded,
+                        "decoded_bit_count": int(fec_result.output_bits),
+                        "trimmed_tail_bits": int(
+                            (fec_result.extra or {}).get("trimmed_tail_bits", 0)
+                        ),
+                        "source": "auto_identified",
+                    }
+                    step["decoded"] = True
+                else:
+                    step["decoded"] = False
+            except Exception as exc:
+                result.warnings.append(f"FEC identification failed: {exc}")
+
+    # ---- explicit FEC decode (MANUAL mode) ---------------------------------
     if config.fec.scheme and bits is not None:
         with provenance.record_step("fec_decode") as step:
             try:
                 from prototype.fec import decode_bits
 
-                decoded, fec_result = decode_bits(bits, config.fec.scheme)
+                decoded, fec_result = decode_bits(
+                    bits,
+                    config.fec.scheme,
+                    trim_partial_codeword=True,
+                )
                 result.demodulation = result.demodulation or {}
                 result.demodulation["fec"] = {
                     "scheme": fec_result.scheme,
                     "corrected_errors": fec_result.corrected_errors,
                     "uncorrectable_blocks": fec_result.uncorrectable_blocks,
-                    "decoded_bits": fec_result.output_bits,
+                    # The recovered bitstream itself (never the count).
+                    "decoded_bits": decoded,
+                    "decoded_bit_count": int(fec_result.output_bits),
+                    "trimmed_tail_bits": int(
+                        (fec_result.extra or {}).get("trimmed_tail_bits", 0)
+                    ),
+                    "source": "explicit_config",
                 }
                 step["scheme"] = config.fec.scheme
             except Exception as exc:
@@ -786,9 +1158,12 @@ def analyze_samples(
     if config.ml.enabled:
         with provenance.record_step("ml_classification") as step:
             try:
+                from prototype.ml.cnn import predict_modulation
                 from prototype.ml.fusion import fuse_classification
 
-                ml_result = predict_modulation(isolated.samples)
+                ml_result = predict_modulation(
+                    isolated.samples, labels_json=config.ml.labels_json
+                )
                 if ml_result is not None:
                     result.ml = ml_result
                     step["predicted_class"] = ml_result["predicted_class"]
@@ -868,6 +1243,15 @@ def analyze_capture(
     candidate_index: int = 0,
     reference_bits_path: str | Path | None = None,
     config: AnalysisConfig | None = None,
+    protocol: Any | None = None,
+    interleaving_mode: str | None = None,
+    interleave_depth: int | None = None,
+    interleave_family: str | None = None,
+    fec_mode: str | None = None,
+    fec_scheme: str | None = None,
+    ml_enabled: bool | None = None,
+    ml_fusion: str | None = None,
+    labels_path: str | Path | None = None,
     **load_overrides,
 ) -> AnalysisResult:
     """
@@ -875,6 +1259,10 @@ def analyze_capture(
 
     ``load_overrides`` are forwarded to :func:`io.loaders.load_signal`
     (e.g. ``sample_rate``, ``dtype``, ``endianness`` for raw IQ files).
+
+    ``protocol`` / ``interleaving_mode`` / ``interleave_depth`` /
+    ``fec_mode`` / ``fec_scheme`` are explicit configuration overrides
+    mapped onto ``AnalysisConfig``; they are never inferred from data.
 
     A BER reference is loaded automatically from a companion
     ``<file>.reference.npz`` (array key ``bits``) when present, or from
@@ -898,12 +1286,47 @@ def analyze_capture(
             with np.load(companion, allow_pickle=False) as data:
                 reference_bits = np.asarray(data["bits"], dtype=np.uint8)
 
+    from dataclasses import replace
+
     if config is None:
         config = processing_mode_config(mode)
-    else:
-        from dataclasses import replace
 
-        config = replace(config, candidate_index=candidate_index)
+    config = replace(config, candidate_index=candidate_index)
+
+    # Explicit FEC / interleaving / protocol overrides.  These map onto
+    # the existing AnalysisConfig fields and are validated by them
+    # (an invalid mode raises rather than being silently ignored).
+    fec_overrides: dict[str, Any] = {}
+    if fec_mode is not None:
+        fec_overrides["mode"] = str(fec_mode).strip().lower()
+    if fec_scheme is not None:
+        fec_overrides["scheme"] = fec_scheme
+    if interleaving_mode is not None:
+        fec_overrides["interleaving_mode"] = str(interleaving_mode).strip().lower()
+    if interleave_depth is not None:
+        fec_overrides["interleave_depth"] = int(interleave_depth)
+    if interleave_family is not None:
+        fec_overrides["interleave_family"] = str(interleave_family).strip().lower()
+
+    if fec_overrides:
+        config = replace(config, fec=replace(config.fec, **fec_overrides))
+
+    if protocol is not None:
+        config = replace(config, protocol=protocol)
+
+    # Optional ML stage overrides (CLI `--ml/--ml-fusion/--labels`).  The
+    # CNN never overrides the DSP classification; it only adds evidence.
+    ml_overrides: dict[str, Any] = {}
+    if ml_enabled:
+        ml_overrides["enabled"] = True
+    if ml_fusion is not None:
+        ml_overrides["fusion"] = replace(
+            config.ml.fusion, method=str(ml_fusion).strip().lower()
+        )
+    if labels_path is not None:
+        ml_overrides["labels_json"] = str(labels_path)
+    if ml_overrides:
+        config = replace(config, ml=replace(config.ml, **ml_overrides))
 
     capture_info = signal.metadata.get("capture", {})
     return analyze_samples(

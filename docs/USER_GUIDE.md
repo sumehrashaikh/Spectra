@@ -262,18 +262,23 @@ production provenance steps. CRC16/CRC32 stay error-detection-only.
 
 ### 9.5 SIH / requirement matrix (Phase 3)
 
+The authoritative, requirement-by-requirement status — every row with its
+evidence and honest limitations — is kept in
+[`SIH_REQUIREMENTS.md`](SIH_REQUIREMENTS.md). Summary:
+
 | Requirement | Implementation status | Where |
 |---|---|---|
-| AUTO / MANUAL / NONE block-interleaving mode | Implemented | `cli.py` `--interleaving-mode`; `core/config.py` `FECMode`; `pipeline.py` `interleaving_identification` step; `gui/window.py` selector |
-| Block interleaving identification (auto-detect depth) | Implemented | `fec/identification_interleaving.py` (row-column block only) |
-| Deinterleaving of detected depth | Implemented | `fec/interleaving.py`; applied in `pipeline.py` on AUTO_DETECTED |
-| GUI display of detected type / depth / status / confidence / candidates | Implemented | `gui/window.py` new labels + `update_analysis_parameters()` |
-| GUI selector (Auto / Manual / None) | Implemented | `gui/window.py` `interleaving_mode_combo` |
-| CLI expose detected depth/status/confidence/candidates in JSON | Implemented | `cli.py` propagates `interleaving_mode`; result dict carries `demodulation.interleaving_result` | 
-| Provenance / result serialization includes interleaving | Implemented | `pipeline.py` stores `demodulation.interleaving_result`; `to_dict()` serializes nested dicts |
-| New interleaver families (conv/diagonal/pseudo-random) | NOT added | block only, existing `deinterleave_bits` reused |
-| New FEC families (RS/LDPC/concatenated) | NOT added | explicit-scheme decode only, unchanged |
-| Modify DSP / classifier / synchronisation | NOT done | classification/modulation/synchronization untouched |
+| AUTO / MANUAL / NONE FEC mode | Implemented + tested | `core/config.py` `FECMode`; GUI FEC selector; CLI `--fec-mode` |
+| FEC scheme set (repetition3, hamming74, conv12, RS, LDPC, concatenated) | Implemented + tested | `fec/framework.py`, `fec/reed_solomon.py`, `fec/ldpc.py`, `fec/concatenated.py` |
+| Automatic FEC identification (evidence-based) | Implemented (7 schemes) | `fec/identification.py` |
+| Block interleaving mode + auto-detected depth | Implemented | `fec/identification_interleaving.py`, `pipeline.py`, GUI + CLI selectors |
+| De-interleaver families (block / convolutional / diagonal / pseudo-random) | Implemented (manual config; bit-level round trip) | `fec/interleaving.py`, `FECConfig.interleave_family`, CLI `--interleave-family`, GUI family selector |
+| Automatic (non-block) interleaving identification | NOT implemented | block-only by design; no fabricated structural evidence |
+| Frame / sync-word search | Implemented + tested | `protocol/`; GUI frame-search control; CLI `--sync-word/--data-bytes` |
+| Recovered bits / info + BER | Implemented | `demodulation.fec.decoded_bits`; "Recovered bits"/"BER" GUI rows |
+| Provenance / JSON export | Implemented | `core/provenance.py`; GUI Export JSON |
+| Reference-free alignment | NOT implemented | codeword alignment requires a reference; resolves 16-QAM only |
+| Real-world / hardware validation | NOT done | synthetic fixed-seed captures only |
 
 ### 9.6 Limitations
 
@@ -282,6 +287,13 @@ real-world RF identification accuracy. Interleaving identification is now
 in scope for this phase; the structural identifier runs only on the
 demodulated bitstream (no waveform input) and reports AUTO_DETECTED only
 on genuine structural evidence.
+
+Blind codeword alignment (the phase/origin fold) is implemented for
+16-QAM and for coded streams scored against a transmitted reference; it is
+**not** resolved for uncoded QPSK/8-PSK, which are therefore reported
+without a BER reference rather than with a misleading ~0.5 BER.
+Automatic interleaving identification remains block-only — the other three
+families are applied from explicit configuration.
 
 ## 10. Machine learning
 

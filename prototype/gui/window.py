@@ -33,6 +33,7 @@ classify_modulation
 from prototype.core.isolator import isolate_signal
 from prototype.core.signal import Signal
 from PySide6.QtWidgets import (
+QAbstractItemView,
 QCheckBox,
 QComboBox,
 QFrame,
@@ -46,6 +47,8 @@ QMessageBox,
 QPushButton,
 QScrollArea,
 QSizePolicy,
+QSpinBox,
+QTabWidget,
 QTableWidget,
 QTableWidgetItem,
 QVBoxLayout,
@@ -190,6 +193,7 @@ class MainWindow(QMainWindow):
         self._pipeline_ber_summary = None
         self._pipeline_sync_summary = None
         self._pipeline_fec_summary = None
+        self._pipeline_protocol_summary = None
         self._pipeline_ml_summary = None
         self._pipeline_candidates = None  # batch: full candidate payload list
         self._pipeline_candidate_index = None
@@ -209,9 +213,14 @@ class MainWindow(QMainWindow):
         self.pipeline_result = None
         self.pipeline_mode = "balanced"
 
-        # Automatic FEC identification result (Phase 2)
+
+        # Interleaving / FEC identification + pipeline input/worker state
+        self._interleaving_result = None
+        self._interleaving_candidates = []
         self._identification_result = None
-        self._identification_candidates = None
+        self._pipeline_input = None
+        self._pipeline_parameters = None
+        self._gnuradio_worker = None
 
         # Last analysis provenance (stage timings, versions) — captured
         # at result-apply time and shown via "Provenance".
@@ -225,14 +234,17 @@ class MainWindow(QMainWindow):
         "SIH Signal Analyzer"
         )
 
+        # Fit a standard 1366x768 laptop screen: the analysis UI is
+        # organised as title + compact control row + visualisation tabs
+        # + results, so no single page is a giant vertical scroll.
         self.resize(
-        1450,
-        950
+        1200,
+        720
         )
 
         self.setMinimumSize(
-        1100,
-        750
+        900,
+        620
         )
 
         self.build_ui()
@@ -267,7 +279,7 @@ class MainWindow(QMainWindow):
         # ====================================================
 
         title = QLabel(
-        "SIH SIGNAL ANALYZER"
+        "SPECTRA "
         )
 
         title.setAlignment(
@@ -277,9 +289,9 @@ class MainWindow(QMainWindow):
         title.setStyleSheet(
         """
         QLabel {
-        font-size: 24px;
+        font-size: 20px;
         font-weight: bold;
-        padding: 8px;
+        padding: 6px;
         }
         """
         )
@@ -289,86 +301,45 @@ class MainWindow(QMainWindow):
         )
 
         # ====================================================
-        # BUTTONS
+        # COMPACT CONTROL ROW
         # ====================================================
 
-        button_layout = QHBoxLayout()
+        # Two compact rows so the ribbon stays readable at 1366x768.
+        # Row 1 = input / analysis, Row 2 = signal / decoding.  Every
+        # control appears exactly once (no duplicates, no backend change).
+        control_row = QHBoxLayout()   # row 1 - input / analysis
+        control_row.setSpacing(8)
 
-        self.open_button = QPushButton(
-        "Open WAV"
+        decode_row = QHBoxLayout()    # row 2 - signal / decoding
+        decode_row.setSpacing(8)
+
+        self._control_row_1 = control_row
+        self._decode_row = decode_row
+
+        control_row.addWidget(
+        QLabel("Source:")
         )
 
-        self.open_button.clicked.connect(
-        self.open_wav
+        self.source_selector = QComboBox()
+
+        self.source_selector.addItems(
+        ["WAV", "Raw IQ", "GNU Radio"]
         )
 
-        self.analyze_button = QPushButton(
-        "Analyze Signal"
+        self.source_selector.setToolTip(
+        "Select the source of the samples to analyze: WAV, raw IQ, or GNU Radio."
         )
 
-        self.analyze_button.clicked.connect(
-        self.analyze_current_signal
+        self.source_selector.currentIndexChanged.connect(
+        self._on_source_changed
         )
 
-        self.analyze_button.setEnabled(
-        False
+        control_row.addWidget(
+        self.source_selector
         )
 
-        self.clear_button = QPushButton(
-        "Clear"
-        )
-
-        self.clear_button.clicked.connect(
-        self.clear_analysis
-        )
-
-        self.mode_combo = QComboBox()
-
-        self.mode_combo.addItems(
-        ["balanced", "quick", "deep", "realtime"]
-        )
-
-        self.mode_combo.setCurrentText("balanced")
-
-        self.mode_combo.setToolTip(
-        "Processing preset: quick (fast FFT/basic), balanced (full DSP), "
-        "deep (extra cross-checks), realtime (streaming optimized)"
-        )
-
-        self.batch_checkbox = QCheckBox("Analyze all candidates")
-
-        self.batch_checkbox.setToolTip(
-        "Run the full V2 pipeline on every detected candidate "
-        "(multi-signal analysis) instead of just the strongest"
-        )
-
-        # The CNN is supplementary evidence: it never overrides the
-        # rule-based DSP classification, so it is an opt-in toggle.
-        self.ml_checkbox = QCheckBox("ML assist (CNN)")
-
-        self.ml_checkbox.setToolTip(
-        "Score the signal with a convolutional neural network in "
-        "addition to the rule-based classifier. The CNN's prediction "
-        "is reported alongside the DSP result, never instead of it."
-        )
-
-        # Automatic FEC identification policy: AUTO / MANUAL / NONE.
-        self.fec_mode_combo = QComboBox()
-
-        self.fec_mode_combo.addItem(FECMode.AUTO)
-
-        self.fec_mode_combo.addItem(FECMode.MANUAL)
-
-        self.fec_mode_combo.addItem(FECMode.NONE)
-
-        self.fec_mode_combo.setCurrentText(FECMode.AUTO)
-
-        self.fec_mode_combo.setToolTip(
-        "How automatic FEC identification / deinterleaving is applied: "
-        "Auto = run the block-interleaving identifier and decode on strong "
-        "evidence (never overwrites a manual scheme); Manual = apply the "
-        "configured interleave depth authoritatively; None = skip "
-        "identification and deinterleaving."
+        decode_row.addWidget(
+        QLabel("Interleaving:")
         )
 
         self.interleaving_mode_combo = QComboBox()
@@ -384,25 +355,102 @@ class MainWindow(QMainWindow):
         self.interleaving_mode_combo.setToolTip(
         "How the block interleaver is handled on the demodulated "
         "bitstream: Auto = identify the interleaver and deinterleave on "
-        "strong structural evidence (no manual scheme overwritten); Manual "
-        "= apply the configured interleave depth authoritatively; None = "
-        "the received bitstream is passed through unchanged (no "
-        "identification, no deinterleaving)."
+        "strong structural evidence; Manual = apply the configured depth; "
+        "None = bits pass through unchanged."
         )
 
-        button_layout.addWidget(QLabel("INTERLEAVING MODE:"))
+        self.interleaving_mode_combo.currentIndexChanged.connect(
+        self._on_interleaving_mode_changed
+        )
 
-        button_layout.addWidget(
+        decode_row.addWidget(
         self.interleaving_mode_combo
         )
 
-        button_layout.addWidget(QLabel("FEC MODE:"))
+        # Manual interleaving needs an explicit block depth (the pipeline
+        # requires >= 2, otherwise manual is a no-op).
+        self.interleave_depth_spin = QSpinBox()
 
-        button_layout.addWidget(
+        self.interleave_depth_spin.setRange(2, 4096)
+
+        self.interleave_depth_spin.setValue(16)
+
+        self.interleave_depth_spin.setEnabled(False)
+
+        self.interleave_depth_spin.setToolTip(
+        "Block-interleaver depth applied when Interleaving = Manual"
+        )
+
+        decode_row.addWidget(
+        QLabel("Depth:")
+        )
+
+        decode_row.addWidget(
+        self.interleave_depth_spin
+        )
+
+        # De-interleaver family. Block/convolutional/diagonal/pseudo-random
+        # are all applied manually; the AUTO identifier stays block-only
+        # until genuine structural evidence exists for the other families.
+        self.interleave_family_combo = QComboBox()
+
+        self.interleave_family_combo.addItem("Block", "block")
+
+        self.interleave_family_combo.addItem("Convolutional", "convolutional")
+
+        self.interleave_family_combo.addItem("Diagonal", "diagonal")
+
+        self.interleave_family_combo.addItem("Pseudo-random", "pseudo_random")
+
+        self.interleave_family_combo.setCurrentIndex(0)
+
+        self.interleave_family_combo.setEnabled(False)
+
+        self.interleave_family_combo.setToolTip(
+        "De-interleaver family applied when Interleaving = Manual. The Depth "
+        "field doubles as the streams k (convolutional), square width "
+        "(diagonal), or permutation seed (pseudo-random)."
+        )
+
+        decode_row.addWidget(
+        QLabel("Family:")
+        )
+
+        decode_row.addWidget(
+        self.interleave_family_combo
+        )
+
+        decode_row.addWidget(
+        QLabel("FEC mode:")
+        )
+
+        self.fec_mode_combo = QComboBox()
+
+        # Title-case labels with the canonical lowercase value as data, so
+        # the control reads like the Interleaving selector while the
+        # backend still receives FECMode values.
+        self.fec_mode_combo.addItem("Auto", FECMode.AUTO)
+
+        self.fec_mode_combo.addItem("Manual", FECMode.MANUAL)
+
+        self.fec_mode_combo.addItem("None", FECMode.NONE)
+
+        self.fec_mode_combo.setCurrentIndex(0)
+
+        self.fec_mode_combo.setToolTip(
+        "How automatic FEC identification / deinterleaving is applied: "
+        "Auto = run the identifier and decode on strong evidence; "
+        "Manual = apply the configured depth authoritatively; "
+        "None = skip identification and deinterleaving."
+        )
+
+        decode_row.addWidget(
         self.fec_mode_combo
         )
 
-        button_layout.addWidget(QLabel("FEC:"))
+        decode_row.addWidget(
+        QLabel("FEC scheme:")
+        )
 
         self.fec_combo = QComboBox()
 
@@ -417,812 +465,539 @@ class MainWindow(QMainWindow):
         "FEC is never guessed: pick the scheme the transmitter used."
         )
 
-        button_layout.addWidget(
+        decode_row.addWidget(
         self.fec_combo
         )
 
-        button_layout.addWidget(
-        self.open_button
+        self.mode_combo = QComboBox()
+
+        self.mode_combo.addItems(
+        ["balanced", "quick", "deep", "realtime"]
         )
 
-        button_layout.addWidget(
-        self.analyze_button
+        self.mode_combo.setCurrentText("balanced")
+
+        self.mode_combo.setToolTip(
+        "Processing preset: quick (fast FFT/basic), balanced (full DSP), "
+        "deep (extra cross-checks), realtime (streaming optimized)"
         )
 
-        self.isolate_button = QPushButton(
-        "Isolate Selected"
+        # Batch + ML toggles
+        self.batch_checkbox = QCheckBox("Analyze all candidates")
+
+        self.batch_checkbox.setToolTip(
+        "Run the full V2 pipeline on every detected candidate "
+        "(multi-signal analysis) instead of just the strongest"
         )
 
-        self.analyze_selected_button = QPushButton(
-        "Analyze Selected"
+        self.ml_checkbox = QCheckBox("ML assist (CNN)")
+
+        self.ml_checkbox.setToolTip(
+        "Score the signal with a convolutional neural network in "
+        "addition to the rule-based classifier. The CNN\u2019s prediction "
+        "is reported alongside the DSP result, never instead of it."
         )
 
-        self.analyze_selected_button.clicked.connect(
-        self.analyze_selected_signal
+        # Frame / sync-word search.  The protocol stage is off by default
+        # because a sync word is transmitter-specific; when enabled it
+        # runs the same FrameConfig the CLI builds from --sync-word.
+        self.frame_checkbox = QCheckBox("Frame search")
+
+        self.frame_checkbox.setToolTip(
+        "Run the frame/protocol stage: normalized-correlation sync-word "
+        "search and payload extraction on the demodulated bits."
         )
 
-        self.analyze_selected_button.setEnabled(
-        False
+        self.sync_word_edit = QLineEdit("0xAA55AA55")
+
+        self.sync_word_edit.setMaximumWidth(110)
+
+        self.sync_word_edit.setToolTip(
+        "Expected sync word (hex or integer), matched by normalized "
+        "correlation. 0xAA55AA55 is the classic 32-bit pattern."
         )
 
-        button_layout.addWidget(
-        self.analyze_selected_button
+        self.sync_word_edit.setEnabled(False)
+
+        self.data_bytes_spin = QSpinBox()
+
+        self.data_bytes_spin.setRange(0, 4096)
+
+        self.data_bytes_spin.setValue(0)
+
+        self.data_bytes_spin.setToolTip(
+        "Expected payload bytes after the sync word (0 = unspecified)."
         )
 
-        self.isolate_button.clicked.connect(
-        self.isolate_selected_signal
+        self.data_bytes_spin.setEnabled(False)
+
+        self.frame_checkbox.toggled.connect(
+        self._on_frame_search_toggled
         )
 
-        self.isolate_button.setEnabled(
-        False
+        decode_row.addWidget(
+        self.frame_checkbox
         )
 
-        button_layout.addWidget(
-        self.isolate_button
+        decode_row.addWidget(
+        self.sync_word_edit
         )
 
-        button_layout.addWidget(QLabel("Mode:"))
-
-        button_layout.addWidget(
-        self.mode_combo
+        decode_row.addWidget(
+        QLabel("Payload bytes:")
         )
 
-        button_layout.addWidget(
-        self.batch_checkbox
+        decode_row.addWidget(
+        self.data_bytes_spin
         )
 
-        button_layout.addWidget(
-        self.ml_checkbox
+        # Actions: Open / Analyze / Clear
+        self.open_button = QPushButton(
+        "Open WAV/IQ"
         )
 
-        button_layout.addWidget(
-        self.clear_button
+        self.open_button.clicked.connect(
+        self.open_wav
         )
 
-        button_layout.addStretch()
-
-        main_layout.addLayout(
-        button_layout
+        self.analyze_button = QPushButton(
+        "Analyze Signal"
         )
 
-        # ====================================================
-        # PROGRESS + EXPORT BAR
-        # ====================================================
-
-        progress_layout = QHBoxLayout()
-
-        self.progress_bar = QProgressBar()
-
-        self.progress_bar.setRange(0, 1)
-
-        self.progress_bar.setValue(0)
-
-        self.progress_bar.setTextVisible(False)
-
-        self.progress_bar.setMaximumHeight(10)
-
-        self.progress_bar.setToolTip(
-        "Indeterminate while the pipeline runs on the background thread"
+        self.analyze_button.clicked.connect(
+        self.analyze_current_signal
         )
 
-        self.export_json_button = QPushButton("Export JSON")
-
-        self.export_json_button.clicked.connect(
-        self.export_result_json
-        )
-
-        self.export_json_button.setEnabled(False)
-
-        self.export_json_button.setToolTip(
-        "Save the full analysis payload (all stages, warnings, "
-        "provenance) as a JSON file"
-        )
-
-        self.provenance_button = QPushButton("Provenance")
-
-        self.provenance_button.clicked.connect(
-        self.show_provenance
-        )
-
-        self.provenance_button.setEnabled(False)
-
-        self.provenance_button.setToolTip(
-        "Per-stage timings, configuration, software versions and git "
-        "commit recorded by the last analysis"
-        )
-
-        progress_layout.addWidget(
-        self.progress_bar,
-        1,
-        )
-
-        progress_layout.addWidget(
-        self.export_json_button
-        )
-
-        progress_layout.addWidget(
-        self.provenance_button
-        )
-
-        main_layout.addLayout(
-        progress_layout
-        )
-
-        # ====================================================
-        # FILE INFORMATION
-        # ====================================================
-
-        info_frame = QFrame()
-
-        info_frame.setFrameShape(
-        QFrame.Shape.StyledPanel
-        )
-
-        info_layout = QGridLayout(
-        info_frame
-        )
-
-        self.file_label = QLabel("—")
-        self.format_label = QLabel("—")
-        self.sample_rate_label = QLabel("—")
-        self.samples_label = QLabel("—")
-        self.duration_label = QLabel("—")
-
-        info_layout.addWidget(
-        QLabel("File:"),
-        0,
-        0
-        )
-
-        info_layout.addWidget(
-        self.file_label,
-        0,
-        1
-        )
-
-        info_layout.addWidget(
-        QLabel("Format:"),
-        0,
-        2
-        )
-
-        info_layout.addWidget(
-        self.format_label,
-        0,
-        3
-        )
-
-        info_layout.addWidget(
-        QLabel("Sample Rate:"),
-        1,
-        0
-        )
-
-        info_layout.addWidget(
-        self.sample_rate_label,
-        1,
-        1
-        )
-
-        info_layout.addWidget(
-        QLabel("Samples:"),
-        1,
-        2
-        )
-
-        info_layout.addWidget(
-        self.samples_label,
-        1,
-        3
-        )
-
-        info_layout.addWidget(
-        QLabel("Duration:"),
-        2,
-        0
-        )
-
-        info_layout.addWidget(
-        self.duration_label,
-        2,
-        1
-        )
-
-        main_layout.addWidget(
-        info_frame
-        )
-
-        # ====================================================
-        # SCROLL AREA
-        # ====================================================
-
-        scroll = QScrollArea()
-
-        scroll.setWidgetResizable(
+        self.analyze_button.setEnabled(
         True
         )
 
-        content = QWidget()
-
-        content_layout = QVBoxLayout(
-        content
+        self.clear_button = QPushButton(
+        "Clear"
         )
 
-        content_layout.setSpacing(
-        8
+        self.clear_button.clicked.connect(
+        self.clear_analysis
+        )
+
+        control_row.addWidget(
+        self.open_button
+        )
+
+        control_row.addWidget(
+        self.analyze_button
+        )
+
+        # "Analyze Selected" is created later, next to the detection
+        # table; remember the slot so row 1 keeps the actions together.
+        self._row1_insert_index = control_row.count()
+
+        control_row.addWidget(
+        self.clear_button
+        )
+
+        control_row.addWidget(
+        QLabel("Mode:")
+        )
+
+        control_row.addWidget(
+        self.mode_combo
+        )
+
+        control_row.addWidget(
+        self.batch_checkbox
+        )
+
+        control_row.addWidget(
+        self.ml_checkbox
+        )
+
+        control_row.addStretch()
+
+        main_layout.addLayout(
+        control_row
+        )
+
+        main_layout.addLayout(
+        decode_row
         )
 
         # ====================================================
-        # TIME DOMAIN
+        # VISUALISATION TABS (every plot gets most of the window)
         # ====================================================
 
-        time_title = QLabel(
+        self.vis_tabs = QTabWidget()
+
+        self.vis_tabs.setDocumentMode(True)
+
+        self.vis_tabs.setTabPosition(
+        QTabWidget.TabPosition.North
+        )
+
+        # --- Time Domain ---
+
+        self.time_tab = QWidget()
+
+        self.time_tab_layout = QVBoxLayout(
+        self.time_tab
+        )
+
+        self.time_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.time_tab_layout.setSpacing(6)
+
+        self.time_tab_title = QLabel(
         "TIME DOMAIN"
         )
 
-        time_title.setStyleSheet(
+        self.time_tab_title.setStyleSheet(
         "font-weight: bold;"
         )
 
-        content_layout.addWidget(
-        time_title
+        self.time_tab_layout.addWidget(
+        self.time_tab_title
         )
 
         self.time_plot = PlotWidget()
 
-        content_layout.addWidget(
+        self.time_plot.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding
+        )
+
+        self.time_tab_layout.addWidget(
         self.time_plot
         )
 
-        # ====================================================
-        # SPECTRUM
-        # ====================================================
+        self.time_tab_layout.addStretch()
 
-        spectrum_title = QLabel(
+        self.time_tab.setLayout(
+        self.time_tab_layout
+        )
+
+        self.vis_tabs.addTab(
+        self.time_tab,
+        "Time Domain"
+        )
+
+        # --- Spectrum ---
+
+        self.spectrum_tab = QWidget()
+
+        self.spectrum_tab_layout = QVBoxLayout(
+        self.spectrum_tab
+        )
+
+        self.spectrum_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.spectrum_tab_layout.setSpacing(6)
+
+        self.spectrum_tab_title = QLabel(
         "SPECTRUM"
         )
 
-        spectrum_title.setStyleSheet(
+        self.spectrum_tab_title.setStyleSheet(
         "font-weight: bold;"
         )
 
-        content_layout.addWidget(
-        spectrum_title
+        self.spectrum_tab_layout.addWidget(
+        self.spectrum_tab_title
         )
 
         self.spectrum_plot = PlotWidget()
 
-        content_layout.addWidget(
+        self.spectrum_plot.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding
+        )
+
+        self.spectrum_tab_layout.addWidget(
         self.spectrum_plot
         )
 
-        # ====================================================
-        # WATERFALL
-        # ====================================================
+        self.spectrum_tab_layout.addStretch()
 
-        waterfall_title = QLabel(
-        "WATERFALL"
+        self.spectrum_tab.setLayout(
+        self.spectrum_tab_layout
         )
 
-        waterfall_title.setStyleSheet(
+        self.vis_tabs.addTab(
+        self.spectrum_tab,
+        "Spectrum"
+        )
+
+        # --- Waterfall / STFT ---
+
+        self.waterfall_tab = QWidget()
+
+        self.waterfall_tab_layout = QVBoxLayout(
+        self.waterfall_tab
+        )
+
+        self.waterfall_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.waterfall_tab_layout.setSpacing(6)
+
+        self.waterfall_tab_title = QLabel(
+        "WATERFALL / STFT"
+        )
+
+        self.waterfall_tab_title.setStyleSheet(
         "font-weight: bold;"
         )
 
-        content_layout.addWidget(
-        waterfall_title
+        self.waterfall_tab_layout.addWidget(
+        self.waterfall_tab_title
         )
 
         self.waterfall_plot = PlotWidget()
 
-        content_layout.addWidget(
+        self.waterfall_plot.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding
+        )
+
+        self.waterfall_tab_layout.addWidget(
         self.waterfall_plot
         )
 
-        # ====================================================
-        # DETECTED SIGNALS
-        # ====================================================
+        self.waterfall_tab_layout.addStretch()
 
-        signal_title = QLabel(
-        "DETECTED SIGNALS"
+        self.waterfall_tab.setLayout(
+        self.waterfall_tab_layout
         )
 
-        signal_title.setStyleSheet(
-        "font-weight: bold;"
+        self.vis_tabs.addTab(
+        self.waterfall_tab,
+        "Waterfall / STFT"
         )
 
-        content_layout.addWidget(
-        signal_title
+        # --- Constellation ---
+
+        self.constellation_tab = QWidget()
+
+        self.constellation_tab_layout = QVBoxLayout(
+        self.constellation_tab
         )
 
-        self.signal_table = QTableWidget()
+        self.constellation_tab_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.signal_table.setColumnCount(
-        4
-        )
+        self.constellation_tab_layout.setSpacing(6)
 
-        self.signal_table.setHorizontalHeaderLabels(
-        [
-        "Signal",
-        "Frequency (Hz)",
-        "Bandwidth (Hz)",
-        "Peak (dB)",
-        ]
-        )
-
-        self.signal_table.setMinimumHeight(
-        150
-        )
-
-        self.signal_table.setMaximumHeight(
-        220
-        )
-
-        self.signal_table.setEditTriggers(
-        QTableWidget.EditTrigger.NoEditTriggers
-        )
-
-        self.signal_table.setSelectionBehavior(
-        QTableWidget.SelectionBehavior.SelectRows
-        )
-
-        self.signal_table.setSelectionMode(
-        QTableWidget.SelectionMode.SingleSelection
-        )
-
-        self.signal_table.verticalHeader().setDefaultSectionSize(
-        28
-        )
-
-        header = self.signal_table.horizontalHeader()
-
-        header.setSectionResizeMode(
-        0,
-        QHeaderView.ResizeMode.ResizeToContents
-        )
-
-        header.setSectionResizeMode(
-        1,
-        QHeaderView.ResizeMode.ResizeToContents
-        )
-
-        header.setSectionResizeMode(
-        2,
-        QHeaderView.ResizeMode.ResizeToContents
-        )
-
-        header.setSectionResizeMode(
-        3,
-        QHeaderView.ResizeMode.Stretch
-        )
-
-        # IMPORTANT:
-        # clicking a row now selects the signal
-        self.signal_table.cellClicked.connect(
-        self.select_signal
-        )
-
-        content_layout.addWidget(
-        self.signal_table
-        )
-
-        # ----------------------------------------------------
-        # Batch candidate selector (visible in batch mode)
-        # ----------------------------------------------------
-
-        candidate_layout = QHBoxLayout()
-
-        candidate_layout.addWidget(QLabel("Analyzed candidate:"))
-
-        self.candidate_combo = QComboBox()
-
-        self.candidate_combo.setToolTip(
-        "Switch the detail panels between analyzed candidates "
-        "(batch mode)"
-        )
-
-        self.candidate_combo.setVisible(False)
-
-        self.candidate_combo.currentIndexChanged.connect(
-        self._on_candidate_selected
-        )
-
-        candidate_layout.addWidget(
-        self.candidate_combo
-        )
-
-        candidate_layout.addStretch()
-
-        content_layout.addLayout(
-        candidate_layout
-        )
-
-        # ====================================================
-        # SELECTED SIGNAL STATUS
-        # ====================================================
-
-        selected_title = QLabel(
-        "SELECTED SIGNAL"
-        )
-
-        selected_title.setStyleSheet(
-        "font-weight: bold;"
-        )
-
-        content_layout.addWidget(
-        selected_title
-        )
-
-        selected_frame = QFrame()
-
-        selected_frame.setFrameShape(
-        QFrame.Shape.StyledPanel
-        )
-
-        selected_layout = QHBoxLayout(
-        selected_frame
-        )
-
-        self.selected_signal_label = QLabel(
-        "No signal selected"
-        )
-
-        self.selected_frequency_label = QLabel(
-        "Frequency: —"
-        )
-
-        self.selected_bandwidth_label = QLabel(
-        "Bandwidth: —"
-        )
-
-        selected_layout.addWidget(
-        self.selected_signal_label
-        )
-
-        selected_layout.addWidget(
-        self.selected_frequency_label
-        )
-
-        selected_layout.addWidget(
-        self.selected_bandwidth_label
-        )
-
-        selected_layout.addStretch()
-
-        content_layout.addWidget(
-        selected_frame
-        )
-
-        # ====================================================
-        # BOTTOM SECTION
-        # ====================================================
-
-        bottom_layout = QGridLayout()
-
-        bottom_layout.setColumnStretch(
-        0,
-        3
-        )
-
-        bottom_layout.setColumnStretch(
-        1,
-        1
-        )
-
-        # ----------------------------------------------------
-        # Constellation
-        # ----------------------------------------------------
-
-        constellation_title = QLabel(
+        self.constellation_tab_title = QLabel(
         "CONSTELLATION"
         )
 
-        constellation_title.setStyleSheet(
+        self.constellation_tab_title.setStyleSheet(
         "font-weight: bold;"
         )
 
-        bottom_layout.addWidget(
-        constellation_title,
-        0,
-        0
+        self.constellation_tab_layout.addWidget(
+        self.constellation_tab_title
         )
 
         self.constellation_plot = PlotWidget()
 
-        self.constellation_plot.setMinimumHeight(
-        320
+        self.constellation_plot.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding
         )
 
-        bottom_layout.addWidget(
-        self.constellation_plot,
-        1,
-        0
+        self.constellation_tab_layout.addWidget(
+        self.constellation_plot
         )
 
-        # ----------------------------------------------------
-        # Parameters
-        # ----------------------------------------------------
+        self.constellation_tab_layout.addStretch()
 
-        parameter_title = QLabel(
-        "SIGNAL PARAMETERS"
+        self.constellation_tab.setLayout(
+        self.constellation_tab_layout
         )
 
-        parameter_title.setStyleSheet(
+        self.vis_tabs.addTab(
+        self.constellation_tab,
+        "Constellation"
+        )
+
+        # --- Detection / Results ---
+
+        self.results_tab = QWidget()
+
+        # The results page is long (headline + detections + several
+        # parameter groups), so it scrolls instead of forcing the whole
+        # window to grow past a 768px-tall screen.
+        self.results_tab_outer = QVBoxLayout(
+        self.results_tab
+        )
+
+        self.results_tab_outer.setContentsMargins(0, 0, 0, 0)
+
+        self.results_scroll = QScrollArea()
+
+        self.results_scroll.setWidgetResizable(True)
+
+        self.results_scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.results_content = QWidget()
+
+        self.results_tab_layout = QVBoxLayout(
+        self.results_content
+        )
+
+        self.results_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.results_tab_layout.setSpacing(6)
+
+        self.results_scroll.setWidget(
+        self.results_content
+        )
+
+        self.results_tab_outer.addWidget(
+        self.results_scroll
+        )
+
+        self.results_tab_title = QLabel(
+        "DETECTION / RESULTS"
+        )
+
+        self.results_tab_title.setStyleSheet(
         "font-weight: bold;"
         )
 
-        bottom_layout.addWidget(
-        parameter_title,
-        0,
-        1
+        self.results_tab_layout.addWidget(
+        self.results_tab_title
         )
 
-        parameter_frame = QFrame()
+        # Signal info (sample rate, candidates, modulation, SNR)
+        self.results_signal_frame = QFrame()
 
-        parameter_frame.setFrameShape(
+        self.results_signal_frame.setFrameShape(
         QFrame.Shape.StyledPanel
         )
 
-        parameter_frame.setMinimumWidth(
-        280
+        self.results_signal_layout = QHBoxLayout(
+        self.results_signal_frame
         )
 
-        parameter_layout = QVBoxLayout(
-        parameter_frame
-        )
+        self.results_signal_layout.setSpacing(6)
 
-        self.parameter_sample_rate = QLabel(
+        self.results_sample_rate_label = QLabel(
         "Sample Rate: —"
         )
 
-        self.parameter_duration = QLabel(
-        "Duration: —"
+        self.results_candidate_count_label = QLabel(
+        "Candidates: —"
         )
 
-        self.parameter_peak = QLabel(
-        "Peak: —"
-        )
-
-        self.parameter_rms = QLabel(
-        "RMS: —"
-        )
-
-        self.parameter_signal = QLabel(
-        "Signal Detected: —"
-        )
-
-        self.parameter_noise = QLabel(
-        "Noise Floor: —"
-        )
-
-        self.parameter_threshold = QLabel(
-        "Detection Threshold: —"
-        )
-
-        self.parameter_dominant = QLabel(
-        "Dominant Frequency: —"
-        )
-
-        self.parameter_band = QLabel(
-        "Detected Band: —"
-        )
-
-        self.parameter_bandwidth = QLabel(
-        "Bandwidth: —"
-        )
-
-        self.parameter_snr = QLabel(
-        "SNR: —"
-        )
-
-        self.parameter_modulation = QLabel(
+        self.results_modulation_label = QLabel(
         "Modulation: —"
         )
 
-        self.parameter_sps = QLabel(
-        "Samples/Symbol: —"
+        self.results_snr_label = QLabel(
+        "SNR: —"
         )
 
-        self.parameter_symbol_rate = QLabel(
-        "Symbol Rate: —"
+        for _label in [
+        self.results_sample_rate_label,
+        self.results_candidate_count_label,
+        self.results_modulation_label,
+        self.results_snr_label,
+        ]:
+
+            _label.setWordWrap(True)
+
+            self.results_signal_layout.addWidget(
+            _label
+            )
+
+        self.results_tab_layout.addWidget(
+        self.results_signal_frame
         )
 
-        self.parameter_timing_confidence = QLabel(
-        "Timing Confidence: —"
+        # Interleaving / FEC / BER results
+        self.results_il_frame = QFrame()
+
+        self.results_il_frame.setFrameShape(
+        QFrame.Shape.StyledPanel
         )
 
-        self.parameter_symbol_count = QLabel(
-        "Recovered Symbols/Bits: —"
+        self.results_il_layout = QVBoxLayout(
+        self.results_il_frame
         )
 
-        self.parameter_ber = QLabel(
-        "BER Validation: No reference loaded"
+        self.results_il_layout.setSpacing(4)
+
+        self.results_il_title = QLabel(
+        "Interleaving / FEC / BER"
         )
 
-        self.parameter_decision_margin = QLabel(
-        "Decision Margin: —"
+        self.results_il_title.setStyleSheet(
+        "font-weight: bold;"
         )
 
-        self.parameter_fec = QLabel(
-        "FEC: —"
+        self.results_il_layout.addWidget(
+        self.results_il_title
         )
 
-        self.parameter_auto_status = QLabel(
-        "Auto FEC: Not run"
+        self.results_il_status_label = QLabel(
+        "Interleaving: not run"
         )
 
-        self.parameter_auto_scheme = QLabel(
-        "Detected scheme: —"
-        )
-
-        self.parameter_auto_confidence = QLabel(
-        "Confidence: —"
-        )
-
-        self.parameter_auto_corrected = QLabel(
-        "Corrected errors: —"
-        )
-
-        self.parameter_auto_residual = QLabel(
-        "Residual estimate: —"
-        )
-
-        self.parameter_auto_validation = QLabel(
-        "Validation: —"
-        )
-
-        self.parameter_auto_source = QLabel(
-        "FEC source: —"
-        )
-
-        self.parameter_identify_candidates = QLabel(
-        "Identified candidates: —"
-        )
-
-        self.parameter_interleaving_mode = QLabel(
-        "Interleaving mode: —"
-        )
-
-        self.parameter_interleaving_type = QLabel(
+        self.results_il_type_label = QLabel(
         "Detected type: —"
         )
 
-        self.parameter_interleaving_depth = QLabel(
+        self.results_il_depth_label = QLabel(
         "Detected depth: —"
         )
 
-        self.parameter_interleaving_status = QLabel(
-        "Status: —"
-        )
-
-        self.parameter_interleaving_confidence = QLabel(
+        self.results_il_confidence_label = QLabel(
         "Confidence: —"
         )
 
-        self.parameter_sync_freq = QLabel(
-        "Freq Offset: —"
+        self.results_il_fec_label = QLabel(
+        "FEC: —"
         )
 
-        self.parameter_sync_phase = QLabel(
-        "Phase Offset: —"
+        self.results_il_ber_label = QLabel(
+        "BER: no reference loaded"
         )
 
-        self.parameter_ml = QLabel(
-        "ML Prediction: off"
-        )
+        for _label in [
+        self.results_il_status_label,
+        self.results_il_type_label,
+        self.results_il_depth_label,
+        self.results_il_confidence_label,
+        self.results_il_fec_label,
+        self.results_il_ber_label,
+        ]:
 
-        self.parameter_selected = QLabel(
-        "Selected Signal: —"
-        )
+            _label.setWordWrap(True)
 
-        parameter_widgets = [
-        self.parameter_sample_rate,
-        self.parameter_duration,
-        self.parameter_peak,
-        self.parameter_rms,
-        self.parameter_signal,
-        self.parameter_noise,
-        self.parameter_threshold,
-        self.parameter_dominant,
-        self.parameter_band,
-        self.parameter_bandwidth,
-        self.parameter_snr,
-        self.parameter_modulation,
-        self.parameter_sps,
-        self.parameter_symbol_rate,
-        self.parameter_timing_confidence,
-        self.parameter_symbol_count,
-        self.parameter_ber,
-        self.parameter_decision_margin,
-        self.parameter_fec,
-        self.parameter_auto_status,
-        self.parameter_auto_scheme,
-        self.parameter_auto_confidence,
-        self.parameter_auto_corrected,
-        self.parameter_auto_residual,
-        self.parameter_auto_validation,
-        self.parameter_auto_source,
-        self.parameter_identify_candidates,
-        self.parameter_interleaving_mode,
-        self.parameter_interleaving_type,
-        self.parameter_interleaving_depth,
-        self.parameter_interleaving_status,
-        self.parameter_interleaving_confidence,
-        self.parameter_sync_freq,
-        self.parameter_sync_phase,
-        self.parameter_ml,
-        self.parameter_selected,
-        ]
-
-        for widget in parameter_widgets:
-
-            widget.setWordWrap(
-            True
+            self.results_il_layout.addWidget(
+            _label
             )
 
-            parameter_layout.addWidget(
-            widget
-            )
-
-        parameter_layout.addStretch()
-
-        bottom_layout.addWidget(
-        parameter_frame,
-        1,
-        1
+        self.results_tab_layout.addWidget(
+        self.results_il_frame
         )
 
-        content_layout.addLayout(
-        bottom_layout
-        )
+        self._build_detail_widgets()
 
-        scroll.setWidget(
-        content
+        self.results_tab_layout.addStretch()
+
+        self.vis_tabs.addTab(
+        self.results_tab,
+        "Detection / Results"
         )
 
         main_layout.addWidget(
-        scroll
+        self.vis_tabs,
+        1,
         )
 
-        # ========================================================
-        # SOURCE SELECTOR + GNU RADIO CONFIGURATION (Phase 1)
-        # ========================================================
-
-        source_layout = QHBoxLayout()
-
-        self.source_selector = QComboBox()
-
-        self.source_selector.addItems(
-        ["WAV", "Raw IQ", "GNU Radio"]
-        )
-
-        self.source_selector.setToolTip(
-        "Select the source of the samples to analyze: WAV file, raw IQ "
-        "file, or GNU Radio capture (Phase 1: selector only, no acquisition "
-        "started yet)."
-        )
-
-        self.source_selector.currentIndexChanged.connect(
-        self._on_source_changed
-        )
-
-        source_layout.addWidget(
-        QLabel("Source:")
-        )
-
-        source_layout.addWidget(
-        self.source_selector
-        )
-
-        source_layout.addStretch()
-
-        main_layout.addLayout(
-        source_layout
-        )
-
-        # ----------------------------------------------------
-        # GNU Radio configuration panel (Phase 1: config only,
-        # acquisition not started)
-        # ----------------------------------------------------
+        # ====================================================
+        # GNU RADIO CONFIGURATION PANEL (compact group box)
+        # ====================================================
 
         self.gnuradio_frame = QFrame()
 
@@ -1230,13 +1005,17 @@ class MainWindow(QMainWindow):
         QFrame.Shape.StyledPanel
         )
 
+        self.gnuradio_frame.setMinimumHeight(
+        0
+        )
+
+        self.gnuradio_frame.setVisible(False)
+
         self.gnuradio_layout = QVBoxLayout(
         self.gnuradio_frame
         )
 
-        self.gnuradio_layout.setSpacing(
-        6
-        )
+        self.gnuradio_layout.setSpacing(6)
 
         self.gnuradio_layout.setContentsMargins(
         8, 8, 8, 8
@@ -1244,16 +1023,16 @@ class MainWindow(QMainWindow):
 
         self._gnuradio_controls_visible = False
 
-        config_label = QLabel(
+        self.gnuradio_group_title = QLabel(
         "GNU Radio configuration"
         )
 
-        config_label.setStyleSheet(
+        self.gnuradio_group_title.setStyleSheet(
         "font-weight: bold;"
         )
 
         self.gnuradio_layout.addWidget(
-        config_label
+        self.gnuradio_group_title
         )
 
         # Device / source name
@@ -1364,11 +1143,223 @@ class MainWindow(QMainWindow):
         self.gnuradio_chunk_size
         )
 
-        self.gnuradio_layout.addStretch()
+        # GNU Radio panel is hidden by default (Source = WAV/Raw IQ).
+        self.gnuradio_frame.setVisible(False)
 
-        main_layout.addWidget(
+        # ====================================================
+        # GNU RADIO SOURCE TAB
+        # ====================================================
+        # The configuration panel lives in its own tab, revealed when the
+        # GNU Radio source is selected.  "Acquire and Analyze" captures a
+        # short recording through the GNU Radio acquisition worker and
+        # loads it into the analyzer.
+
+        self.gnuradio_tab = QWidget()
+
+        self.gnuradio_tab_layout = QVBoxLayout(
+        self.gnuradio_tab
+        )
+
+        self.gnuradio_tab_layout.setContentsMargins(
+        8, 8, 8, 8
+        )
+
+        self.gnuradio_tab_layout.setSpacing(6)
+
+        self.gnuradio_tab_layout.addWidget(
         self.gnuradio_frame
         )
+
+        self.gnuradio_acquire_button = QPushButton(
+        "Acquire and Analyze"
+        )
+
+        self.gnuradio_acquire_button.setToolTip(
+        "Capture samples from the configured GNU Radio source and load "
+        "them into the analyzer"
+        )
+
+        self.gnuradio_acquire_button.clicked.connect(
+        self.acquire_gnuradio
+        )
+
+        self.gnuradio_tab_layout.addWidget(
+        self.gnuradio_acquire_button
+        )
+
+        self.gnuradio_status_label = QLabel("")
+
+        self.gnuradio_status_label.setWordWrap(True)
+
+        self.gnuradio_tab_layout.addWidget(
+        self.gnuradio_status_label
+        )
+
+        self.gnuradio_tab_layout.addStretch()
+
+        self._update_gnuradio_status()
+
+        self.vis_tabs.addTab(
+        self.gnuradio_tab,
+        "GNU Radio"
+        )
+
+        # Every tab is fed by the same analysis: switching tabs redraws
+        # that tab's plot on demand, so one "Analyze Signal" populates
+        # all of them (no per-tab re-analysis).
+        self.vis_tabs.currentChanged.connect(
+        self._on_vis_tab_changed
+        )
+
+        # ====================================================
+        # FILE INFORMATION (compact)
+        # ====================================================
+
+        info_frame = QFrame()
+
+        info_frame.setFrameShape(
+        QFrame.Shape.StyledPanel
+        )
+
+        info_layout = QGridLayout(
+        info_frame
+        )
+
+        self.file_label = QLabel("—")
+        self.format_label = QLabel("—")
+        self.sample_rate_label = QLabel("—")
+        self.samples_label = QLabel("—")
+        self.duration_label = QLabel("—")
+
+        info_layout.addWidget(
+        QLabel("File:"),
+        0,
+        0
+        )
+
+        info_layout.addWidget(
+        self.file_label,
+        0,
+        1
+        )
+
+        info_layout.addWidget(
+        QLabel("Format:"),
+        0,
+        2
+        )
+
+        info_layout.addWidget(
+        self.format_label,
+        0,
+        3
+        )
+
+        info_layout.addWidget(
+        QLabel("Sample Rate:"),
+        1,
+        0
+        )
+
+        info_layout.addWidget(
+        self.sample_rate_label,
+        1,
+        1
+        )
+
+        info_layout.addWidget(
+        QLabel("Samples:"),
+        1,
+        2
+        )
+
+        info_layout.addWidget(
+        self.samples_label,
+        1,
+        3
+        )
+
+        info_layout.addWidget(
+        QLabel("Duration:"),
+        2,
+        0
+        )
+
+        info_layout.addWidget(
+        self.duration_label,
+        2,
+        1
+        )
+
+        main_layout.addWidget(
+        info_frame
+        )
+
+        # ====================================================
+        # PROGRESS + EXPORT BAR (bottom)
+        # ====================================================
+
+        progress_layout = QHBoxLayout()
+
+        self.progress_bar = QProgressBar()
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        self.progress_bar.setTextVisible(False)
+
+        self.progress_bar.setMaximumHeight(10)
+
+        self.progress_bar.setToolTip(
+        "Indeterminate while the pipeline runs on the background thread"
+        )
+
+        self.export_json_button = QPushButton("Export JSON")
+
+        self.export_json_button.clicked.connect(
+        self.export_result_json
+        )
+
+        self.export_json_button.setEnabled(False)
+
+        self.export_json_button.setToolTip(
+        "Save the full analysis payload (all stages, warnings, "
+        "provenance) as a JSON file"
+        )
+
+        self.provenance_button = QPushButton("Provenance")
+
+        self.provenance_button.clicked.connect(
+        self.show_provenance
+        )
+
+        self.provenance_button.setEnabled(False)
+
+        self.provenance_button.setToolTip(
+        "Per-stage timings, configuration, software versions and git "
+        "commit recorded by the last analysis"
+        )
+
+        progress_layout.addWidget(
+        self.progress_bar,
+        1,
+        )
+
+        decode_row.addStretch()
+
+        decode_row.addWidget(
+        self.export_json_button
+        )
+
+        decode_row.addWidget(
+        self.provenance_button
+        )
+
+        main_layout.addLayout(
+        progress_layout
+        )
+
 
         # ----
         # Source selector handler (Phase 1: visibility only).
@@ -1386,8 +1377,16 @@ class MainWindow(QMainWindow):
 
         self._gnuradio_controls_visible = is_gnuradio
 
-        # Hide the GNU Radio frame unless GNU Radio is selected.
+        # Show the GNU Radio panel only for the GNU Radio source and
+        # bring its tab to the front; hide it otherwise.
         self.gnuradio_frame.setVisible(is_gnuradio)
+
+        if is_gnuradio:
+            self.vis_tabs.setCurrentWidget(self.gnuradio_tab)
+        elif self.vis_tabs.currentWidget() is getattr(
+        self, "gnuradio_tab", None
+        ):
+            self.vis_tabs.setCurrentIndex(0)
 
         # Disable the GNU Radio controls so no one can "tweak" the
         # panel while another source is selected (not enforced here;
@@ -1395,6 +1394,559 @@ class MainWindow(QMainWindow):
         for _widget in self.gnuradio_frame.findChildren(QWidget):
             if isinstance(_widget, QLineEdit) or isinstance(_widget, QComboBox):
                 _widget.setEnabled(is_gnuradio)
+
+        # The Open button only applies to file sources; GNU Radio
+        # captures come from its own tab.
+        if selected == "WAV":
+
+            self.open_button.setText("Open WAV")
+            self.open_button.setEnabled(True)
+
+        elif selected == "Raw IQ":
+
+            self.open_button.setText("Open Raw IQ")
+            self.open_button.setEnabled(True)
+
+        else:
+
+            self.open_button.setText("Open Capture")
+            self.open_button.setEnabled(False)
+
+        self._update_gnuradio_status()
+
+    def _on_frame_search_toggled(self, enabled: bool):
+        """The sync word / payload size only matter when frame search runs."""
+
+        self.sync_word_edit.setEnabled(bool(enabled))
+
+        self.data_bytes_spin.setEnabled(bool(enabled))
+
+    def _frame_search_config(self):
+        """Build the FrameConfig for the frame stage, or None when off.
+
+        Mirrors the CLI's ``--sync-word`` / ``--data-bytes`` handling so
+        both front-ends exercise the same protocol stage.
+        """
+
+        if not self.frame_checkbox.isChecked():
+            return None
+
+        from prototype.protocol import FrameConfig
+
+        text = self.sync_word_edit.text().strip() or "0xAA55AA55"
+
+        try:
+            sync_word = int(text, 0)
+        except ValueError as exc:
+            raise ValueError(
+            f"Sync word must be hex (0x…) or decimal, got {text!r}"
+            ) from exc
+
+        return FrameConfig(
+        name="GUI-frame",
+        sync_word=sync_word,
+        data_bytes=int(self.data_bytes_spin.value()),
+        description="Protocol frame configured from the GUI frame search.",
+        )
+
+    def _on_interleaving_mode_changed(self, index):
+        """Only the Manual interleaving mode uses an explicit depth."""
+
+        del index
+
+        manual = self.interleaving_mode_combo.currentText() == "Manual"
+
+        self.interleave_depth_spin.setEnabled(manual)
+
+        self.interleave_family_combo.setEnabled(manual)
+
+    def _update_gnuradio_status(self):
+        """Describe whether a real GNU Radio backend is available."""
+
+        try:
+            from prototype.io.gnuradio import gnuradio_available
+
+            available = bool(gnuradio_available())
+        except Exception:  # noqa: BLE001
+            available = False
+
+        if available:
+
+            text = (
+            "Backend: GNU Radio is available — the configured "
+            "device/source will be used."
+            )
+
+        else:
+
+            text = (
+            "Backend: GNU Radio is not installed — acquisition falls "
+            "back to the built-in synthetic source (offline validation)."
+            )
+
+        if getattr(self, "gnuradio_status_label", None) is not None:
+            self.gnuradio_status_label.setText(text)
+
+    # ========================================================
+    # DETAIL WIDGETS
+    # ========================================================
+
+    def _build_detail_widgets(self):
+        """Create the signal-detail widgets used by the analysis views.
+
+        They live in the Detection/Results tab: the detection table, the
+        analyzed-candidate selector, the selected-signal summary and the
+        full parameter read-out.
+        """
+
+        detail_frame = QFrame()
+
+        detail_frame.setFrameShape(QFrame.Shape.StyledPanel)
+
+        detail_layout = QVBoxLayout(detail_frame)
+
+        detail_layout.setSpacing(4)
+
+        detail_title = QLabel("SIGNAL DETAIL")
+
+        detail_title.setStyleSheet("font-weight: bold;")
+
+        detail_layout.addWidget(detail_title)
+
+        # --- detection table ---
+        self.signal_table = QTableWidget()
+
+        self.signal_table.setColumnCount(4)
+
+        self.signal_table.setHorizontalHeaderLabels(
+        ["Signal", "Frequency (Hz)", "Bandwidth (Hz)", "Peak (dB)"]
+        )
+
+        self.signal_table.setSelectionBehavior(
+        QAbstractItemView.SelectionBehavior.SelectRows
+        )
+
+        self.signal_table.setSelectionMode(
+        QAbstractItemView.SelectionMode.SingleSelection
+        )
+
+        self.signal_table.cellClicked.connect(self.select_signal)
+
+        self.signal_table.horizontalHeader().setSectionResizeMode(
+        QHeaderView.Stretch
+        )
+
+        self.signal_table.setMinimumHeight(120)
+
+        detail_layout.addWidget(self.signal_table)
+
+        # --- analyzed candidate selector (batch mode) ---
+        candidate_row = QHBoxLayout()
+
+        candidate_row.addWidget(QLabel("Analyzed candidate:"))
+
+        self.candidate_combo = QComboBox()
+
+        self.candidate_combo.setToolTip(
+        "Switch the detail panels between analyzed candidates "
+        "(batch mode)"
+        )
+
+        self.candidate_combo.setVisible(False)
+
+        self.candidate_combo.currentIndexChanged.connect(
+        self._on_candidate_selected
+        )
+
+        candidate_row.addWidget(self.candidate_combo)
+
+        candidate_row.addStretch()
+
+        detail_layout.addLayout(candidate_row)
+
+        # --- selected signal summary + actions ---
+        selected_row = QHBoxLayout()
+
+        self.selected_signal_label = QLabel("No signal selected")
+        self.selected_frequency_label = QLabel("Frequency: —")
+        self.selected_bandwidth_label = QLabel("Bandwidth: —")
+
+        selected_row.addWidget(self.selected_signal_label)
+        selected_row.addWidget(self.selected_frequency_label)
+        selected_row.addWidget(self.selected_bandwidth_label)
+
+        self.isolate_button = QPushButton("Isolate Signal")
+
+        self.isolate_button.clicked.connect(self.isolate_selected_signal)
+
+        self.isolate_button.setEnabled(False)
+
+        self.analyze_selected_button = QPushButton("Analyze Selected")
+
+        self.analyze_selected_button.clicked.connect(
+        self.analyze_selected_signal
+        )
+
+        self.analyze_selected_button.setEnabled(False)
+
+        selected_row.addWidget(self.isolate_button)
+        # Keep the action in row 1 (input / analysis) instead of the
+        # detail panel; the widget itself is unchanged.
+        self._control_row_1.insertWidget(
+        self._row1_insert_index,
+        self.analyze_selected_button,
+        )
+
+        selected_row.addStretch()
+
+        detail_layout.addLayout(selected_row)
+
+        # --- parameter read-out ---
+        # Sample rate / modulation / SNR already headline the summary
+        # frame above; alias those widgets instead of duplicating them
+        # (their text formats are identical).
+        self.parameter_sample_rate = self.results_sample_rate_label
+        self.parameter_modulation = self.results_modulation_label
+        self.parameter_snr = self.results_snr_label
+
+        labels = {
+        "parameter_signal": "Signal Detected: —",
+        "parameter_duration": "Duration: —",
+        "parameter_peak": "Peak: —",
+        "parameter_rms": "RMS: —",
+        "parameter_power": "Power: —",
+        "parameter_papr": "PAPR: —",
+        "parameter_crest": "Crest Factor: —",
+        "parameter_dynamic_range": "Dynamic Range: —",
+        "parameter_dc_offset": "DC Offset: —",
+        "parameter_noise": "Noise Floor: —",
+        "parameter_dominant": "Dominant Frequency: —",
+        "parameter_center_freq": "Center Frequency: —",
+        "parameter_peak_freq": "Peak Frequency: —",
+        "parameter_band": "Detected Band: —",
+        "parameter_bandwidth": "Bandwidth: —",
+        "parameter_obw": "Occupied BW (99%): —",
+        "parameter_sps": "Samples/Symbol: —",
+        "parameter_symbol_rate": "Symbol Rate: —",
+        "parameter_timing_confidence": "Timing Confidence: —",
+        "parameter_symbol_count": "Recovered Symbols/Bits: —",
+        "parameter_decision_margin": "Decision Margin: —",
+        "parameter_sync_freq": "Freq Offset: —",
+        "parameter_sync_phase": "Phase Offset: —",
+        "parameter_ber": "BER Validation: No reference loaded",
+        "parameter_fec": "FEC: —",
+        "parameter_fec_auto": "Auto FEC: not run",
+        "parameter_recovered_bits": "Recovered bits: —",
+        "parameter_sync_word": "Sync word: not run",
+        "parameter_identify_candidates": "Interleaving candidates: —",
+        "parameter_interleaving_mode": "Interleaving mode: not run",
+        "parameter_interleaving_type": "Detected type: —",
+        "parameter_interleaving_depth": "Detected depth: —",
+        "parameter_interleaving_status": "Status: —",
+        "parameter_interleaving_confidence": "Confidence: —",
+        "parameter_ml": "ML Prediction: off",
+        "parameter_selected": "Selected Signal: —",
+        }
+
+        # Grouped, two-column read-out so the page stays scannable
+        # instead of one 36-line column.
+        groups = [
+        ("DETECTION", [
+        "parameter_signal",
+        "parameter_dominant",
+        "parameter_center_freq",
+        "parameter_peak_freq",
+        "parameter_band",
+        "parameter_bandwidth",
+        "parameter_obw",
+        "parameter_noise",
+        ]),
+        ("LEVELS", [
+        "parameter_power",
+        "parameter_peak",
+        "parameter_rms",
+        "parameter_papr",
+        "parameter_crest",
+        "parameter_dynamic_range",
+        "parameter_dc_offset",
+        "parameter_duration",
+        ]),
+        ("MODULATION / TIMING", [
+        "parameter_sps",
+        "parameter_symbol_rate",
+        "parameter_timing_confidence",
+        "parameter_symbol_count",
+        "parameter_decision_margin",
+        "parameter_sync_freq",
+        "parameter_sync_phase",
+        ]),
+        ("FEC / BER", [
+        "parameter_fec",
+        "parameter_fec_auto",
+        "parameter_recovered_bits",
+        "parameter_sync_word",
+        "parameter_ber",
+        ]),
+        ("BLOCK INTERLEAVING", [
+        "parameter_interleaving_mode",
+        "parameter_interleaving_type",
+        "parameter_interleaving_depth",
+        "parameter_interleaving_status",
+        "parameter_interleaving_confidence",
+        "parameter_identify_candidates",
+        ]),
+        ("MACHINE LEARNING", [
+        "parameter_ml",
+        ]),
+        ("SELECTED SIGNAL", [
+        "parameter_selected",
+        ]),
+        ]
+
+        # Long / free-form read-outs span both columns.
+        wide = {
+        "parameter_identify_candidates",
+        "parameter_selected",
+        "parameter_ml",
+        }
+
+        for _title, _names in groups:
+
+            _group = QFrame()
+
+            _group.setFrameShape(QFrame.Shape.StyledPanel)
+
+            _grid = QGridLayout(_group)
+
+            _grid.setContentsMargins(8, 6, 8, 6)
+
+            _grid.setHorizontalSpacing(16)
+
+            _grid.setVerticalSpacing(2)
+
+            _heading = QLabel(_title)
+
+            _heading.setStyleSheet("font-weight: bold;")
+
+            _grid.addWidget(_heading, 0, 0, 1, 2)
+
+            _row = 1
+
+            _column = 0
+
+            for _name in _names:
+
+                _label = QLabel(labels[_name])
+
+                _label.setWordWrap(True)
+
+                setattr(self, _name, _label)
+
+                if _name in wide:
+
+                    if _column != 0:
+                        _row += 1
+                        _column = 0
+
+                    _grid.addWidget(_label, _row, 0, 1, 2)
+
+                    _row += 1
+
+                else:
+
+                    _grid.addWidget(_label, _row, _column)
+
+                    if _column == 1:
+                        _row += 1
+
+                    _column = 1 - _column
+
+            detail_layout.addWidget(_group)
+
+        detail_layout.addStretch()
+
+        self.results_tab_layout.addWidget(detail_frame)
+
+    def _update_auto_fec_display(self):
+        """Refresh the Detection/Results interleaving + FEC labels."""
+
+        il_result = getattr(self, "_interleaving_result", None)
+
+        if il_result is not None:
+            il_status = il_result.get("status", "UNKNOWN")
+
+            self.results_il_status_label.setText(
+            f"Interleaving: {il_status}"
+            )
+
+            self.results_il_type_label.setText(
+            f"Detected type: {self._interleaving_family_label(il_result)}"
+            )
+
+            depth = il_result.get("best_depth")
+
+            self.results_il_depth_label.setText(
+            f"Detected depth: {depth if depth is not None else '—'}"
+            )
+
+            self.results_il_confidence_label.setText(
+            f"Confidence: {il_result.get('confidence', 0.0)}"
+            )
+        else:
+            self.results_il_status_label.setText("Interleaving: not run")
+            self.results_il_type_label.setText("Detected type: —")
+            self.results_il_depth_label.setText("Detected depth: —")
+            self.results_il_confidence_label.setText("Confidence: —")
+
+        # Automatic FEC identification (AUTO mode) and the configured
+        # decoder state are both reported: the auto row is the evidence-
+        # based verdict, the FEC row is what the decoder actually did.
+        fec = self._pipeline_fec_summary
+
+        if fec:
+            self.results_il_fec_label.setText(
+            f"FEC: {fec.get('scheme')} "
+            f"(corrected {fec.get('corrected_errors', 0)} errors)"
+            )
+        elif self.fec_combo.currentText() != "none":
+            self.results_il_fec_label.setText(
+            f"FEC: {self.fec_combo.currentText()} (no decoder output)"
+            )
+        else:
+            self.results_il_fec_label.setText("FEC: none configured")
+
+        ber = self._pipeline_ber_summary
+
+        if ber is not None:
+            self.results_il_ber_label.setText(
+            f"BER: {float(ber.get('ber', 1.0)):.6g}"
+            )
+        else:
+            self.results_il_ber_label.setText("BER: no reference loaded")
+
+    # ========================================================
+    # GNU RADIO ACQUISITION
+    # ========================================================
+
+    def acquire_gnuradio(self):
+        """Capture a short recording from the configured GNU Radio source.
+
+        Uses the offline synthetic source when the optional ``gnuradio``
+        package is unavailable, so the flow is testable headlessly.
+        """
+
+        try:
+            sample_rate = float(self.gnuradio_sample_rate.text())
+
+            center_freq = float(self.gnuradio_center_freq.text())
+
+            gain = float(self.gnuradio_gain.text())
+
+            max_chunks = int(self.gnuradio_max_chunks.text())
+
+            chunk_size = int(self.gnuradio_chunk_size.text())
+        except ValueError as exc:
+
+            QMessageBox.critical(
+            self,
+            "Invalid GNU Radio configuration",
+            f"Please check the numeric fields: {exc}",
+            )
+
+            return
+
+        from prototype.io.gnuradio.gui_controller import (
+        GNURadioAcquisitionWorker
+        )
+
+        self.gnuradio_acquire_button.setEnabled(False)
+
+        self.progress_bar.setRange(0, 0)
+
+        self._gnuradio_worker = GNURadioAcquisitionWorker(
+        device_name=self.gnuradio_source_name.text() or "synthetic-bpsk",
+        center_frequency_hz=center_freq,
+        sample_rate=sample_rate,
+        gain_db=gain,
+        chunk_size=chunk_size,
+        max_chunks=max_chunks,
+        parent=self,
+        )
+
+        self._gnuradio_worker.finished_with_result.connect(
+        self._on_gnuradio_acquired
+        )
+
+        self._gnuradio_worker.failed.connect(
+        self._on_gnuradio_failed
+        )
+
+        logger.info(
+        "Starting GNU Radio acquisition (%s, %.0f Hz)",
+        self.gnuradio_source_name.text(),
+        sample_rate,
+        )
+
+        self._gnuradio_worker.start()
+
+    def _on_gnuradio_acquired(self, payload):
+        """Load the acquired Signal into the analyzer."""
+
+        self.gnuradio_acquire_button.setEnabled(True)
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        signal = payload.get("signal") if isinstance(payload, dict) else None
+
+        if signal is None:
+
+            QMessageBox.warning(
+            self,
+            "GNU Radio",
+            "Acquisition returned no signal.",
+            )
+
+            return
+
+        self.samples = np.asarray(signal.samples)
+
+        self.sample_rate = float(signal.sample_rate)
+
+        self.current_file = None
+
+        self.analysis = None
+
+        self.analyze_button.setEnabled(True)
+
+        self.update_basic_information(
+        basic_stats(self.samples, self.sample_rate),
+        "GNU Radio",
+        )
+
+        self.update_visualizations()
+
+        # One click, one analysis: jump to the first plot tab and run
+        # the pipeline immediately instead of asking for a second click.
+        self.vis_tabs.setCurrentIndex(0)
+
+        self.analyze_current_signal()
+
+    def _on_gnuradio_failed(self, message: str):
+        """Restore the UI after a failed GNU Radio acquisition."""
+
+        self.gnuradio_acquire_button.setEnabled(True)
+
+        self.progress_bar.setRange(0, 1)
+
+        self.progress_bar.setValue(0)
+
+        QMessageBox.critical(
+        self,
+        "GNU Radio acquisition failed",
+        message,
+        )
 
     # ========================================================
     # OPEN WAV
@@ -1498,8 +2050,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
 
         self.progress_bar.setValue(0)
-        self._identification_result = None
-        self._identification_candidates = None
+
         self.parameter_ber.setText(
         "BER Validation: No reference loaded"
         )
@@ -1531,45 +2082,49 @@ class MainWindow(QMainWindow):
     fmt="WAV",
     ):
 
-        self.file_label.setText(
-        self.current_file.name
-        )
+        # File info
+        self.format_label.setText(fmt)
 
-        self.format_label.setText(
-        fmt
-        )
+        if self.current_file is not None:
+            self.file_label.setText(
+            self.current_file.name
+            )
+            self.sample_rate_label.setText(
+            f"{stats['sample_rate']:.0f} Hz"
+            )
+            self.samples_label.setText(
+            f"{stats['num_samples']:,}"
+            )
+            self.duration_label.setText(
+            f"{stats['duration']:.4f} s"
+            )
 
-        self.sample_rate_label.setText(
-        f"{stats['sample_rate']:.0f} Hz"
+        # Detection/Results tab: signal info (sample rate, candidates, modulation, SNR)
+        self.results_sample_rate_label.setText(
+            f"Sample Rate: {stats['sample_rate']:.0f} Hz"
         )
+        candidate_count = (
+            len(self.analysis.get("detected_signals", []))
+            if self.analysis
+            else None
+        )
+        self.results_candidate_count_label.setText(
+            f"Candidates: {candidate_count if candidate_count is not None else '—'}"
+        )
+        modulation = getattr(self, "modulation_result", "Unknown")
+        self.results_modulation_label.setText(f"Modulation: {modulation}")
+        if self.analysis is not None and self.analysis.get('snr_db') is not None:
+            self.results_snr_label.setText(f"SNR: {self.analysis['snr_db']:.2f} dB")
+        else:
+            self.results_snr_label.setText("SNR: —")
 
-        self.samples_label.setText(
-        f"{stats['num_samples']:,}"
-        )
-
-        self.duration_label.setText(
-        f"{stats['duration']:.4f} s"
-        )
-
-        self.parameter_sample_rate.setText(
-        f"Sample Rate: "
-        f"{stats['sample_rate']:.0f} Hz"
-        )
-
-        self.parameter_duration.setText(
-        f"Duration: "
-        f"{stats['duration']:.4f} s"
-        )
-
-        self.parameter_peak.setText(
-        f"Peak: "
-        f"{stats['peak']:.6f}"
-        )
-
-        self.parameter_rms.setText(
-        f"RMS: "
-        f"{stats['rms']:.6f}"
-        )
+        # Interleaving/FEC/BER tab (results)
+        self.results_il_status_label.setText("Interleaving: not run")
+        self.results_il_type_label.setText("Detected type: —")
+        self.results_il_depth_label.setText("Detected depth: —")
+        self.results_il_confidence_label.setText("Confidence: —")
+        self.results_il_fec_label.setText("FEC: —")
+        self.results_il_ber_label.setText("BER: no reference loaded")
 
         # ========================================================
         # ANALYZE SIGNAL
@@ -1577,6 +2132,14 @@ class MainWindow(QMainWindow):
 
     def analyze_current_signal(self):
         if self.samples is None:
+
+            QMessageBox.information(
+            self,
+            "No capture loaded",
+            "Open a WAV / raw IQ capture (or acquire from the GNU Radio "
+            "tab) before analyzing.",
+            )
+
             return
 
         # --------------------------------------------------------
@@ -1623,16 +2186,29 @@ class MainWindow(QMainWindow):
 
         self.pipeline_result = None
 
+        try:
+            protocol_config = self._frame_search_config()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid frame configuration", str(exc))
+            self.analyze_button.setEnabled(True)
+            self.analyze_button.setText("Analyze Signal")
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            return
+
         self.pipeline_worker = AnalysisWorker(
         samples=self.samples,
         sample_rate=self.sample_rate,
         mode=self.pipeline_mode,
         analyze_all=self.batch_checkbox.isChecked(),
         reference_bits=reference_bits,
-        fec_mode=self.fec_mode_combo.currentText(),
+        fec_mode=self.fec_mode_combo.currentData(),
         fec_scheme=self.fec_combo.currentText(),
         ml_enabled=self.ml_checkbox.isChecked(),
         interleaving_mode=self.interleaving_mode_combo.currentText(),
+        interleave_depth=self.interleave_depth_spin.value(),
+        interleave_family=self.interleave_family_combo.currentData(),
+        protocol_config=protocol_config,
         parent=self,
         )
 
@@ -1761,8 +2337,11 @@ class MainWindow(QMainWindow):
                 self._apply_candidate_detail(first)
 
             else:
+                # No candidate could be analyzed: clear the detail state so
+                # no stale previous run leaks into the panels.
                 self.modulation_result = "Unknown"
                 self.modulation_features = {}
+                self._reset_candidate_detail()
 
         else:
             self._pipeline_candidates = None
@@ -1784,9 +2363,13 @@ class MainWindow(QMainWindow):
         payload.get("input") or {},
         )
 
-        self._pipeline_input = payload.get("input") or {}
+            # Only the single-result payload carries the candidate detail;
+            # applying it again after a batch would clobber the candidate
+            # that was just selected (Unknown modulation, empty params,
+            # raw-IQ constellation).
+            self._apply_candidate_detail(payload)
 
-        self._apply_candidate_detail(payload)
+        self._pipeline_input = payload.get("input") or {}
 
         self.update_analysis_parameters()
 
@@ -1881,8 +2464,81 @@ class MainWindow(QMainWindow):
             "detected_signals": signals,
         }
 
+    @staticmethod
+    def _interleaving_family_label(il_result: dict) -> str:
+        """Name the interleaving family the result describes.
+
+        AUTO runs report the identified ``best_type``; MANUAL runs report
+        the configured ``family``.  Both are genuine outcomes, so neither
+        is presented as a detection when it is only a configuration.
+        """
+
+        best_type = il_result.get("best_type")
+
+        if best_type:
+            return str(best_type)
+
+        family = il_result.get("family") or (
+            il_result.get("evidence") or {}
+        ).get("family")
+
+        if family:
+            return f"{family} (configured)"
+
+        return "—"
+
+    @staticmethod
+    def _as_mapping(value):
+        """Coerce a result record to a dict (dataclasses or None).
+
+        Batch and single-candidate payloads are both plain JSON now, but a
+        bridge that hands over a dataclass must not crash the results
+        panel - it is converted instead.
+        """
+
+        if value is None or isinstance(value, dict):
+
+            return value
+
+        from dataclasses import asdict, is_dataclass
+
+        if is_dataclass(value) and not isinstance(value, type):
+
+            return asdict(value)
+
+        return None
+
+    def _reset_candidate_detail(self):
+        """Clear every per-candidate panel input (no candidate analysed)."""
+
+        self._pipeline_parameters = {}
+        self._identification_result = None
+        self._pipeline_demod_summary = None
+        self._pipeline_fec_summary = None
+        self._pipeline_ber_summary = None
+        self._pipeline_sync_summary = None
+        self._pipeline_protocol_summary = None
+        self._pipeline_ml_summary = None
+        self._interleaving_result = None
+        self._interleaving_candidates = []
+        self.timing_sps = None
+        self.timing_symbol_rate = None
+        self.timing_confidence = None
+
     def _apply_candidate_detail(self, candidate: dict):
         """Apply classification/sync/demod/BER of one candidate result."""
+
+        # Measured signal parameters (SNR, noise floor, PAPR, ...).  The
+        # single-candidate payload carries them; batch sub-results do not.
+        self._pipeline_parameters = candidate.get("parameters") or {}
+
+        # Automatic FEC identification result (AUTO mode only).  The
+        # pipeline stores it inside the demodulation record, next to the
+        # bit stream it was computed from.
+        demodulation = candidate.get("demodulation") or {}
+        self._identification_result = candidate.get("fec_identification") or (
+            demodulation.get("fec_identification")
+        )
 
         classification = candidate.get("classification") or {}
 
@@ -1927,6 +2583,10 @@ class MainWindow(QMainWindow):
 
         self._pipeline_sync_summary = candidate.get("synchronization")
 
+        self._pipeline_protocol_summary = self._as_mapping(
+        candidate.get("protocol")
+        )
+
         self._pipeline_ml_summary = candidate.get("ml")
 
         demod = self._pipeline_demod_summary or {}
@@ -1941,8 +2601,7 @@ class MainWindow(QMainWindow):
         {}
         ).get("candidates", [])
 
-        self._identification_result = demod.get("fec_identification")
-        self._identification_candidates = demod.get("fec_identification_candidates")
+
 
     def _on_candidate_selected(self, index: int):
         """Batch mode: re-target the detail panels at another candidate."""
@@ -1962,6 +2621,8 @@ class MainWindow(QMainWindow):
 
                 self.update_analysis_parameters()
 
+                self._refresh_active_plot()
+
                 return
 
     def _pipeline_summary_text(self, payload: dict) -> str:
@@ -1969,22 +2630,19 @@ class MainWindow(QMainWindow):
 
         batch = payload.get("analyzed_candidates") is not None
 
-        classification = self.modulation_result
-
-        symbol_rate = self.timing_symbol_rate
-
-        sps = self.timing_sps
-
         lines = [
-        f"Pipeline: V2 ({self.pipeline_mode}{', all candidates' if batch else ''})",
-        f"Modulation: {classification}",
+        f"Pipeline: V2 ({self.pipeline_mode}"
+        f"{', all candidates' if batch else ''})",
+        f"Modulation: {self.modulation_result}",
         ]
 
-        if symbol_rate:
-            lines.append(f"Symbol rate: {symbol_rate:.2f} symbols/s")
+        if self.timing_symbol_rate:
+            lines.append(
+            f"Symbol rate: {self.timing_symbol_rate:.2f} symbols/s"
+            )
 
-        if sps:
-            lines.append(f"Samples/symbol: {sps:.2f}")
+        if self.timing_sps:
+            lines.append(f"Samples/symbol: {self.timing_sps:.2f}")
 
         demod = self._pipeline_demod_summary or {}
 
@@ -1997,13 +2655,11 @@ class MainWindow(QMainWindow):
         ber = self._pipeline_ber_summary
 
         if ber:
-            lines.append(f"BER: {ber.get('ber', 0):.6g}")
-
+            lines.append(f"BER: {float(ber.get('ber', 0.0)):.6g}")
         else:
-            lines.append("BER: no reference loaded"            )
+            lines.append("BER: no reference loaded")
 
-            fec = self._pipeline_fec_summary
-
+        fec = self._pipeline_fec_summary
 
         if fec:
             lines.append(
@@ -2017,13 +2673,7 @@ class MainWindow(QMainWindow):
             lines.append(
             f"Auto FEC: {auto.get('status', 'unknown')} "
             f"(scheme {auto.get('best_scheme')}, "
-            f"confidence {auto.get('confidence')}"
-            )
-
-
-            lines.append(
-            f"FEC ({fec.get('scheme')}): corrected "
-            f"{fec.get('corrected_errors', 0)} errors"
+            f"confidence {auto.get('confidence')})"
             )
 
         ml = self._pipeline_ml_summary
@@ -2037,164 +2687,118 @@ class MainWindow(QMainWindow):
                 lines.append(
                 "ML (CNN): UNTRAINED artifact — scores unvalidated"
                 )
-            if not ml.get("trained", False):
-                lines.append(
-                "ML (CNN): UNTRAINED artifact — scores unvalidated"
-                )
 
         return "\n".join(lines)
 
-        # --------------------------------------------------------
-        # Modulation classification
-        # --------------------------------------------------------
-
-        # ========================================================
-        # ANALYSIS PARAMETERS
-        # ========================================================
+    # ========================================================
+    # ANALYSIS PARAMETERS
+    # ========================================================
 
     def update_analysis_parameters(self):
+        """Refresh the signal-detail labels from the current analysis."""
 
         if self.analysis is None:
             return
 
         a = self.analysis
 
-        detected = a["signal_detected"]
+        detected = bool(a.get("signal_detected"))
 
-        # ----------------------------------------------------
-        # Detection
-        # ----------------------------------------------------
+        # Measured parameters come from the pipeline's parameter extractor
+        # when it ran; the detection summary is only the fallback.
+        params = getattr(self, "_pipeline_parameters", None) or {}
+
+        def _measured(key, digits=2, unit=""):
+            value = params.get(key)
+            if value is None:
+                value = a.get(key)
+            if value is None:
+                return "—"
+            try:
+                return f"{float(value):.{digits}f}{unit}"
+            except (TypeError, ValueError):
+                return "—"
 
         self.parameter_signal.setText(
-        f"Signal Detected: "
-        f"{'YES' if detected else 'NO'}"
+        f"Signal Detected: {'YES' if detected else 'NO'}"
         )
 
-        # ----------------------------------------------------
-        # Noise floor
-        # ----------------------------------------------------
+        self.parameter_duration.setText(
+        f"Duration: {_measured('duration', 4, ' s')}"
+        )
 
-        if a["noise_floor_db"] is not None:
+        self.parameter_peak.setText(f"Peak: {_measured('peak', 4)}")
 
+        self.parameter_rms.setText(f"RMS: {_measured('rms', 4)}")
+
+        self.parameter_power.setText(f"Power: {_measured('power', 4)}")
+
+        self.parameter_papr.setText(
+        f"PAPR: {_measured('papr_db', 2, ' dB')}"
+        )
+
+        self.parameter_crest.setText(
+        f"Crest Factor: {_measured('crest_factor', 4)}"
+        )
+
+        self.parameter_dynamic_range.setText(
+        f"Dynamic Range: {_measured('dynamic_range_db', 2, ' dB')}"
+        )
+
+        self.parameter_dc_offset.setText(
+        f"DC Offset: {_measured('dc_offset', 4)}"
+        )
+
+        # The V2 parameter extractor reports linear noise power; convert
+        # it to the dB floor convention used elsewhere in the project.
+        noise_power = params.get("noise_power")
+
+        if noise_power:
             self.parameter_noise.setText(
-            f"Noise Floor: "
-            f"{a['noise_floor_db']:.2f} dB"
+            f"Noise Floor: {10.0 * np.log10(float(noise_power)):.2f} dB"
             )
-
         else:
+            self.parameter_noise.setText("Noise Floor: —")
 
-            self.parameter_noise.setText(
-            "Noise Floor: "
-            "Below measurement floor"
-            )
+        self.parameter_dominant.setText(
+        f"Dominant Frequency: {_measured('dominant_frequency', 2, ' Hz')}"
+        )
 
-            # ----------------------------------------------------
-            # Threshold
-            # ----------------------------------------------------
+        self.parameter_center_freq.setText(
+        f"Center Frequency: {_measured('center_frequency', 2, ' Hz')}"
+        )
 
-        if a["threshold_db"] is not None:
-
-            self.parameter_threshold.setText(
-            f"Detection Threshold: "
-            f"{a['threshold_db']:.2f} dB"
-            )
-
-        else:
-
-            self.parameter_threshold.setText(
-            "Detection Threshold: —"
-            )
-
-            # ----------------------------------------------------
-            # Dominant frequency
-            # ----------------------------------------------------
-
-        if a["dominant_frequency"] is not None:
-
-            self.parameter_dominant.setText(
-            f"Dominant Frequency: "
-            f"{a['dominant_frequency']:.2f} Hz"
-            )
-
-        else:
-
-            self.parameter_dominant.setText(
-            "Dominant Frequency: —"
-            )
-
-            # ----------------------------------------------------
-            # Detected band
-            # ----------------------------------------------------
+        self.parameter_peak_freq.setText(
+        f"Peak Frequency: {_measured('peak_frequency', 2, ' Hz')}"
+        )
 
         if (
         detected
-        and a["lower_frequency"] is not None
-        and a["upper_frequency"] is not None
+        and a.get("lower_frequency") is not None
+        and a.get("upper_frequency") is not None
         ):
-
             self.parameter_band.setText(
-            f"Detected Band: "
-            f"{a['lower_frequency']:.2f} – "
+            f"Detected Band: {a['lower_frequency']:.2f} – "
             f"{a['upper_frequency']:.2f} Hz"
             )
-
         else:
+            self.parameter_band.setText("Detected Band: —")
 
-            self.parameter_band.setText(
-            "Detected Band: —"
-            )
-
-            # ----------------------------------------------------
-            # Bandwidth
-            # ----------------------------------------------------
-
-        if a["bandwidth"] is not None:
-
-            self.parameter_bandwidth.setText(
-            f"Bandwidth: "
-            f"{a['bandwidth']:.2f} Hz"
-            )
-
-        else:
-
-            self.parameter_bandwidth.setText(
-            "Bandwidth: —"
-            )
-
-            # ----------------------------------------------------
-            # SNR
-            # ----------------------------------------------------
-
-        if a["snr_db"] is not None:
-
-            self.parameter_snr.setText(
-            f"SNR: "
-            f"{a['snr_db']:.2f} dB"
-            )
-
-        else:
-
-            self.parameter_snr.setText(
-            "SNR: Not reliably estimable"
-            )
-
-            # ----------------------------------------------------
-            # Modulation
-            # ----------------------------------------------------
-
-        modulation = getattr(
-        self,
-        "modulation_result",
-        "Unknown"
+        self.parameter_bandwidth.setText(
+        f"Bandwidth: {_measured('bandwidth', 2, ' Hz')}"
         )
 
-        self.parameter_modulation.setText(
-        f"Modulation: {modulation}"
+        self.parameter_obw.setText(
+        f"Occupied BW (99%): {_measured('bandwidth_99', 2, ' Hz')}"
         )
 
-        # ----------------------------------------------------
-        # V2 pipeline: symbol timing summary
-        # ----------------------------------------------------
+        self.parameter_snr.setText(
+        f"SNR: {_measured('snr_db', 2, ' dB')}"
+        )
+
+        modulation = getattr(self, "modulation_result", "Unknown")
+
+        self.parameter_modulation.setText(f"Modulation: {modulation}")
 
         if self.timing_sps:
             self.parameter_sps.setText(
@@ -2206,21 +2810,14 @@ class MainWindow(QMainWindow):
             f"Symbol Rate: {self.timing_symbol_rate:.2f} symbols/s"
             )
 
-            confidence = self.timing_confidence
-
-            if confidence is not None:
-                self.parameter_timing_confidence.setText(
-                f"Timing Confidence: {confidence * 100:.1f}%"
-                )
-
-        # ----------------------------------------------------
-        # V2 pipeline: BER, decision margin, FEC, sync detail
-        # ----------------------------------------------------
+        if self.timing_confidence is not None:
+            self.parameter_timing_confidence.setText(
+            f"Timing Confidence: {self.timing_confidence * 100:.1f}%"
+            )
 
         ber = self._pipeline_ber_summary
 
         if ber is not None:
-
             self.parameter_ber.setText(
             f"BER: {float(ber.get('ber', 1.0)):.6g} "
             f"({ber.get('bit_errors', '?')}/"
@@ -2230,26 +2827,19 @@ class MainWindow(QMainWindow):
         demod = self._pipeline_demod_summary or {}
 
         if demod.get("num_symbols") is not None:
-
             self.parameter_symbol_count.setText(
-            f"Recovered Symbols/Bits: "
-            f"{demod.get('num_symbols')} / {demod.get('num_bits')}"
+            f"Recovered Symbols/Bits: {demod.get('num_symbols')} / "
+            f"{demod.get('num_bits')}"
             )
 
         if demod.get("decision_margin") is not None:
-
             self.parameter_decision_margin.setText(
-            f"Decision Margin: "
-            f"{float(demod['decision_margin']):.4f}"
+            f"Decision Margin: {float(demod['decision_margin']):.4f}"
             )
-
         else:
+            self.parameter_decision_margin.setText("Decision Margin: —")
 
-            self.parameter_decision_margin.setText(
-            "Decision Margin: —"
-            )
-
-            fec = self._pipeline_fec_summary
+        fec = self._pipeline_fec_summary
 
         if fec:
             self.parameter_fec.setText(
@@ -2257,175 +2847,147 @@ class MainWindow(QMainWindow):
             f"{fec.get('corrected_errors', 0)} errors, "
             f"{fec.get('uncorrectable_blocks', 0)} uncorrectable)"
             )
-
         elif self.fec_combo.currentText() != "none":
-
             self.parameter_fec.setText(
             f"FEC: {self.fec_combo.currentText()} "
             f"(no FEC stage output)"
             )
-
         else:
+            self.parameter_fec.setText("FEC: none configured")
 
-            self.parameter_fec.setText(
-            "FEC: none configured"
+        # Recovered information: the decoded (FEC) bitstream when 
+        # available, else the deinterleaved stream, else the received
+        # demodulated bits.  This is the *payload* the receiver produced.
+        if fec and fec.get("decoded_bit_count") is not None:
+            self.parameter_recovered_bits.setText(
+            f"Recovered bits: {int(fec['decoded_bit_count'])} "
+            f"(decoded, {fec.get('source', '?')})"
             )
-
-        # ---- automatic FEC identification (Phase 2) display ------------------
-
-        if self._identification_result is not None:
-
-            status_text = self._identification_result.get("status", "UNKNOWN")
-
-            self.parameter_auto_status.setText(
-            f"Auto FEC: {status_text}"
+        elif demod.get("deinterleaved_bits") is not None:
+            self.parameter_recovered_bits.setText(
+            f"Recovered bits: {len(demod['deinterleaved_bits'])} "
+            f"(deinterleaved)"
             )
-
-            if status_text == "AUTO_DETECTED":
-                self.parameter_auto_scheme.setText(
-                f"Detected scheme: {self._identification_result.get('best_scheme')}")
-                self.parameter_auto_confidence.setText(
-                f"Confidence: {self._identification_result.get('confidence')}")
-            else:
-                self.parameter_auto_scheme.setText(
-                "Detected scheme: —")
-                self.parameter_auto_confidence.setText(
-                "Confidence: —")
-
-            self.parameter_auto_corrected.setText(
-            f"Corrected errors: "
-            f"{self._identification_result.get('corrected_error_count', 0)}"
+        elif demod.get("num_bits") is not None:
+            self.parameter_recovered_bits.setText(
+            f"Recovered bits: {demod.get('num_bits')} (received, no FEC)"
             )
-
-            self.parameter_auto_residual.setText(
-            f"Residual estimate: "
-            f"{self._identification_result.get('residual_error_count', 0)}"
-            )
-
-            self.parameter_auto_validation.setText(
-            f"Validation: {self._identification_result.get('validation_status', 'unknown')}")
-
-            # ---- block-interleaving identification (new) ------------------
-
-            il_result = self._interleaving_result
-
-            if il_result is not None:
-                il_status = il_result.get("status", "UNKNOWN")
-
-                self.parameter_interleaving_mode.setText(
-                f"Interleaving mode: {il_status}"
-                )
-
-                self.parameter_interleaving_type.setText(
-                f"Detected type: {il_result.get('best_type', '—')}"
-                )
-
-                depth = il_result.get("best_depth")
-                self.parameter_interleaving_depth.setText(
-                f"Detected depth: {depth if depth is not None else '—'}"
-                )
-
-                self.parameter_interleaving_status.setText(
-                f"Status: {il_status}"
-                )
-
-                self.parameter_interleaving_confidence.setText(
-                f"Confidence: {il_result.get('confidence', 0.0)}"
-                )
-
-                # Candidate evidence (compact, on one line).
-                candidates = self._interleaving_candidates or []
-                parts = []
-                for cand in candidates:
-                    parts.append(
-                    f"{cand.get('candidate')} {cand.get('score')}[{cand.get('evidence', {}).get('status', '')}]"
-                    )
-                self.parameter_identify_candidates.setText(
-                "Identified candidates: " + ("; ".join(parts) if parts else "—")
-                )
-
-            else:
-                self.parameter_interleaving_mode.setText(
-                "Interleaving mode: not run"
-                )
-                self.parameter_interleaving_type.setText(
-                "Detected type: —"
-                )
-                self.parameter_interleaving_depth.setText(
-                "Detected depth: —"
-                )
-                self.parameter_interleaving_status.setText(
-                "Status: —"
-                )
-                self.parameter_interleaving_confidence.setText(
-                "Confidence: —"
-                )
-                self.parameter_identify_candidates.setText(
-                "Identified candidates: —"
-                )
-
-            # FEC source: manual configuration is authoritative; auto
-            # inference is reported separately (never mispresented).
-            fec_cfg = self._pipeline_input.get("fec", {}) if self._pipeline_input else {}
-            fec_mode = fec_cfg.get("mode", "auto")
-
-            if fec_mode == "manual":
-                self.parameter_auto_source.setText("FEC source: User configured")
-            elif fec_mode == "none":
-                self.parameter_auto_source.setText("FEC source: None configured")
-            else:
-                self.parameter_auto_source.setText("FEC source: Auto detected")
-
-            # Candidate evidence table (compact, on one line).
-            candidates = self._identification_candidates or []
-            parts = []
-            for cand in candidates:
-                parts.append(
-                f"{cand.get('candidate')} {cand.get('score')}[{cand.get('evidence', {}).get('status', '')}]"
-                )
-            self.parameter_identify_candidates.setText(
-            "Identified candidates: " + ("; ".join(parts) if parts else "—")
-            )
-
         else:
-            self.parameter_auto_status.setText("Auto FEC: Not run")
-            self.parameter_auto_scheme.setText("Detected scheme: —")
-            self.parameter_auto_confidence.setText("Confidence: —")
-            self.parameter_auto_corrected.setText("Corrected errors: —")
-            self.parameter_auto_residual.setText("Residual estimate: —")
-            self.parameter_auto_validation.setText("Validation: —")
-            self.parameter_auto_source.setText("FEC source: —")
-            self.parameter_identify_candidates.setText("Identified candidates: —")
+            self.parameter_recovered_bits.setText("Recovered bits: —")
 
+        # Sync-word / frame semantics come from the protocol stage, which
+        # reuses the normalized-correlation sync-word search.  "not found"
+        # and "not run" are first-class, honest outcomes.
+        protocol = getattr(self, "_pipeline_protocol_summary", None)
 
-        sync = self._pipeline_sync_summary or {}
+        if protocol:
+            if protocol.get("sync_found"):
+                confidence = protocol.get("sync_confidence")
+                payload = protocol.get("payload_bytes") or b""
+                self.parameter_sync_word.setText(
+                f"Sync word: found (confidence {float(confidence or 0.0):.3f}), "
+                f"{len(payload)} payload bytes"
+                )
+            else:
+                self.parameter_sync_word.setText("Sync word: not found")
+        else:
+            self.parameter_sync_word.setText("Sync word: not run")
 
-        ml_summary = getattr(self, "_pipeline_ml_summary", None)
+        identification = getattr(self, "_identification_result", None)
 
-        if ml_summary:
-            top = ml_summary.get("top3") or []
-            top_text = " ".join(
-            f"{item['class']} {item['score']:.2f}" for item in top[:3]
+        if identification:
+            ident_status = identification.get("status", "UNKNOWN")
+            ident_scheme = identification.get("best_scheme")
+            ident_conf = float(identification.get("confidence") or 0.0)
+
+            if ident_status == "AUTO_DETECTED" and ident_scheme:
+                self.parameter_fec_auto.setText(
+                f"Auto FEC: {ident_scheme} (confidence {ident_conf:.0f})"
+                )
+            else:
+                self.parameter_fec_auto.setText(
+                f"Auto FEC: {ident_status} (no scheme claimed)"
+                )
+        else:
+            self.parameter_fec_auto.setText("Auto FEC: not run")
+
+        # The AUTO identification verdict is filled in by the FEC stage;
+        # MANUAL/NONE runs honestly report "not run".
+
+        il_result = getattr(self, "_interleaving_result", None)
+
+        if il_result is not None:
+            il_status = il_result.get("status", "UNKNOWN")
+
+            self.parameter_interleaving_mode.setText(
+            f"Interleaving mode: {il_status}"
             )
-            if not ml_summary.get("trained", False):
-                top_text += "  [UNTRAINED — scores near-random; disable]"
+
+            self.parameter_interleaving_type.setText(
+            f"Detected type: {self._interleaving_family_label(il_result)}"
+            )
+
+            depth = il_result.get("best_depth")
+
+            self.parameter_interleaving_depth.setText(
+            f"Detected depth: {depth if depth is not None else '—'}"
+            )
+
+            self.parameter_interleaving_status.setText(f"Status: {il_status}")
+
+            self.parameter_interleaving_confidence.setText(
+            f"Confidence: {il_result.get('confidence', 0.0)}"
+            )
+        else:
+            self.parameter_interleaving_mode.setText("Interleaving mode: not run")
+            self.parameter_interleaving_type.setText("Detected type: —")
+            self.parameter_interleaving_depth.setText("Detected depth: —")
+            self.parameter_interleaving_status.setText("Status: —")
+            self.parameter_interleaving_confidence.setText("Confidence: —")
+
+        candidates = getattr(self, "_interleaving_candidates", None) or []
+
+        # The identifier returns one entry per (type, depth) probed, so
+        # only the ones that actually scored carry information.
+        scored = [
+        c for c in candidates if float(c.get("score") or 0.0) > 0.0
+        ]
+
+        parts = []
+
+        for cand in scored[:5]:
+
+            label = str(cand.get("type") or "?")
+
+            depth = cand.get("depth")
+
+            if depth is not None:
+                label = f"{label}@{depth}"
+
+            parts.append(f"{label} {float(cand.get('score') or 0.0):.2f}")
+
+        self.parameter_identify_candidates.setText(
+        "Interleaving candidates: " + ("; ".join(parts) if parts else "none")
+        )
+
+        ml = getattr(self, "_pipeline_ml_summary", None)
+
+        if ml:
             self.parameter_ml.setText(
-            f"ML Prediction: {ml_summary.get('predicted_class', '?')} "
-            f"({float(ml_summary.get('confidence', 0.0)) * 100:.0f}%, "
-            f"{ml_summary.get('num_frames', '?')} frames)  {top_text}"
+            f"ML Prediction: {ml.get('predicted_class', '?')} "
+            f"({float(ml.get('confidence', 0.0)) * 100:.0f}%)"
             )
-
         elif self.ml_checkbox.isChecked():
             self.parameter_ml.setText(
             "ML Prediction: unavailable (artifact missing or capture "
             "too short)"
             )
-
         else:
             self.parameter_ml.setText("ML Prediction: off")
 
-        freq_offset = sync.get("frequency_offset_hz")
+        sync = self._pipeline_sync_summary or {}
 
+        freq_offset = sync.get("frequency_offset_hz")
         phase_offset = sync.get("phase_offset_rad")
 
         self.parameter_sync_freq.setText(
@@ -2440,26 +3002,33 @@ class MainWindow(QMainWindow):
         else "Phase Offset: —"
         )
 
-        # ----------------------------------------------------
-        # Selected signal
-        # ----------------------------------------------------
-
         if self.selected_signal is not None:
-
             self.parameter_selected.setText(
-            f"Selected Signal: "
-            f"Signal {self.selected_signal['id']}"
+            f"Selected Signal: Signal {self.selected_signal['id']}"
             )
-
         else:
+            self.parameter_selected.setText("Selected Signal: —")
 
-            self.parameter_selected.setText(
-            "Selected Signal: —"
-            )
+        # Detection / Results tab signal read-out.
+        self.results_sample_rate_label.setText(
+        f"Sample Rate: {a.get('sample_rate', 0.0):.0f} Hz"
+        )
 
-            # ========================================================
-            # SIGNAL TABLE
-            # ========================================================
+        self.results_candidate_count_label.setText(
+        f"Candidates: {len(a.get('detected_signals', []))}"
+        )
+
+        self.results_modulation_label.setText(f"Modulation: {modulation}")
+
+        if a.get("snr_db") is not None:
+            self.results_snr_label.setText(f"SNR: {a['snr_db']:.2f} dB")
+
+        self._update_auto_fec_display()
+
+
+        # ========================================================
+        # SIGNAL TABLE
+        # ========================================================
 
     def update_signal_table(self):
 
@@ -2567,6 +3136,16 @@ class MainWindow(QMainWindow):
         "BER Validation: No reference loaded"
         )
 
+        self.parameter_recovered_bits.setText(
+        "Recovered bits: —"
+        )
+
+        self.parameter_sync_word.setText(
+        "Sync word: not run"
+        )
+
+        self._pipeline_protocol_summary = None
+
         self.isolate_button.setEnabled(
         True
         )
@@ -2649,90 +3228,139 @@ class MainWindow(QMainWindow):
         # VISUALIZATIONS
         # ========================================================
 
+    def _draw_time_domain(self):
+
+        self.time_plot.set_figure(
+        create_time_figure(
+        self.samples,
+        self.sample_rate
+        )
+        )
+
+    def _draw_spectrum(self):
+
+        self.spectrum_plot.set_figure(
+        create_spectrum_figure(
+        self.samples,
+        self.sample_rate
+        )
+        )
+
+    def _draw_waterfall(self):
+
+        self.waterfall_plot.set_figure(
+        create_waterfall_figure(
+        self.samples,
+        self.sample_rate
+        )
+        )
+
+    def _draw_constellation(self):
+
+        # Prefer the RECOVERED symbol constellation when the V2
+        # pipeline captured it: that is the actual analysis
+        # deliverable (the raw-IQ scatter is a shapeless smear for
+        # any pulsed-shaped signal).
+
+        constellation_symbols = None
+
+        demod = self._pipeline_demod_summary or {}
+
+        symbols_payload = (demod.get("constellation") or {}).get(
+        "symbols"
+        )
+
+        if symbols_payload:
+
+            try:
+
+                constellation_symbols = np.asarray(
+                [complex(re_, im_) for re_, im_ in symbols_payload],
+                dtype=np.complex128,
+                )
+
+            except (TypeError, ValueError):
+
+                constellation_symbols = None
+
+        if constellation_symbols is not None:
+
+            from prototype.visualization.plots import (
+            create_symbol_constellation_figure,
+            )
+
+            self.constellation_plot.set_figure(
+            create_symbol_constellation_figure(
+            constellation_symbols,
+            title=(
+            f"Recovered Constellation ({self.modulation_result})"
+            ),
+            )
+            )
+
+        else:
+
+            try:
+
+                self.constellation_plot.set_figure(
+                create_constellation_figure(
+                self.samples
+                )
+                )
+
+            except ValueError as exc:
+
+                self.show_constellation_message(
+                str(exc)
+                )
+
     def update_visualizations(self):
+        """(Re)draw the plot owned by the currently visible tab.
+
+        A single analysis feeds every tab: this draws the tab on screen
+        now, and ``_on_vis_tab_changed`` draws each other tab on demand
+        when the user switches to it — no repeated "Analyze Signal".
+        """
 
         if self.samples is None:
             return
 
+        self._refresh_active_plot()
+
+    def _on_vis_tab_changed(self, index):
+        """Redraw the newly selected visualisation tab."""
+
+        del index
+
+        self._refresh_active_plot()
+
+    def _refresh_active_plot(self):
+        """Draw the plot owned by the currently selected tab."""
+
+        if self.samples is None:
+            return
+
+        active = self.vis_tabs.currentIndex()
+
         try:
 
-            self.time_plot.set_figure(
-            create_time_figure(
-            self.samples,
-            self.sample_rate
-            )
-            )
+            if active == 0:
 
-            self.spectrum_plot.set_figure(
-            create_spectrum_figure(
-            self.samples,
-            self.sample_rate
-            )
-            )
+                self._draw_time_domain()
 
-            self.waterfall_plot.set_figure(
-            create_waterfall_figure(
-            self.samples,
-            self.sample_rate
-            )
-            )
+            elif active == 1:
 
-            # Prefer the RECOVERED symbol constellation when the V2
-            # pipeline captured it: that is the actual analysis
-            # deliverable (the raw-IQ scatter is a shapeless smear for
-            # any pulsed-shaped signal).
+                self._draw_spectrum()
 
-            constellation_symbols = None
+            elif active == 2:
 
-            demod = self._pipeline_demod_summary or {}
+                self._draw_waterfall()
 
-            symbols_payload = (demod.get("constellation") or {}).get(
-            "symbols"
-            )
+            elif active == 3:
 
-            if symbols_payload:
+                self._draw_constellation()
 
-                try:
-
-                    constellation_symbols = np.asarray(
-                    [complex(re_, im_) for re_, im_ in symbols_payload],
-                    dtype=np.complex128,
-                    )
-
-                except (TypeError, ValueError):
-
-                    constellation_symbols = None
-
-            if constellation_symbols is not None:
-
-                from prototype.visualization.plots import (
-                create_symbol_constellation_figure,
-                )
-
-                self.constellation_plot.set_figure(
-                create_symbol_constellation_figure(
-                constellation_symbols,
-                title=(
-                f"Recovered Constellation ({self.modulation_result})"
-                ),
-                )
-                )
-
-            else:
-
-                try:
-
-                    self.constellation_plot.set_figure(
-                    create_constellation_figure(
-                    self.samples
-                    )
-                    )
-
-                except ValueError as exc:
-
-                    self.show_constellation_message(
-                    str(exc)
-                    )
+            # The Detection/Results and GNU Radio tabs host no plot.
 
         except Exception as exc:
 
@@ -2741,10 +3369,6 @@ class MainWindow(QMainWindow):
             "Plotting error",
             str(exc)
             )
-
-            # ========================================================
-            # CONSTELLATION FALLBACK
-            # ========================================================
 
     def show_constellation_message(
     self,
@@ -2791,6 +3415,8 @@ class MainWindow(QMainWindow):
         self.qpsk_ber_validation = None
         self.qam16_demodulation = None
         self.qam16_ber_validation = None
+        # Full reset: unload the capture as well, so "Clear" returns the
+        # window to its initial state with no stale plots or labels.
         self.samples = None
         self.sample_rate = None
         self.current_file = None
@@ -2798,6 +3424,7 @@ class MainWindow(QMainWindow):
         self.selected_signal = None
 
         # V2 pipeline state
+        self._pipeline_parameters = None
         self._pipeline_demod_summary = None
         self._pipeline_ber_summary = None
         self._pipeline_sync_summary = None
@@ -2808,9 +3435,7 @@ class MainWindow(QMainWindow):
         self._pipeline_provenance = None
         self.pipeline_result = None
 
-        self.parameter_ml.setText(
-        "ML Prediction: off"
-        )
+        self.parameter_ml.setText("ML Prediction: off")
 
         self.export_json_button.setEnabled(False)
 
@@ -2820,13 +3445,13 @@ class MainWindow(QMainWindow):
 
         self.progress_bar.setValue(0)
 
-        self.candidate_combo.blockSignals(True)
-
-        self.candidate_combo.clear()
-
-        self.candidate_combo.blockSignals(False)
-
-        self.candidate_combo.setVisible(False)
+        # Detection/Results tab: reset all results fields
+        self.results_il_status_label.setText("Interleaving: not run")
+        self.results_il_type_label.setText("Detected type: —")
+        self.results_il_depth_label.setText("Detected depth: —")
+        self.results_il_confidence_label.setText("Confidence: —")
+        self.results_il_fec_label.setText("FEC: —")
+        self.results_il_ber_label.setText("BER: no reference loaded")
 
         self.parameter_decision_margin.setText(
         "Decision Margin: —"
@@ -2853,6 +3478,21 @@ class MainWindow(QMainWindow):
         self.sample_rate_label.setText("—")
         self.samples_label.setText("—")
         self.duration_label.setText("—")
+
+        self.results_sample_rate_label.setText("Sample Rate: —")
+        self.results_candidate_count_label.setText("Candidates: —")
+        self.results_modulation_label.setText("Modulation: —")
+        self.results_snr_label.setText("SNR: —")
+
+        # Interleaving / auto-FEC read-out reset (the results_il_*
+        # labels are already reset above).
+        self.parameter_fec_auto.setText("Auto FEC: not run")
+        self.parameter_identify_candidates.setText("Interleaving candidates: —")
+        self.parameter_interleaving_mode.setText("Interleaving mode: not run")
+        self.parameter_interleaving_type.setText("Detected type: —")
+        self.parameter_interleaving_depth.setText("Detected depth: —")
+        self.parameter_interleaving_status.setText("Status: —")
+        self.parameter_interleaving_confidence.setText("Confidence: —")
 
         self.parameter_sps.setText(
         "Samples/Symbol: —"
@@ -2890,10 +3530,6 @@ class MainWindow(QMainWindow):
         "Noise Floor: —"
         )
 
-        self.parameter_threshold.setText(
-        "Detection Threshold: —"
-        )
-
         self.parameter_dominant.setText(
         "Dominant Frequency: —"
         )
@@ -2905,6 +3541,15 @@ class MainWindow(QMainWindow):
         self.parameter_bandwidth.setText(
         "Bandwidth: —"
         )
+
+        self.parameter_obw.setText("Occupied BW (99%): —")
+        self.parameter_center_freq.setText("Center Frequency: —")
+        self.parameter_peak_freq.setText("Peak Frequency: —")
+        self.parameter_power.setText("Power: —")
+        self.parameter_papr.setText("PAPR: —")
+        self.parameter_crest.setText("Crest Factor: —")
+        self.parameter_dynamic_range.setText("Dynamic Range: —")
+        self.parameter_dc_offset.setText("DC Offset: —")
 
         self.parameter_snr.setText(
         "SNR: —"
@@ -4516,11 +5161,18 @@ class MainWindow(QMainWindow):
 
         if not known_rate:
 
+            # A raw IQ file has no header, so the sample rate cannot be
+            # read from it (a .json sidecar can supply it).  Default to
+            # the last rate used in this session so repeated opens of the
+            # same capture family only ask once.
+            default_rate = str(getattr(self, "_last_raw_sample_rate", 8000))
+
             rate_text, ok = QInputDialog.getText(
             self,
             "Raw IQ sample rate",
-            f"Sample rate in Hz for {Path(path).name}",
-            text="8000",
+            f"Sample rate in Hz for {Path(path).name} "
+            "(or add a JSON sidecar with sample_rate/dtype):",
+            text=default_rate,
             )
 
             if not ok or not rate_text.strip():
@@ -4532,6 +5184,8 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                 f"Sample rate must be positive, got {sample_rate}"
                 )
+
+            self._last_raw_sample_rate = sample_rate
 
         known_dtype = sidecar.get("dtype") is not None
 
