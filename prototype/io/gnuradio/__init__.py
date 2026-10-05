@@ -50,12 +50,17 @@ logger = logging.getLogger("spectra.io.gnuradio")
 
 
 def gnuradio_available() -> bool:
-    """True when the GNU Radio Python package is importable."""
+    """True when the GNU Radio Python package is importable in-process.
+
+    A broader question -- can *some* GNU Radio runtime be executed, e.g.
+    from its own radioconda environment -- is answered by
+    ``gnuradio_runtime_status()`` below.
+    """
     return _import_gnuradio()
 
 
 def make_gnuradio_source(
-    config: GNURadioAcquisitionConfig,
+    config: GNURadioAcquisitionConfig | GNURadioSourceConfig,
 ) -> "GNURadioSource | None":
     """Build a GNU Radio source if the runtime supports it, else None."""
     if not gnuradio_available():
@@ -65,7 +70,8 @@ def make_gnuradio_source(
     except Exception:  # noqa: BLE001
         logger.warning("GNU Radio source backend unavailable", exc_info=True)
         return None
-    return GNURadioSource(config)
+    source_cfg = config.source if hasattr(config, "source") else config
+    return GNURadioSource(source_cfg)
 
 
 def _import_gnuradio():

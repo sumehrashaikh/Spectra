@@ -98,6 +98,26 @@ def create_spectrum_figure(
     return figure
 
 
+def create_spectrum_figure_gnuradio(fft_dict):
+    """Create FFT spectrum figure from GNU Radio output."""
+    freqs = np.asarray(fft_dict.get("freqs", []))
+    mag = np.asarray(fft_dict.get("magnitude", []))
+    source = fft_dict.get("source", "GNU Radio")
+
+    figure = Figure(
+        figsize=(8, 3),
+        tight_layout=True
+    )
+    ax = figure.add_subplot(111)
+    ax.plot(freqs, mag, color="#1f77b4")
+    ax.set_title(f"Signal Spectrum [Source: {source}]")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude")
+    ax.grid(True)
+
+    return figure
+
+
 def create_waterfall_figure(
     samples,
     sample_rate,
@@ -167,6 +187,61 @@ def create_waterfall_figure(
         label="Magnitude (dB)"
     )
 
+    return figure
+
+
+def create_waterfall_figure_gnuradio(waterfall_dict):
+    """Create waterfall figure from GNU Radio output."""
+    freqs = np.asarray(waterfall_dict.get("freqs", []))
+    times = np.asarray(waterfall_dict.get("times", []))
+    power_db = np.asarray(waterfall_dict.get("power_db", []))
+    source = waterfall_dict.get("source", "GNU Radio")
+
+    figure = Figure(
+        figsize=(8, 3),
+        tight_layout=True
+    )
+    ax = figure.add_subplot(111)
+
+    if power_db.size > 0 and len(times) > 0 and len(freqs) > 0:
+        # Mesh expects X: times, Y: freqs, C: power_db shape (len(freqs), len(times))
+        if power_db.shape == (len(freqs), len(times)):
+            mesh = ax.pcolormesh(times, freqs, power_db, shading="auto", cmap="viridis")
+        elif power_db.shape == (len(times), len(freqs)):
+            mesh = ax.pcolormesh(times, freqs, power_db.T, shading="auto", cmap="viridis")
+        else:
+            mesh = ax.imshow(
+                power_db,
+                aspect="auto",
+                origin="lower",
+                extent=[times[0], times[-1], freqs[0], freqs[-1]],
+                cmap="viridis"
+            )
+        figure.colorbar(mesh, ax=ax, label="Power (dB)")
+
+    ax.set_title(f"Waterfall / Spectrogram [Source: {source}]")
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Frequency (Hz)")
+
+    return figure
+
+
+def create_error_figure(title: str, message: str) -> Figure:
+    """Create a figure displaying an error or unavailable status message."""
+    figure = Figure(figsize=(8, 3), tight_layout=True)
+    ax = figure.add_subplot(111)
+    ax.text(
+        0.5,
+        0.5,
+        f"{title}\n\n{message}",
+        ha="center",
+        va="center",
+        wrap=True,
+        fontsize=11,
+        color="#c0392b",
+        fontweight="bold"
+    )
+    ax.set_axis_off()
     return figure
 
 
