@@ -2,6 +2,9 @@
 .venv/
 venv/
 env/
+# Dedicated ML-training environment (CPU PyTorch). Training/export only —
+# runtime inference is NumPy-only and never needs this environment.
+.venv-mltrain/
 
 # Python cache
 __pycache__/
@@ -20,9 +23,22 @@ Thumbs.db
 *.png
 *.jpg
 *.jpeg
+# ...except the evidence figures that ship with the documentation
+!prototype/docs/evidence/*.png
 
 # Large generated signal files
 prototype/data/output/
+
+# Generated analysis exports (GUI "Export JSON" default name)
+/*_analysis.json
+
+# ML training scratch candidates / backups. The promoted artifact is
+# prototype/ml/modulation_cnn_trained.npz; candidate runs stay local.
+prototype/ml/_*.npz
+prototype/ml/_*.config.json
+
+# Agent/client local state
+.freebuff/
 
 # Python packaging
 *.egg-info/

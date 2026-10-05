@@ -1,0 +1,49 @@
+{
+  "case": "BFSK_nofec_nointerleave",
+  "origin": "fsk",
+  "expected_modulation": "BFSK",
+  "expected_fec": null,
+  "expected_interleaver": null,
+  "expected_interleave_param": null,
+  "payload_bits": 1000,
+  "coded_bits": 1000,
+  "capture_samples": 80000,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": false,
+  "notes": [
+    "modulation=BFSK",
+    "tones=500/700 Hz"
+  ],
+  "auto": {
+    "detected_modulation": "BFSK",
+    "symbol_rate_est": 99.98529627995883,
+    "symbol_rate_confidence": 100.0,
+    "symbol_rate_method": "fsk_run_length",
+    "snr_db": 58.05104480318231,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNRESOLVED",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": null,
+    "warnings": []
+  },
+  "configured": {
+    "detected_modulation": "BFSK",
+    "symbol_rate_est": 99.98529627995883,
+    "snr_db": 58.05104480318231,
+    "coded_stream_ber": null,
+    "fec_scheme": null,
+    "fec_source": null,
+    "uncorrectable_blocks": null,
+    "corrected_errors": null,
+    "decoded_bits": 0,
+    "payload_prefix_matched": 0,
+    "payload_recovered": false,
+    "interleaver_status": "NONE",
+    "codeword_alignment": null,
+    "warnings": []
+  }
+}

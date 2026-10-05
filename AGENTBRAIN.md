@@ -786,3 +786,346 @@ implemented feature.  No GUI redesign, no second pipeline, no DSP rewrite.
 - Codeword alignment is 16-QAM-only; uncoded QPSK/8-PSK cannot be BER-scored against a
   reference. Automatic interleaving identification is block-only. LDPC is a didactic
   (16,8) code. All validation remains synthetic; no real captures, no SDR hardware.
+
+---
+
+## Session 15 (2026-09-30) — ML prediction honesty, joint FEC+interleaver search, GNU Radio spectrum/waterfall, light/dark theme
+
+**Scope:** fix the three reported defect areas (wrong ML predictions, block
+interleaving, FEC + interleaving) and add the two requested features (GNU Radio
+with spectrum + waterfall only, light/dark mode). No GUI redesign, no DSP
+rewrite.
+
+**1. Wrong ML predictions — two real defects, one of them a preprocessing bug**
+- `ml/train.py` trained on the raw frames from `build_dataset` (amplitude varies
+  with the randomised SNR: frame RMS 0.06 … 1.0) while the runtime
+  (`ml/cnn.py`) feeds every frame through `normalize_frames(unit_rms)` — the same
+  convention the artifact declares (`normalization="unit_rms"`). Measured on a
+  fresh 160-frame holdout, the shipped weights scored **37.5% on raw frames but
+  21.2% on the unit-RMS frames the pipeline actually feeds them**. The trainer
+  now normalizes the dataset, so training and inference share one representation
+  and the training summary records `normalization`. The shipped artifact was
+  replaced with a warm-started, normalization-correct retrain (declared holdout
+  0.344): accuracy on the representation the runtime actually feeds the network
+  went from **0.229 to 0.422** on a fresh 192-frame holdout (+84% relative). The
+  CNN is still below the 0.60 validation floor, so its output is still reported
+  as *evidence* - but no longer through a self-inflicted handicap.
+- Fusion silently discarded most ML answers: the CNN vocabulary says `16QAM` /
+  `8PSK` while the deterministic classifier says `16-QAM` / `8-PSK`, so
+  `fuse_classification` rewrote every QAM/PSK prediction to `Unknown`.
+  `ml.fusion.canonical_modulation` now unifies both vocabularies,
+  `is_comparable()` distinguishes "a class the receiver cannot emit" (AM-DSB,
+  PAM4) from "no answer", and an out-of-vocabulary ML class is recorded as
+  evidence instead of a rival result.
+- `predict_modulation` now reports `validated` (from the artifact's declared
+  holdout accuracy, floor 0.60), `presented_as` (`prediction` only when the model
+  is validated *and* the capture clears the confidence/agreement floors),
+  `predicted_class_canonical`, `comparable` and `low_confidence`. The GUI row
+  reads `ML Prediction: QPSK (90%)` for a supported label and
+  `ML (CNN): evidence only — top class Noise (100%), model holdout accuracy 31%`
+  otherwise, plus `ML top-3: ...` in the summary dialog. A confident-but-wrong
+  argmax is no longer presented as a result.
+
+**2. Block interleaving / FEC + interleaving (AUTO path)**
+- `pipeline._reference_validated_fec_search` probed `none` plus block depths
+  only, so `16-QAM concatenated pseudo_random` stayed `UNRESOLVED` even with a
+  reference present. The hypothesis set now covers **every implemented family**
+  (block depths, seeded pseudo-random permutations, convolutional strides, the
+  square diagonal), validated by deinterleaving the clean reference and running
+  the FEC identifier on it — only the transmitter's own permutation makes the
+  code stream decodable again, which is what discriminates family *and*
+  parameter. Measured AUTO results on the demo captures with the reference
+  sidecar: `RS+block -> block/8`, `concatenated+block -> block/8`,
+  `concatenated+pseudo_random -> pseudo_random/3` (payload match 1.0), all in
+  ≈2.5–5 s.
+- `interleaving_result` now records `family`, `best_param`, `best_type` and
+  `evidence.hypothesis`, and the provenance step records `family`.
+- Honest boundary (unchanged, now stated): an *uncoded* interleaved capture
+  cannot be resolved from a reference, because the reference is the already
+  interleaved stream — deinterleaving received and reference with the same
+  candidate always matches. Only FEC decodability exposes the permutation.
+
+**3. Viterbi decode was the bottleneck (enabler for the above)**
+- `fec/convolutional.py` decoded in a nested Python loop (64 states × 2 branches
+  per step): 2.6 s for a 2572-bit codeword, which made any hypothesis search
+  unaffordable. Rewritten with predecessor-indexed reverse tables and a
+  vectorised add-compare-select: **59 ms (≈45× faster)**, bit-identical results
+  (clean round trips at 10/100/1000/2572 bits, 40-flip case metric 40.0, and the
+  78 FEC/end-to-end tests unchanged).
+
+**4. GNU Radio — spectrum + waterfall only**
+- New `io/gnuradio/viz.py` runs the headless FFT flowgraph from the standalone
+  `gnuradio_integration` package in a subprocess and returns the PSD + STFT
+  waterfall matrices. `gnuradio` is never imported into the Spectra process;
+  `SPECTRA_GNURADIO_PYTHON` / `SPECTRA_GNURADIO_VIZ_SCRIPT` override the
+  interpreter and script. Every failure returns `backend_used="numpy"` plus a
+  reason, and the GUI draws its own plots in that case.
+- Verified live on this machine (the flowgraph env *is* installed):
+  `C:\Users\eiraa\radioconda\python.exe`, GNU Radio 3.10.12.0, 1024-point FFT,
+  8 STFT frames in 0.64 s. (Spectra's own Python still has no `gnuradio`
+  importable, which is exactly why the bridge is a subprocess.)
+- GUI: checkbox in the existing GNU Radio tab (`Compute Spectrum + Waterfall
+  with GNU Radio`) plus a status row that names the backend actually used. The
+  result is cached per capture, so switching tabs never re-runs the flowgraph.
+- No demodulation / carrier recovery / constellation work moved off NumPy.
+
+**5. Light / dark theme**
+- New `gui/theme.py` (palette + stylesheet + Matplotlib canvas recolouring) and
+  a corner button in the title row (`🌙 Dark` / `☀ Light`). Light is the original
+  look and applies **no** stylesheet, so toggling back restores exactly the
+  previous appearance; the toggle adds no row and moves no existing control.
+  Existing canvases and every newly drawn figure are restyled, so plots stay
+  readable in the dark theme.
+
+**Tests**
+- New: `tests/test_gnuradio_viz.py` (bridge contract, fallback record, stub
+  flowgraph parsing + matrix orientation, plot helpers, rejection of mismatched
+  matrices), `tests/test_ml_evidence.py` (canonical labels, comparability,
+  evidence gate, short-capture fields), `tests/test_gui_theme_viz.py` (offscreen
+  theme toggle, canvas recolouring, light keeps the original stylesheet, GNU
+  Radio toggle off/on/fallback/success).
+- Extended: `tests/test_reference_validated_fec.py` (+2 — pseudo-random family
+  resolved end to end; an un-interleaved coded capture is not forced through a
+  deinterleaver).
+
+**Remaining limitations (honest)**
+- The 16-class CNN is still weak: the shipped artifact declares 34% holdout
+  accuracy, so its output is reported as evidence, never as a prediction. The
+  normalization fix removed the largest single handicap (runtime-domain accuracy
+  0.229 -> 0.422) and the retrain is measurably better, but on the 16-QAM/QPSK/
+  8-PSK demo captures the CNN still lands on AM-SSB/AM-DSB: training data spans
+  SNR 0-18 dB while the demo captures sit at ~45-58 dB, and the 16-class problem
+  needs far more frames/epochs than a laptop NumPy trainer affords. The pipeline
+  therefore keeps ML as a labelled second opinion; making it *right* would need
+  an SNR-widened dataset plus a long training run.
+- Blind (reference-free) interleaver identification stays block-only and
+  conservative; uncoded interleaved captures remain UNRESOLVED by construction.
+- GNU Radio is visualization-only here (spectrum + waterfall); live SDR capture
+  and hardware validation are unchanged/roadmap.
+
+## Session 16 (2026-09-30) — "still unresolved": BER/interleaving read-out, symbols & bits inspectors, and the real reason the QPSK BER was stuck at 0.24
+
+**Reported:** the FEC / interleaving / BER rows are still unresolved; add a
+Symbols button (and the same for bits/BER) that opens the values the JSON
+export already carries; when the ML cannot classify, show the DSP
+classification in the ML row instead of being honest about the CNN.
+
+**1. The ML row now mirrors the DSP classification**
+- `pipeline._mirror_ml_display` runs in the ML stage: for an unvalidated model
+  it sets `display_class`/`display_confidence`/`display_source="dsp_mirror"`,
+  `mirrored_from_dsp=True` and keeps the network's own answer in
+  `ml_raw_class` + `raw_note`, so the JSON export and provenance still record
+  exactly what the CNN said. The GUI row reads
+  `ML Prediction: QPSK (97%) — from DSP analysis (CNN said 64QAM)`.
+
+**2. Symbols + bits inspectors**
+- `View Symbols (I/Q)` and `View Bits / BER` buttons (Constellation tab and the
+  FEC / BER group) open a small read-only window (`_show_text_dialog`, with
+  Copy / Save…) listing the recovered synchronized symbols (`# / I / Q / |S|`)
+  and every bitstream the receiver produced (demodulated, codeword-aligned,
+  deinterleaved, FEC-decoded) with lengths, ones/zeros and a 512-bit preview.
+  Exactly the data the JSON/report carries, now visible without exporting.
+
+**3. "Unresolved" rows**
+- **BER row**: one shared formatter everywhere (`_ber_display_text`): measured
+  when a reference exists, otherwise `BER: not measured (no reference) — EVM
+  x%, SNR est y dB, BER est z`. The EVM estimate is derived from the recovered
+  constellation (`_estimate_link_quality`, `method="evm_estimate"`, labelled
+  as an estimate) and, for QPSK, measured against the closer of the two lattice
+  phases a blind receiver cannot distinguish.
+- **Interleaving row**: a capture whose demodulated stream already matches its
+  reference reports `NONE (no deinterleaving required)`
+  (`evidence.mode="reference_agreement"`) instead of `UNRESOLVED`; the
+  type/depth rows now name what happened (`none required (received bits
+  already match the reference)`, `not identifiable from a blind capture (needs
+  a bit reference or a decodable FEC code)`, `— (no depth claimed, none
+  applied)`) and the completion summary shows the same BER/interleaving lines.
+
+**4. Found and fixed: the demo QPSK BER plateau at ~0.25 was a fixture bug**
+- Diagnosis (this took the session): on a *noise-free* QPSK demo capture the
+  BER search could not get below 0.244 at any rotation/origin, i.e. not a
+  synchronization limit. Comparing the recovered symbol stream against the
+  transmitted symbols showed the quadrants matched 1:1 while the *bits*
+  disagreed on exactly the two `-I` quadrants. Cause: `tests/demo_captures.py`
+  hand-wrote `QPSK_LEVELS` in an order that is Grey-reversed on the `-I` half
+  relative to `modulation.demodulator.qpsk_decision` — the comment claimed to
+  follow the receiver, the implementation did not. 8-PSK had the same drift.
+- Fix: the tables are now *derived* from the receiver's own decision kernel
+  (`_receiver_derived_levels`: evaluate the kernel on the ideal constellation,
+  read off the word→symbol map it implements), with a regression test that
+  round-trips every word through the kernel. Measured after the fix (this
+  machine, demo captures): uncoded QPSK **BER 0.00 (0/1004 bits)**,
+  QPSK diagonal **0/6380**, FSK demo **0/1000**.
+- `reference_is_usable` now writes reference sidecars for QPSK and BFSK too
+  (8-PSK stays excluded: these captures classify as 16-QAM, so the decision
+  device applied to them is the wrong one and a reference would report a
+  misleading ~0.45).
+
+**5. Found and fixed: synchronizer chosen from the coarse label, never revisited**
+- A QPSK capture is labelled 16-QAM by the coarse waveform stage, so the first
+  synchronization optimized the 16-QAM lattice: the recovered cloud was smeared
+  (mean lattice distance 0.41 vs 0.03 after the fix), which the constellation
+  tab, the EVM estimate and the decision chain all inherited.
+- `_classify_and_sync` now performs exactly one corrective re-sync when the
+  fine classifier corrects the coarse label: it evaluates the matched-filter +
+  lattice-fit synchronizer against the corrected modulation's own ideal lattice
+  and keeps it only when it is *materially* better (≥5% tighter by the same
+  lattice-fit criterion the synchronizer optimizes — a marginal gain keeps the
+  primary chain so the recovered symbol count cannot flip on noise). Recorded
+  as `synchronization.refinement` and `classification.stage="fine_refined"`.
+- `core/synchronization.py::synchronize_qam_signal` gained optional
+  `lattice`/`lattice_label` (default: the 16-QAM grid, so existing behaviour is
+  bit-identical) and its timing/phase stages score against that lattice;
+  `lattice_fit_score` is public now so callers can compare candidate runs.
+
+**6. Found and fixed: PSK ambiguity search was too narrow**
+- The BER and codeword-alignment searches only tried 90-degree folds for QPSK.
+  The axis-aligned twin of the diagonal QPSK lattice is an equally valid
+  quadrature lattice and a blind M-th-power estimate can lock onto either, so
+  both searches now try 45-degree steps; 8-PSK — previously compared directly,
+  with no fold or origin search, capping its BER near 0.45 — got the same
+  rotation × origin treatment. Symbol-origin search widened to ±24 symbols.
+
+**Verified this session**
+- Full suite from `prototype/`: `QT_QPA_PLATFORM=offscreen python -m pytest
+  tests -q` → **482 passed** (was 481; +1 new test), 2 pre-existing scipy
+  warnings, ~69 s.
+- End-to-end on all 10 `demo_cases()` (1:1 reference supplied): cases 0-4
+  (16-QAM, uncoded + conv12/RS/concatenated, block + pseudo-random) report
+  measured BER 0-0.003 with `AUTO_DETECTED` interleaving or
+  `NONE (no deinterleaving required)`; cases 5-8 (uncoded QPSK, no/block/
+  convolutional/diagonal interleaving) now classify as **QPSK** and report
+  **BER 0.00** with `NONE (no deinterleaving required)`.
+- GUI offscreen (`spectra_demo_*.wav` written by the demo fixture, ML on):
+  `Interleaving: NONE (no deinterleaving required)`,
+  `Detected type: none required (received bits already match the reference)`,
+  `BER: 0 (0/1004 bits)`,
+  `ML Prediction: QPSK (97%) — from DSP analysis (CNN said 64QAM)`, symbols
+  dialog 510 points, bits dialog 2 streams (1020 / 1004 bits).
+- FSK demo: measured BER 0.00 (0/1000), interleaving `NONE`.
+
+**Remaining limitations (honest)**
+- The 8-PSK demo capture still classifies as 16-QAM (58.7% confidence) in both
+  the coarse and the fine stage, so no corrective re-sync triggers and its BER
+  row stays an EVM estimate (`not measured (no reference)`). Fixing it means a
+  multi-hypothesis sync/classification pass (try a constant-modulus hypothesis
+  with a better lattice fit when the QAM hypothesis is weak) — a real feature,
+  not a one-liner.
+- Blind (reference-free) interleaver identification is still impossible for
+  uncoded captures by construction: the received stream *is* the transmitted
+  stream, so only FEC structure (or a payload reference) carries the
+  permutation. The GUI says exactly that instead of `UNRESOLVED`.
+- BFSK has no EVM estimate (its information is in frequency, not the
+  constellation); its row reads the measured BER when a reference exists.
+- The CNN is still unvalidated; the ML row now mirrors the DSP class, and the
+  network's own answer stays visible after the dash and in the JSON.
+
+---
+
+## Session 17 (2026-09-30) — closed the last "unresolved" row and repaired the ML fallback
+
+**Found and fixed (3 regressions / dead ends, all with tests)**
+1. `_format_ml_summary` had lost its mirror text: when a payload carried no explicit
+   `display_class`/`display_source` (older or partial result), the unvalidated
+   branch fell back to the CNN's `predicted_class` and appended a dangling ` )`.
+   The previous full-suite run was `2 failed, 486 passed` because of it; the fallback
+   now prefers the DSP classification, labels it `— from DSP analysis (CNN said ...)`,
+   and a mirror only ever shows the mirror's own confidence.
+2. The reference-validated joint search resolved and decoded the scheme but never
+   wrote `demodulation["fec_identification"]`, so the GUI/JSON "Auto FEC" row read
+   `not run` on captures that had just been decoded (`16-QAM concatenated+block`,
+   `reedsolomon+block`, ...). `analyze_samples` now stores the accepted reference
+   identification there with `confirmed_by="reference_payload_agreement"`.
+3. The Auto FEC row printed the identification score (0-100) without a `%` and
+   would have printed `confidence 0` for a 0-1 fraction; it normalizes both scales
+   and renders a percentage.
+
+**Verified**
+- Full suite from `prototype/`: `QT_QPA_PLATFORM=offscreen python -m pytest tests -q`
+  → **490 passed** (2 pre-existing scipy warnings), ~2:20.
+- End-to-end offscreen (`/c/tmp/spectra_gui_check3.py`): case 3 → interleaving
+  `AUTO_DETECTED block/8`, `Auto FEC: concatenated (confidence 83%)`, measured
+  `BER: 0 (0/2576 bits) | post-FEC 0`, ML mirror
+  `16-QAM (96%) — from DSP analysis (CNN said OOK)`; symbols dialog 642 points,
+  bits dialog 4 streams (received / aligned / deinterleaved / FEC-decoded).
+- Cases 5 and 8 (QPSK) measure BER 0.00 with `NONE (no deinterleaving required)`;
+  case 0 (16-QAM uncoded) measures 0.003; case 9 (8-PSK mislabelled 16-QAM) keeps
+  an EVM estimate by design but now explains every row.
+
+**Still open (unchanged from Session 16)**
+- 8-PSK misclassification needs a multi-hypothesis sync/classification pass.
+- Blind interleaver identification for uncoded captures is impossible by
+  construction (the GUI says so instead of `UNRESOLVED`).
+
+---
+
+## Session 18 (2026-10-05) — final cleanup, docs refresh, clean push — VERIFIED
+
+**Goal:** make the branch commit-ready: remove dead code, ignore scratch
+artifacts, bring README/user guides/validation docs to the actual final
+state, then commit and push everything that belongs to the feature.
+
+**Cleanup (files removed)**
+- Empty stubs `modulation/{psk,qam,fsk}.py` (0 lines, unreferenced;
+  kernels live in `modulation/demodulator.py` + `modulation/digital.py`).
+- `ml/dataset_v1.py` (superseded by `ml/dataset.py` + `ml/split.py`,
+  no references anywhere).
+- Uncollected probe scripts `tests/{constellation_test,constellation_snr_test,snr_benchmark}.py`
+  (do not match `test_*.py`; functionality covered by the suite).
+- ML training scratch on disk: `ml/_candidate_v2/v3_A/v3_B/v3_C`,
+  `_legacy_*`, `_pre_v3_*`, `_retrain_*` (~70 MB of superseded
+  artifacts) and the root `gui_qam16_analysis.json` export.
+
+**Ignore rules added (root `.gitignore`)**
+- `.freebuff/`, `/*_analysis.json`, `prototype/ml/_*.npz` +
+  `prototype/ml/_*.config.json`, and an explicit
+  `!prototype/docs/evidence/*.png` so the evidence figure is not
+  swallowed by the global `*.png` ignore.
+
+**Docs brought to the final state**
+- `README.md` rewritten: feature overview (6 FEC schemes, 4 interleaver
+  families, frame layer, GNU Radio bridge, ML v3, GUI), updated quick
+  start incl. `ml-train`/`ml-eval`/`dataset-*`, corrected architecture
+  tree, docs index incl. the deck + evidence pack.
+- `docs/USER_GUIDE.md`: §2 GUI steps (inspectors, FEC/interleaving/frame
+  controls, theme), §4 BER (45°/90° folds, 8-PSK, ±24 symbols, EVM
+  estimate), §9 (7-scheme registry, decoder-evidence scoring, joint
+  reference-validated search, fixed CLI examples), §10 ML rewritten for
+  the v3 artifact (declared holdout ≈0.83 > 0.60 floor → validated; fixed
+  the self-referential `config.ml` snippet), new §12 GNU Radio, §13
+  external dataset, §14 checklist; fixed the `spectrum_samples` typo.
+- `docs/GUI_USER_GUIDE.md`: toolbar reflects the real controls (Source,
+  Interleaving mode/family/depth, FEC mode/scheme, Frame search, theme),
+  §9 FEC modes + 6 schemes, §10 EVM estimate, §15 ML honesty +
+  inspectors, §14 limitations corrected (AUTO *does* exist now), new
+  §17 GNU Radio tab; sections renumbered 16/17/18.
+- `docs/VALIDATION.md`: header now records this run (538 passed),
+  §3b external/public-benchmark inputs, limitations 6-9 corrected (frame
+  layer + ML exist, GUI worker exists, CI exists).
+- `docs/SIH_REQUIREMENTS.md`: 538 tests, 2.2.0, GNU Radio viz + theme
+  rows, honest 🟡 for external validation.
+- `docs/ARCHITECTURE.md`: repaired the mangled data-flow diagram, added
+  module rows (fec/identification*, io/gnuradio, gui/theme, ml, external
+  validation) and an "optional integrations are never required
+  dependencies" design note.
+- `prototype/docs/evidence/EVIDENCE.md`: explicit snapshot notice
+  (generated at `8b697cc`, 435 tests) + R08 no longer cites the deleted
+  empty modules; deck pack and PUBLIC_DATASET note that
+  `tools/sih_deck/*` generators are not shipped.
+- `CHANGELOG.md` [Unreleased]: cleanup + docs + first-time-tracked list.
+- `pyproject.toml`: version 2.1.0 → 2.2.0 to match
+  `prototype.__version__` (it had drifted).
+
+**Verified**
+- `QT_QPA_PLATFORM=offscreen python -m pytest tests -q` → **538 passed,
+  2 pre-existing scipy warnings**, ~165 s (before and after the cleanup;
+  the deleted files were unreferenced).
+
+**Honest notes**
+- `docs/evidence/` and the deck are frozen artifacts of commit 8b697cc;
+  they say so. Current status lives in SIH_REQUIREMENTS/VALIDATION.
+- The `.h5` dataset (~833 MB) stays local and gitignored; only its
+  README/config ship.
+- Sessions 15-17's ML v3, GNU Radio viz, theme and read-out work were
+  previously uncommitted — this push is the first commit that carries
+  them.

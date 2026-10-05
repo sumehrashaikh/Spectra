@@ -131,6 +131,310 @@ def _timing_only_sync(isolated: Signal, symbol_rate: float) -> Signal:
     return synchronize_signal(isolated, symbol_rate=symbol_rate).signal
 
 
+def _synchronize_for_modulation(
+    modulation: str | None,
+    isolated: Signal,
+    symbol_rate: float,
+    prefer_lattice: bool = False,
+    order: int | None = None,
+):
+    """Run the synchronizer that belongs to ``modulation``.
+
+    One dispatch point shared by the initial synchronization and the
+    corrective re-sync: square-QAM uses the lattice-fit synchronizer,
+    constant-envelope PSK uses the M-th power carrier/timing chain, and
+    envelope/FSK modulations have no carrier stage of their own.
+    Returns a ``FullSynchronizationResult`` (``.signal`` is the
+    synchronized Signal) or ``None`` when the modulation has no
+    constellation whose synchronization could be refined.
+
+    ``prefer_lattice`` (used by the corrective re-sync) also evaluates the
+    matched-filter + lattice-fit synchronizer against the modulation's own
+    ideal lattice and keeps whichever run yields the tighter constellation.
+    The criterion is the same lattice-fit score the synchronizer optimizes,
+    so the choice is evidence, not a guess; the M-th power chain remains the
+    default for PSK when it wins or when the lattice run is unavailable.
+    """
+    from prototype.core.synchronization import (
+        lattice_fit_score,
+        synchronize_qam_signal,
+        synchronize_signal as full_sync,
+    )
+
+    if modulation == "16-QAM":
+        return synchronize_qam_signal(isolated, symbol_rate=symbol_rate)
+
+    # ``order`` lets the caller supply the M-th power order it already
+    # resolved (an unclassified waveform is synchronized as 4th-power by
+    # the caller's fallback, and must keep that behaviour here).
+    effective_order = order if order is not None else _modulation_order(modulation)
+    if effective_order is None:
+        return None  # OOK / FSK: no carrier-phase constellation to refine
+
+    generic_result = full_sync(
+        isolated, symbol_rate=symbol_rate, modulation_order=effective_order
+    )
+
+    lattice = _IDEAL_CONSTELLATIONS.get(modulation)
+    if not prefer_lattice or lattice is None:
+        return generic_result
+
+    try:
+        lattice_result = synchronize_qam_signal(
+            isolated,
+            symbol_rate=symbol_rate,
+            lattice=lattice,
+            lattice_label=modulation,
+        )
+    except Exception:  # refinement is optional: keep the generic chain
+        return generic_result
+
+    generic_score = lattice_fit_score(
+        np.asarray(generic_result.signal.samples), lattice
+    )
+    lattice_score = lattice_fit_score(
+        np.asarray(lattice_result.signal.samples), lattice
+    )
+
+    # Only a *material* improvement replaces the primary chain: the two
+    # synchronizers trim slightly different numbers of transient symbols, so
+    # a coin-flip decision would make the recovered symbol count (and with
+    # it every downstream length) depend on noise.  5% is well below the
+    # gap seen where the lattice run is genuinely right (measured ~5x on
+    # the demo captures) and well above run-to-run noise on a clean signal.
+    if lattice_score < 0.95 * generic_score:
+        return lattice_result
+    return generic_result
+
+
+def _synchronization_summary(sync_result) -> dict[str, Any]:
+    """JSON-safe summary of one synchronization run."""
+    synchronized_signal = sync_result.signal
+    metadata = getattr(synchronized_signal, "metadata", {}) or {}
+    return {
+        "symbol_rate_hz": float(sync_result.symbol_rate),
+        "samples_per_symbol": float(sync_result.samples_per_symbol),
+        "timing_offset": int(sync_result.timing_offset),
+        "timing_confidence": float(sync_result.timing_confidence),
+        "frequency_offset_hz": float(metadata.get("frequency_offset", 0.0)),
+        "frequency_confidence": float(metadata.get("frequency_confidence", 0.0)),
+        "phase_offset_rad": float(metadata.get("phase_offset", 0.0)),
+        "phase_confidence": float(metadata.get("phase_confidence", 0.0)),
+    }
+
+
+# Phase conventions the blind receiver cannot distinguish, per lattice.
+# QPSK is the interesting one: the diagonal grid (45/135/225/315) and its
+# 45-degree twin (0/90/180/270) are equally valid quadrature lattices and
+# a blind M-th-power phase estimate may lock onto either, so the
+# reference-free quality estimate measures the error vector against the
+# closer one.  The other lattices map onto themselves under the
+# alternatives that matter, so the extra phase is a no-op for them.
+_IDEAL_PHASE_ALTERNATIVES: dict[str, tuple[float, ...]] = {
+    "QPSK": (0.0, 45.0),
+}
+
+# Ideal unit-average-power constellations used for the reference-free
+# quality estimate.  BFSK/OOK are absent: their information lives in
+# frequency/amplitude, where EVM is not defined the same way.
+_IDEAL_CONSTELLATIONS: dict[str, np.ndarray] = {
+    "BPSK": np.array([1.0, -1.0], dtype=complex),
+    "QPSK": np.exp(1j * (np.pi / 4.0 + np.arange(4) * np.pi / 2.0)),
+    "8-PSK": np.exp(
+        1j * (2 * np.arange(8) + 1) * np.pi / 8.0
+    ),
+    "16-QAM": (
+        np.array(
+            [complex(i, q) for i in (-3, -1, 1, 3) for q in (-3, -1, 1, 3)]
+        )
+        / np.sqrt(10.0)
+    ),
+}
+
+#: bits carried by one symbol, per modulation (for the Eb/N0 conversion).
+_BITS_PER_SYMBOL: dict[str, int] = {
+    "BPSK": 1,
+    "QPSK": 2,
+    "8-PSK": 3,
+    "16-QAM": 4,
+    "OOK": 1,
+    "BFSK": 1,
+}
+
+
+def _mirror_ml_display(
+    ml_result: dict[str, Any],
+    classification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Mirror the deterministic classification into the ML display fields.
+
+    Used when the CNN's argmax must not be presented as the ML verdict.
+    Rather than showing "evidence only" (or, worse, a confident wrong
+    class), the ML row shows the classification the DSP chain actually
+    produced, and the CNN's own answer stays in ``ml_raw_class``/``top3``
+    so the JSON export and provenance still record what the network said
+    (when it said anything at all).
+
+    Three distinct situations reach here, and the note must not conflate
+    them:
+
+    * **inference never ran** - the capture is shorter than one artifact
+      frame, so no CNN output exists to withhold.  The note says the stage
+      skipped inference and names the frame length.  A *validated*
+      artifact must never be called "unvalidated" here;
+    * **inference ran, artifact validated, scores below the floors** - the
+      verdict is withheld for this capture on confidence/agreement
+      grounds, which is a per-capture gate, not a training one;
+    * **inference ran, artifact unvalidated** - the historical case, where
+      the training-level gate is what withholds the verdict.
+
+    Returns ``None`` when there is no DSP classification to mirror.
+    """
+    modulation = str((classification or {}).get("modulation") or "").strip()
+    if not modulation or modulation == "Unknown":
+        return None
+    if str(ml_result.get("presented_as", "evidence")) == "prediction":
+        # A genuinely validated model keeps its own verdict.
+        return None
+
+    confidence = (classification or {}).get("confidence")
+    try:
+        display_confidence = float(confidence) / 100.0
+    except (TypeError, ValueError):
+        display_confidence = ml_result.get("confidence", 0.0)
+
+    inference_ran = bool(ml_result.get("num_frames")) and (
+        ml_result.get("predicted_class") is not None
+    )
+    validated = bool(ml_result.get("validated", False))
+    frame_length = ml_result.get("frame_length")
+
+    if not inference_ran:
+        # No CNN output exists, so nothing is being withheld here.  The
+        # stage's own note is the reason (``ml.cnn.predict_modulation``
+        # knows the frame length authoritatively); this only adds what is
+        # being displayed instead, and keeps a copy in ``raw_note`` below.
+        reason = str(ml_result.get("note") or "").strip()
+        if not reason:
+            reason = (
+                "ML stage skipped inference: no complete "
+                f"{frame_length}-sample frame was available."
+                if frame_length
+                else "ML stage skipped inference: no complete frame was "
+                "available."
+            )
+        note = (
+            f"{reason} The displayed class is the deterministic DSP "
+            "classification."
+        )
+    elif validated:
+        note = (
+            "The CNN's scores for this capture did not clear the "
+            "confidence/agreement floors, so the displayed class is the "
+            "deterministic DSP classification rather than the network's "
+            "argmax (kept in ml_raw_class)."
+        )
+    else:
+        note = (
+            "CNN output is unvalidated; the displayed class is the "
+            "deterministic classification, not the network's argmax "
+            "(kept in ml_raw_class)."
+        )
+
+    return {
+        "display_class": modulation,
+        "display_confidence": float(display_confidence),
+        "display_source": "dsp_mirror",
+        "mirrored_from_dsp": True,
+        "inference_ran": inference_ran,
+        "ml_raw_class": ml_result.get("predicted_class"),
+        "raw_note": ml_result.get("note"),
+        "note": note,
+    }
+
+
+def _estimate_link_quality(
+    modulation: str | None,
+    synchronized_signal: Signal | None,
+) -> dict[str, Any] | None:
+    """Reference-free link quality from the recovered constellation.
+
+    BER cannot be *measured* without a transmitted reference, but it can
+    be estimated from the error-vector magnitude of the synchronized
+    symbol cloud (a standard receiver figure).  The estimate is derived
+    here and labelled ``method="evm_estimate"`` so it is never confused
+    with a measured BER.
+
+    Returns ``None`` for mappings where EVM is not meaningful (FSK) or
+    when no synchronized symbols are available.
+    """
+    if synchronized_signal is None or modulation not in _IDEAL_CONSTELLATIONS:
+        return None
+
+    symbols = np.asarray(synchronized_signal.samples, dtype=np.complex128)
+    if symbols.size < 8:
+        return None
+
+    ideal = _IDEAL_CONSTELLATIONS[modulation]
+    power = float(np.mean(np.abs(symbols) ** 2))
+    if not np.isfinite(power) or power <= 1e-30:
+        return None
+
+    # Amplitude-invariant comparison: match the mean symbol power of the
+    # ideal lattice before measuring the error vector.
+    ideal_power = float(np.mean(np.abs(ideal) ** 2))
+    scaled = symbols * np.sqrt(ideal_power / power)
+
+    # The blind receiver knows the lattice only up to the phase
+    # conventions it cannot observe, so the error vector is measured
+    # against the closest *admissible* lattice phase; otherwise a
+    # convention difference (e.g. QPSK on 0/90 vs the ideal 45/135) would
+    # be reported as a huge EVM on a perfectly clean capture.  BPSK,
+    # 8-PSK and 16-QAM are already invariant under the alternatives that
+    # matter, so this only changes QPSK.
+    best_evm = None
+    for phase_deg in _IDEAL_PHASE_ALTERNATIVES.get(modulation, (0.0,)):
+        candidate = ideal * np.exp(1j * np.deg2rad(phase_deg))
+        distances = np.abs(scaled[:, None] - candidate[None, :])
+        nearest = distances.argmin(axis=1)
+        error = scaled - candidate[nearest]
+        value = float(
+            np.sqrt(np.mean(np.abs(error) ** 2) / np.mean(np.abs(candidate) ** 2))
+        )
+        if best_evm is None or value < best_evm:
+            best_evm = value
+
+    evm = float(best_evm if best_evm is not None else 1.0)
+    evm = max(evm, 1e-6)
+
+    snr_linear = 1.0 / (evm**2)
+    snr_db = float(10.0 * np.log10(snr_linear))
+
+    # Standard AWGN conversion: Eb/N0 = SNR / (bits per symbol), and
+    # BER = Q(sqrt(2 * Eb/N0)) for the Gray-mapped constellations used
+    # here.  Reported as an estimate, clamped to the 0.5 floor.
+    from scipy.special import erfc
+
+    bits_per_symbol = _BITS_PER_SYMBOL.get(modulation, 1)
+    eb_n0 = snr_linear / max(bits_per_symbol, 1)
+    ber = 0.5 * float(erfc(np.sqrt(eb_n0)))
+
+    return {
+        "method": "evm_estimate",
+        "modulation": modulation,
+        "evm": evm,
+        "evm_percent": 100.0 * evm,
+        "snr_db": snr_db,
+        "ber_estimate": float(min(max(ber, 0.0), 0.5)),
+        "bits_per_symbol": bits_per_symbol,
+        "symbols_compared": int(symbols.size),
+        "note": (
+            "EVM-based estimate from the recovered constellation, not a "
+            "measured BER (no transmitted reference was supplied)."
+        ),
+    }
+
+
 def _summary_symbols(samples: np.ndarray, max_points: int = 4) -> dict[str, float]:
     """Tiny constellation summary for reports (keeps JSON small)."""
     if samples.size == 0:
@@ -158,7 +462,6 @@ def _classify_and_sync(
         estimate_symbol_rate,
         estimate_symbol_rate_fsk,
     )
-    from prototype.core.synchronization import synchronize_signal as full_sync
 
     # ---- coarse classification on the isolated baseband waveform ----
     coarse = classify_signal(isolated, use_constellation=False, synchronized=False)
@@ -231,44 +534,16 @@ def _classify_and_sync(
     # M-th-power phase estimate is data-dependent on QAM (arbitrary
     # mis-rotation) and the magnitude-variation timing metric has no
     # peak on amplitude-modulated carriers (arbitrary origin).
-    if modulation == "16-QAM":
-        from prototype.core.synchronization import synchronize_qam_signal
-
-        sync_result = synchronize_qam_signal(
-            isolated,
-            symbol_rate=rate_estimate.symbol_rate,
-        )
-    # OOK uses timing-only sync (no carrier phase recovery);
-    # every other modulation uses the carrier+timing chain.
-    elif order is not None:
-        sync_result = full_sync(
-            isolated,
-            symbol_rate=rate_estimate.symbol_rate,
-            modulation_order=order,
+    # OOK uses timing-only sync (no carrier phase recovery); every other
+    # modulation uses the carrier+timing chain.
+    if modulation == "16-QAM" or order is not None:
+        sync_result = _synchronize_for_modulation(
+            modulation, isolated, rate_estimate.symbol_rate, order=order
         )
     else:
         sync_result = _timing_only_sync(isolated, rate_estimate.symbol_rate)
 
     synchronized_signal = sync_result.signal
-
-    synchronization_summary = {
-        "symbol_rate_hz": float(sync_result.symbol_rate),
-        "samples_per_symbol": float(sync_result.samples_per_symbol),
-        "timing_offset": int(sync_result.timing_offset),
-        "timing_confidence": float(sync_result.timing_confidence),
-        "frequency_offset_hz": float(
-            synchronized_signal.metadata.get("frequency_offset", 0.0)
-        ),
-        "frequency_confidence": float(
-            synchronized_signal.metadata.get("frequency_confidence", 0.0)
-        ),
-        "phase_offset_rad": float(
-            synchronized_signal.metadata.get("phase_offset", 0.0)
-        ),
-        "phase_confidence": float(
-            synchronized_signal.metadata.get("phase_confidence", 0.0)
-        ),
-    }
 
     # ---- fine classification on synchronized symbols ----
     fine = classify_signal(
@@ -282,11 +557,68 @@ def _classify_and_sync(
             "using coarse waveform result."
         )
 
+    # ---- corrective re-synchronization --------------------------------
+    # The synchronizer is picked from the *coarse* waveform label, but the
+    # fine (constellation-domain) classifier regularly corrects that label.
+    # The two synchronizers optimize different criteria, so a capture
+    # labelled 16-QAM coarsely and QPSK finely is first synchronized on the
+    # wrong lattice: the sampling phase it lands on is wrong for QPSK and
+    # the recovered cloud is smeared (measured: ~3x the lattice distance of
+    # a correct run).  When the fine label differs from the one the
+    # synchronizer was chosen for, re-run synchronization once with the
+    # corrected label and re-classify on the refined symbols.  Exactly one
+    # corrective pass: a second disagreement is recorded, never looped.
+    refine: dict[str, Any] | None = None
+    if (
+        fine.modulation not in (None, "Unknown", "BFSK")
+        and fine.modulation != modulation
+    ):
+        refined_result = None
+        try:
+            refined_result = _synchronize_for_modulation(
+                fine.modulation,
+                isolated,
+                rate_estimate.symbol_rate,
+                prefer_lattice=True,
+            )
+        except Exception as exc:  # refinement is optional, never fatal
+            warnings.append(f"Synchronization refinement failed: {exc}")
+
+        if refined_result is not None:
+            refined_fine = classify_signal(
+                refined_result.signal,
+                use_constellation=True,
+                synchronized=True,
+            )
+            accepted = refined_fine.modulation not in (None, "Unknown")
+            refine = {
+                "coarse_label": coarse.modulation,
+                "synchronized_as": modulation,
+                "fine_label_before": fine.modulation,
+                "fine_label_after": refined_fine.modulation,
+                "method": str(
+                    (getattr(refined_result.signal, "metadata", {}) or {}).get(
+                        "lattice"
+                    )
+                    and "lattice_fit"
+                    or "mth_power"
+                ),
+                "accepted": bool(accepted),
+            }
+            if accepted:
+                sync_result = refined_result
+                synchronized_signal = refined_result.signal
+                fine = refined_fine
+
+    synchronization_summary = _synchronization_summary(sync_result)
+    if refine is not None:
+        synchronization_summary["refinement"] = refine
+
     classification_summary = {
         "modulation": fine.modulation,
         "confidence": float(fine.confidence),
         "method": fine.method,
-        "stage": "fine",
+        "stage": "fine" if refine is None else "fine_refined",
         "coarse_result": {
             "modulation": coarse.modulation,
             "confidence": float(coarse.confidence),
@@ -480,12 +812,19 @@ def _resolve_codeword_alignment(
     best_label = "raw demodulated bits"
     best_ber = raw_errors / raw_compared
 
-    def _consider(candidate: np.ndarray, label: str) -> None:
+    def _consider(
+        candidate: np.ndarray,
+        label: str,
+        reference_view: np.ndarray | None = None,
+    ) -> None:
         nonlocal best_bits, best_errors, best_label, best_ber
         info["candidates_tried"] = int(info["candidates_tried"]) + 1
-        errors, compared = _errors(candidate)
-        if compared == 0:
+        view = reference if reference_view is None else reference_view
+        n = min(candidate.size, view.size)
+        if n == 0:
             return
+        errors = int(np.count_nonzero(candidate[:n] != view[:n]))
+        compared = n
         candidate_ber = errors / compared
         if errors < best_errors and candidate_ber < best_ber:
             best_bits = candidate
@@ -495,18 +834,36 @@ def _resolve_codeword_alignment(
 
     symbols = np.asarray(synchronized_signal.samples)
 
-    if modulation in ("QPSK", "16-QAM"):
-        # Square PSK/QAM mappings leave a 90-degree phase fold and an
+    if modulation in ("QPSK", "8-PSK", "16-QAM"):
+        # Square PSK/QAM mappings leave a phase fold and an
         # integer-symbol origin ambiguity (pulse-shaping group delay), so
         # both are searched in whole symbols.  This reuses the demodulator
         # helpers the BER stage uses, so the resolved stream is exactly the
         # one BER reports on.
+        #
+        # The fold step follows the constellation: 16-QAM is symmetric
+        # under 90 degrees, QPSK additionally has the axis-aligned twin of
+        # its diagonal lattice (45-degree step), and 8-PSK maps onto
+        # itself under 45 degrees while shifting the Gray labels.
         if modulation == "QPSK":
             from prototype.modulation.demodulator import qpsk_decision
 
             decision = qpsk_decision
             symbols_for_search = symbols
             bits_per_symbol = 2
+            fold_step_rad = np.pi / 4.0
+            fold_count = 8
+        elif modulation == "8-PSK":
+            from prototype.modulation.digital import (
+                normalize_psk8_symbols,
+                psk8_decision,
+            )
+
+            decision = psk8_decision
+            symbols_for_search = normalize_psk8_symbols(symbols)
+            bits_per_symbol = 3
+            fold_step_rad = np.pi / 4.0
+            fold_count = 8
         else:
             from prototype.modulation.demodulator import (
                 normalize_qam16_symbols,
@@ -516,11 +873,13 @@ def _resolve_codeword_alignment(
             decision = qam16_decision
             symbols_for_search = normalize_qam16_symbols(symbols)
             bits_per_symbol = 4
+            fold_step_rad = np.pi / 2.0
+            fold_count = 4
 
-        max_offset = min(16, max(0, symbols_for_search.size - 1))
+        max_offset = min(24, max(0, symbols_for_search.size - 1))
 
-        for k in range(4):
-            rotated = symbols_for_search * np.exp(1j * k * np.pi / 2.0)
+        for k in range(fold_count):
+            rotated = symbols_for_search * np.exp(1j * k * fold_step_rad)
             rot_bits, _, _ = decision(rotated)
             rot_bits = np.asarray(rot_bits, dtype=np.uint8)
             if rot_bits.size == 0:
@@ -529,15 +888,26 @@ def _resolve_codeword_alignment(
                 candidate = rot_bits ^ 1 if inverted else rot_bits
                 for sym_off in range(-max_offset, max_offset + 1):
                     shift = bits_per_symbol * sym_off
-                    shifted = candidate[shift:] if shift >= 0 else candidate
-                    if shifted.size == 0:
+                    # The origin ambiguity is two-sided: a positive offset
+                    # advances the candidate past the reference start, a
+                    # negative offset advances the reference past the
+                    # candidate start.  Ignoring the negative side (the
+                    # previous behaviour) could not reach the true origin.
+                    if shift >= 0:
+                        shifted = candidate[shift:]
+                        view = reference
+                    else:
+                        shifted = candidate
+                        view = reference[bits_per_symbol * (-sym_off):]
+                    if shifted.size == 0 or view.size == 0:
                         continue
                     label = (
-                        f"{modulation} rotation {k * 90} deg, "
+                        f"{modulation} rotation "
+                        f"{np.rad2deg(k * fold_step_rad):.0f} deg, "
                         f"origin {sym_off:+d} symbols"
                         f"{' + inversion' if inverted else ''}"
                     )
-                    _consider(shifted, label)
+                    _consider(shifted, label, view)
 
     else:
         # Polarity is the only blind ambiguity for the remaining mappings.
@@ -575,8 +945,9 @@ def _evaluate_ber(
 ) -> dict[str, Any] | None:
     """
     BER against a reference, handling blind ambiguity honestly:
-    BPSK polarity and QPSK 90-degree rotation are searched and the
-    best case reported with the applied correction noted.
+    the polarity (BPSK), the 90-degree lattice fold plus the axis-aligned
+    twin of the QPSK/M-PSK lattice, and the symbol origin are searched; the
+    best case is reported with the applied correction noted.
     """
     from prototype.modulation.demodulator import calculate_ber, qpsk_decision
 
@@ -591,6 +962,7 @@ def _evaluate_ber(
         best = min(report["direct_ber"], report["inverted_ber"])
         return {
             "modulation": "BPSK",
+            "status": "measured",
             "compared_bits": int(report["compared_bits"]),
             "bit_errors": int(
                 report["direct_errors"]
@@ -599,35 +971,132 @@ def _evaluate_ber(
             ),
             "ber": float(best),
             "ambiguity_resolution": "polarity search (0/180 deg)",
+            "reference_domain": "transmitted bits as demodulated (pre-FEC)",
         }
 
     if modulation == "QPSK" and synchronized_signal is not None:
+        # QPSK has the same blind ambiguity structure as 16-QAM: a 90-degree
+        # phase fold (lattice-preserving) plus a whole-symbol origin offset
+        # from pulse-shaping group delay.  Both must be searched against the
+        # reference, or a resolvable stream is reported at ~0.5 BER.
+        #
+        # One extra fold is needed for QPSK specifically: the blind
+        # M-th-power phase estimate resolves the carrier only modulo 90
+        # degrees, and the *axis-aligned* square lattice (0/90/180/270) is
+        # the twin of the transmitted diagonal lattice (45/135/225/315).
+        # Both are equally good constant-modulus quadrature lattices, so a
+        # blind receiver can land on either (verified on captures with a
+        # 30-degree impairment: the recovered cloud sat on the axes and the
+        # fixed 90-degree search reported a bogus ~0.24 BER).  45-degree
+        # steps cover both conventions.
         symbols = synchronized_signal.samples
         best_ber = 1.0
         best_rotation = 0.0
+        best_offset = 0
         best_errors = None
-        for k in range(4):
-            rotated = symbols * np.exp(1j * k * np.pi / 2.0)
+        best_compared = 0
+        max_offset = min(24, max(0, symbols.size - 1))
+        for k in range(8):
+            rotated = symbols * np.exp(1j * k * np.pi / 4.0)
             rot_bits, _, _ = qpsk_decision(rotated)
-            report = calculate_ber(rot_bits, reference_bits)
-            candidate_ber = min(report["direct_ber"], report["inverted_ber"])
-            if candidate_ber < best_ber:
-                best_ber = candidate_ber
-                best_rotation = float(k * 90.0)
-                best_errors = (
-                    report["direct_errors"]
-                    if report["direct_ber"] <= report["inverted_ber"]
-                    else report["inverted_errors"]
-                )
+            rot_bits = np.asarray(rot_bits, dtype=np.uint8)
+            if rot_bits.size == 0:
+                continue
+            for sym_off in range(-max_offset, max_offset + 1):
+                shift = 2 * sym_off
+                if shift >= 0:
+                    candidate = rot_bits[shift:]
+                    view = reference_bits
+                else:
+                    candidate = rot_bits
+                    view = reference_bits[2 * (-sym_off):]
+                if candidate.size == 0 or view.size == 0:
+                    continue
+                report = calculate_ber(candidate, view)
+                candidate_ber = min(report["direct_ber"], report["inverted_ber"])
+                if candidate_ber < best_ber:
+                    best_ber = candidate_ber
+                    best_rotation = float(k * 45.0)
+                    best_offset = sym_off
+                    best_errors = (
+                        report["direct_errors"]
+                        if report["direct_ber"] <= report["inverted_ber"]
+                        else report["inverted_errors"]
+                    )
+                    best_compared = int(report["compared_bits"])
         compared = min(len(bits), len(reference_bits))
         return {
             "modulation": "QPSK",
-            "compared_bits": int(compared),
+            "status": "measured",
+            "compared_bits": int(best_compared or compared),
             "bit_errors": int(best_errors) if best_errors is not None else None,
             "ber": float(best_ber),
             "ambiguity_resolution": (
-                f"rotation search (applied {best_rotation:.0f} deg)"
+                f"rotation x origin search "
+                f"(applied {best_rotation:.0f} deg, {best_offset:+d} symbols)"
             ),
+            "reference_domain": "transmitted bits as demodulated (pre-FEC)",
+        }
+
+    if modulation == "8-PSK" and synchronized_signal is not None:
+        # 8-PSK's blind phase estimate is ambiguous modulo 45 degrees (the
+        # constellation maps onto itself under a 45-degree rotation while
+        # the Gray labels shift), so the decision device is evaluated at all
+        # eight folds against the reference, together with the symbol-origin
+        # search.  Without a reference the fold is unobservable and the
+        # pipeline reports the estimate instead.
+        from prototype.modulation.digital import (
+            normalize_psk8_symbols,
+            psk8_decision,
+        )
+
+        symbols = normalize_psk8_symbols(synchronized_signal.samples)
+        best_ber = 1.0
+        best_rotation = 0.0
+        best_offset = 0
+        best_errors = None
+        best_compared = 0
+        max_offset = min(24, max(0, symbols.size - 1))
+        for k in range(8):
+            rotated = symbols * np.exp(1j * k * np.pi / 4.0)
+            rot_bits, _, _ = psk8_decision(rotated)
+            rot_bits = np.asarray(rot_bits, dtype=np.uint8)
+            if rot_bits.size == 0:
+                continue
+            for sym_off in range(-max_offset, max_offset + 1):
+                shift = 3 * sym_off
+                if shift >= 0:
+                    candidate = rot_bits[shift:]
+                    view = reference_bits
+                else:
+                    candidate = rot_bits
+                    view = reference_bits[3 * (-sym_off):]
+                if candidate.size == 0 or view.size == 0:
+                    continue
+                report = calculate_ber(candidate, view)
+                candidate_ber = min(report["direct_ber"], report["inverted_ber"])
+                if candidate_ber < best_ber:
+                    best_ber = candidate_ber
+                    best_rotation = float(k * 45.0)
+                    best_offset = sym_off
+                    best_errors = (
+                        report["direct_errors"]
+                        if report["direct_ber"] <= report["inverted_ber"]
+                        else report["inverted_errors"]
+                    )
+                    best_compared = int(report["compared_bits"])
+        compared = min(len(bits), len(reference_bits))
+        return {
+            "modulation": "8-PSK",
+            "status": "measured",
+            "compared_bits": int(best_compared or compared),
+            "bit_errors": int(best_errors) if best_errors is not None else None,
+            "ber": float(best_ber),
+            "ambiguity_resolution": (
+                f"rotation x origin search "
+                f"(applied {best_rotation:.0f} deg, {best_offset:+d} symbols)"
+            ),
+            "reference_domain": "transmitted bits as demodulated (pre-FEC)",
         }
 
     if modulation == "16-QAM" and synchronized_signal is not None:
@@ -693,6 +1162,7 @@ def _evaluate_ber(
 
         return {
             "modulation": "16-QAM",
+            "status": "measured",
             "compared_bits": int(compared),
             "bit_errors": int(best_errors) if best_errors is not None else None,
             "ber": float(best_ber),
@@ -700,17 +1170,269 @@ def _evaluate_ber(
                 f"rotation x origin search "
                 f"(applied {best_rotation:.0f} deg, {best_offset:+d} symbols)"
             ),
+            "reference_domain": "transmitted bits as demodulated (pre-FEC)",
         }
 
     # Remaining modulations: direct comparison (RMS-normalized constellation).
     report = calculate_ber(bits, reference_bits)
     return {
         "modulation": modulation,
+        "status": "measured",
         "compared_bits": int(report["compared_bits"]),
         "bit_errors": int(report["direct_errors"]),
         "ber": float(report["direct_ber"]),
         "ambiguity_resolution": "none (unambiguous mapping)",
+        "reference_domain": "transmitted bits as demodulated (pre-FEC)",
     }
+
+
+def _deinterleave_candidate(
+    bits: np.ndarray,
+    family: str | None,
+    param: int | None,
+    transmitted_length: int,
+) -> np.ndarray:
+    """Invert one interleaver hypothesis (all four families).
+
+    Interleaver geometry is defined by the *transmitted* frame length, so
+    a capture whose tail was lost is zero-filled back to that length
+    before the permutation is inverted - the same partial-frame handling
+    the explicit MANUAL path uses.
+    """
+    arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    if family is None:
+        return arr.copy()
+
+    if arr.size > transmitted_length:
+        arr = arr[:transmitted_length]
+    elif arr.size < transmitted_length:
+        arr = np.concatenate(
+            [arr, np.zeros(transmitted_length - arr.size, dtype=np.uint8)]
+        )
+
+    if family == "block":
+        return deinterleave_bits(
+            arr, depth=int(param), original_size=int(transmitted_length)
+        )
+
+    from prototype.fec.interleaving import (
+        convolutional_deinterleave,
+        diagonal_deinterleave,
+        pseudo_random_deinterleave,
+    )
+
+    if family == "pseudo_random":
+        return pseudo_random_deinterleave(arr, seed=int(param))
+    if family == "convolutional":
+        return convolutional_deinterleave(arr, k=int(param))
+    if family == "diagonal":
+        return diagonal_deinterleave(arr, depth=int(param))
+    raise ValueError(f"unknown interleave family {family!r}")
+
+
+def _stream_matches_reference(
+    bits: np.ndarray | None,
+    reference_bits: np.ndarray | None,
+    max_mismatch_rate: float = 0.02,
+) -> bool:
+    """Whether the received stream already reproduces the reference.
+
+    Used to decide that no deinterleaving step is *required*: when the
+    demodulated stream matches the transmitted stream within
+    ``max_mismatch_rate`` over the overlapping prefix, the receiver can
+    reach the transmitted bits without a deinterleaver.
+    """
+    if bits is None or reference_bits is None:
+        return False
+
+    arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    ref = np.asarray(reference_bits, dtype=np.uint8).reshape(-1)
+    compared = int(min(arr.size, ref.size))
+    if compared < 32:
+        return False
+
+    mismatches = int(np.count_nonzero(arr[:compared] != ref[:compared]))
+    return (mismatches / compared) <= max_mismatch_rate
+
+
+def _interleaver_hypotheses(
+    length: int, max_depth: int = 16
+) -> list[tuple[str, str | None, int | None]]:
+    """Deterministic, bounded ``(label, family, param)`` hypothesis order.
+
+    The no-interleaving hypothesis is tried first (it is the cheapest and
+    the honest default), then the families the receiver implements that
+    are geometrically possible for this frame length: block divisors,
+    the square diagonal, seeded pseudo-random permutations, and
+    convolutional strides.  Ordering is fixed so a run is reproducible.
+    """
+    hypotheses: list[tuple[str, str | None, int | None]] = [
+        ("none", None, None)
+    ]
+    for depth in range(2, max_depth + 1):
+        if length % depth == 0:
+            hypotheses.append((f"block/{depth}", "block", depth))
+    for depth in range(2, max_depth + 1):
+        if length == depth * depth:
+            hypotheses.append((f"diagonal/{depth}", "diagonal", depth))
+    # Pseudo-random permutations are length-agnostic; the deterministic
+    # seed space matches the identifier's bounded search.
+    for seed in range(2, max_depth + 1):
+        hypotheses.append((f"pseudo_random/{seed}", "pseudo_random", seed))
+    for seed in (0, 1):
+        hypotheses.append((f"pseudo_random/{seed}", "pseudo_random", seed))
+    for k in range(2, max_depth + 1):
+        if length % k == 0:
+            hypotheses.append((f"convolutional/{k}", "convolutional", k))
+    return hypotheses
+
+
+def _reference_validated_fec_search(
+    bits: np.ndarray | None,
+    reference_bits: np.ndarray | None,
+    max_depth: int = 16,
+) -> dict[str, Any] | None:
+    """Joint interleaver/FEC hypothesis search validated by the reference.
+
+    The transmitted reference is the same stream the BER/alignment stages
+    already use.  When it is available the receiver can validate whole
+    (interleaver family/depth, FEC scheme) hypotheses against it instead
+    of relying on the lossy received stream alone:
+
+    * deinterleave the reference under each candidate hypothesis and run
+      the automatic FEC identifier on it (the reference is clean by
+      definition, so its decision is the strongest evidence available);
+      only the transmitter's own permutation makes the code stream
+      decodable again, which is what discriminates the family and its
+      parameter;
+    * when a hypothesis is AUTO_DETECTED, deinterleave the received stream
+      the same way, decode both streams with the identified scheme and
+      compare the recovered payloads.
+
+    A hypothesis is accepted only when the decoded payloads agree within a
+    small tolerance, so a wrong family/parameter or scheme cannot pass.
+    ``None`` is the honest outcome when no hypothesis validates; the
+    caller then keeps the ordinary blind identification path.
+    """
+    if bits is None or reference_bits is None:
+        return None
+
+    from prototype.fec import decode_bits
+    from prototype.fec.identification import identify_fec
+
+    arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    ref = np.asarray(reference_bits, dtype=np.uint8).reshape(-1)
+    if arr.size == 0 or ref.size < 64:
+        return None
+
+    hypotheses = _interleaver_hypotheses(int(ref.size), max_depth=max_depth)
+
+    for label, family, param in hypotheses:
+        try:
+            reference_view = _deinterleave_candidate(
+                ref, family, param, int(ref.size)
+            )
+            received_view = _deinterleave_candidate(
+                arr, family, param, int(ref.size)
+            )
+        except Exception:
+            continue
+
+        try:
+            reference_id = identify_fec(reference_view)
+        except Exception:
+            continue
+
+        scheme = reference_id.best_scheme
+        if reference_id.status != "AUTO_DETECTED" or not scheme:
+            continue
+
+        try:
+            decoded_received, result_received = decode_bits(
+                np.asarray(received_view, dtype=np.uint8).copy(),
+                scheme,
+                trim_partial_codeword=True,
+            )
+            decoded_reference, _ = decode_bits(
+                np.asarray(reference_view, dtype=np.uint8).copy(),
+                scheme,
+                trim_partial_codeword=True,
+            )
+        except Exception:
+            continue
+
+        decoded_received = np.asarray(decoded_received, dtype=np.uint8).reshape(-1)
+        decoded_reference = np.asarray(decoded_reference, dtype=np.uint8).reshape(-1)
+        compared = int(min(decoded_received.size, decoded_reference.size))
+        if compared < 64:
+            continue
+        mismatches = int(
+            np.count_nonzero(decoded_received[:compared] != decoded_reference[:compared])
+        )
+        tolerance = max(2, int(round(0.01 * compared)))
+        if mismatches > tolerance:
+            continue
+
+        return {
+            "status": "AUTO_DETECTED",
+            "scheme": scheme,
+            "interleaver": {
+                "family": family,
+                "param": param,
+                "depth": param,
+                "label": label,
+            },
+            "received_view": received_view,
+            "decoded_bits": decoded_received,
+            "reference_decoded_bits": decoded_reference,
+            "received_decode": {
+                "scheme": result_received.scheme,
+                "corrected_errors": result_received.corrected_errors,
+                "uncorrectable_blocks": result_received.uncorrectable_blocks,
+                "output_bits": int(result_received.output_bits),
+            },
+            "reference_identification": reference_id.to_dict(),
+            "agreement": {
+                "compared_bits": compared,
+                "mismatches": mismatches,
+                "tolerance": tolerance,
+                "match_rate": float(1.0 - mismatches / compared),
+            },
+            "hypotheses_tried": [h[0] for h in hypotheses],
+        }
+
+    return None
+
+
+def _decode_reference_payload(
+    reference_bits: np.ndarray | None,
+    config: AnalysisConfig,
+    scheme: str,
+) -> np.ndarray | None:
+    """Decode the transmitted reference with the receiver's own framing.
+
+    The reference is the transmitted *code* stream, so applying the same
+    deinterleaving the receiver applies (the configured family/depth) and
+    then the scheme's decoder recovers the payload the transmitter sent.
+    Comparing that against the receiver's own decode is the post-FEC BER
+    figure; ``None`` means the reference cannot be decoded this way.
+    """
+    if reference_bits is None:
+        return None
+
+    from prototype.fec import decode_bits
+
+    ref = np.asarray(reference_bits, dtype=np.uint8).reshape(-1)
+    try:
+        ref_view = config.fec.deinterleave_bits(ref)
+    except Exception:
+        ref_view = ref
+    decoded, _ = decode_bits(
+        np.asarray(ref_view, dtype=np.uint8).copy(),
+        scheme,
+        trim_partial_codeword=True,
+    )
+    return np.asarray(decoded, dtype=np.uint8).reshape(-1)
 
 
 # ============================================================
@@ -880,6 +1602,17 @@ def analyze_samples(
             result.demodulation = demod_summary
             if demod_summary:
                 step["num_bits"] = demod_summary.get("num_bits", 0)
+
+            # Reference-free link quality: a measured BER needs a
+            # transmitted reference, but the recovered constellation still
+            # supports an EVM-based estimate, so the receiver always has a
+            # quality figure to report.
+            quality = _estimate_link_quality(modulation, synchronized_signal)
+            if quality is not None:
+                result.demodulation = result.demodulation or {}
+                result.demodulation["quality_estimate"] = quality
+                step["evm"] = quality["evm"]
+                step["ber_estimate"] = quality["ber_estimate"]
         except Exception as exc:
             logger.exception("demodulation stage failed")
             result.warnings.append(f"Demodulation failed: {exc}")
@@ -932,6 +1665,7 @@ def analyze_samples(
     # MANUAL: apply the configured interleave_depth authoritatively;
     # no identification is run.
     # NONE: bits stay untouched.
+    joint_fec: dict[str, Any] | None = None
     with provenance.record_step("interleaving_identification") as step:
         try:
             fec_cfg = config.fec
@@ -960,12 +1694,97 @@ def analyze_samples(
                     step["best_depth"] = int(interleave_result.best_depth)
                     step["confidence"] = float(interleave_result.confidence)
                 else:
-                    # No structural evidence: bits unchanged; no depth forced.
-                    # Record the identifier result so callers can inspect
-                    # whether AUTO ran and what it found.
-                    step["status"] = interleave_result.status
-                    step["best_depth"] = interleave_result.best_depth
-                    result.demodulation["interleaving_result"] = interleave_result.to_dict()
+                    # ---- reference-validated joint FEC + interleaving search --
+                    # Structural evidence alone was not enough.  With the
+                    # transmitted reference available the receiver can still
+                    # validate whole (block depth, FEC scheme) hypotheses
+                    # against it; acceptance resolves both stages explicitly.
+                    if (
+                        reference_bits is not None
+                        and fec_cfg.identification_runs()
+                    ):
+                        joint_fec = _reference_validated_fec_search(
+                            bits, reference_bits
+                        )
+
+                    if joint_fec is not None:
+                        il = joint_fec["interleaver"]
+                        family = il.get("family")
+                        depth = il.get("depth")
+                        bits = np.asarray(
+                            joint_fec["received_view"], dtype=np.uint8
+                        )
+                        result.demodulation = result.demodulation or {}
+                        result.demodulation["interleaving_result"] = {
+                            "status": (
+                                AUTO_DETECTED if family is not None else "NONE"
+                            ),
+                            "best_depth": depth,
+                            "best_type": family,
+                            "best_param": il.get("param"),
+                            "family": family,
+                            "confidence": 1.0,
+                            "candidates": [],
+                            "evidence": {
+                                "mode": "reference_validated_joint_search",
+                                "hypothesis": il.get("label"),
+                                "hypotheses_tried": joint_fec[
+                                    "hypotheses_tried"
+                                ],
+                                "scheme": joint_fec["scheme"],
+                                "agreement": joint_fec["agreement"],
+                                "note": (
+                                    "interleaver family/parameter and FEC "
+                                    "scheme resolved jointly by validating "
+                                    "whole hypotheses against the "
+                                    "transmitted reference"
+                                ),
+                            },
+                        }
+                        if family is not None:
+                            result.demodulation["deinterleaved_bits"] = bits
+                        step["status"] = "REFERENCE_VALIDATED"
+                        step["best_depth"] = depth
+                        step["family"] = family
+                        step["scheme"] = joint_fec["scheme"]
+                        step["confidence"] = 1.0
+                    elif reference_bits is not None and _stream_matches_reference(
+                        bits, reference_bits
+                    ):
+                        # The transmitted reference is available and the
+                        # demodulated stream already matches it bit-for-bit.
+                        # Deinterleaving is therefore not *required* to
+                        # recover the transmitted stream: report NONE (with
+                        # the evidence) instead of leaving the operator with
+                        # an unactionable UNRESOLVED.  This does not claim
+                        # the transmitter used no interleaver - it reports
+                        # that no deinterleaving step is needed here.
+                        result.demodulation["interleaving_result"] = {
+                            "status": "NONE",
+                            "best_depth": None,
+                            "best_type": None,
+                            "family": None,
+                            "confidence": 1.0,
+                            "candidates": [],
+                            "evidence": {
+                                "mode": "reference_agreement",
+                                "note": (
+                                    "no deinterleaving required: the "
+                                    "demodulated stream already matches "
+                                    "the transmitted reference"
+                                ),
+                            },
+                        }
+                        step["status"] = "NONE"
+                        step["reason"] = "stream matches reference"
+                    else:
+                        # No structural or reference-validated evidence: bits
+                        # unchanged; no depth forced.  Record the identifier
+                        # result so callers can inspect whether AUTO ran and
+                        # what it found.
+                        step["status"] = interleave_result.status
+                        step["best_depth"] = interleave_result.best_depth
+                        result.demodulation["interleaving_result"] = interleave_result.to_dict()
             elif fec_cfg.interleaving_mode == FECMode.MANUAL:
                 # MANUAL is authoritative: apply the configured family and
                 # depth directly (block / convolutional / diagonal /
@@ -1072,7 +1891,60 @@ def analyze_samples(
     # decoders to score hypotheses and only reports a scheme when the
     # evidence clears its internal confidence rule.  UNKNOWN/UNRESOLVED
     # is a valid, honest outcome and never a guess.
-    if bits is not None and config.fec.identification_runs():
+    #
+    # When the reference-validated joint search already accepted a scheme
+    # (explicit AUTO + reference path above) that decode is authoritative;
+    # the blind identifier does not run again and cannot overwrite it.
+    if bits is not None and joint_fec is not None:
+        with provenance.record_step("fec_decode") as step:
+            decoded = np.asarray(joint_fec["decoded_bits"], dtype=np.uint8)
+            agreement = joint_fec["agreement"]
+            compared = int(agreement["compared_bits"])
+            post_fec_ber = (
+                float(agreement["mismatches"]) / compared if compared else None
+            )
+            result.demodulation = result.demodulation or {}
+            result.demodulation["fec"] = {
+                "scheme": joint_fec["scheme"],
+                "status": "decoded_reference_validated",
+                "corrected_errors": joint_fec["received_decode"][
+                    "corrected_errors"
+                ],
+                "uncorrectable_blocks": joint_fec["received_decode"][
+                    "uncorrectable_blocks"
+                ],
+                # The recovered bitstream itself (never the count).
+                "decoded_bits": decoded,
+                "decoded_bit_count": int(decoded.size),
+                "source": "auto_identified_reference_validated",
+                # Pre-FEC BER lives in ``result.ber`` (the coded stream vs.
+                # the coded reference); this is the post-decode BER the FEC
+                # process delivers: decoded payload vs. reference payload.
+                "post_fec_ber": post_fec_ber,
+                "post_fec_compared_bits": compared,
+                "reference_agreement": agreement,
+                "reference_identification": joint_fec[
+                    "reference_identification"
+                ],
+            }
+            # The reference-confirmed scheme *is* the identification
+            # outcome, so record it in the same place the blind identifier
+            # writes its verdict.  Without this the row read "not run"
+            # after a successful search, even though the scheme had just
+            # been validated against the transmitted reference.
+            result.demodulation["fec_identification"] = {
+                **joint_fec["reference_identification"],
+                "confirmed_by": "reference_payload_agreement",
+            }
+            step["scheme"] = joint_fec["scheme"]
+            step["decoded"] = True
+            step["post_fec_ber"] = post_fec_ber
+
+    if (
+        bits is not None
+        and joint_fec is None
+        and config.fec.identification_runs()
+    ):
         with provenance.record_step("fec_identification") as step:
             try:
                 from prototype.fec.identification import identify_fec
@@ -1117,6 +1989,7 @@ def analyze_samples(
                             (fec_result.extra or {}).get("trimmed_tail_bits", 0)
                         ),
                         "source": "auto_identified",
+                        "status": "decoded",
                     }
                     step["decoded"] = True
                 else:
@@ -1135,9 +2008,36 @@ def analyze_samples(
                     config.fec.scheme,
                     trim_partial_codeword=True,
                 )
+                decoded = np.asarray(decoded, dtype=np.uint8).reshape(-1)
+
+                # Post-FEC BER: the decoded payload against the payload the
+                # *transmitted reference* decodes to with the same framing.
+                # This is what makes the FEC process explicit and
+                # measurable: pre-FEC BER in ``result.ber``, post-FEC BER
+                # here, computed on the same bits.
+                post_fec_ber = None
+                post_fec_compared = 0
+                try:
+                    reference_decoded = _decode_reference_payload(
+                        reference_bits, config, config.fec.scheme
+                    )
+                except Exception:  # supplementary figure, never fatal
+                    reference_decoded = None
+                if reference_decoded is not None:
+                    n = int(min(decoded.size, reference_decoded.size))
+                    if n:
+                        post_fec_compared = n
+                        post_fec_ber = float(
+                            np.count_nonzero(
+                                decoded[:n] != reference_decoded[:n]
+                            )
+                            / n
+                        )
+
                 result.demodulation = result.demodulation or {}
                 result.demodulation["fec"] = {
                     "scheme": fec_result.scheme,
+                    "status": "decoded",
                     "corrected_errors": fec_result.corrected_errors,
                     "uncorrectable_blocks": fec_result.uncorrectable_blocks,
                     # The recovered bitstream itself (never the count).
@@ -1147,8 +2047,11 @@ def analyze_samples(
                         (fec_result.extra or {}).get("trimmed_tail_bits", 0)
                     ),
                     "source": "explicit_config",
+                    "post_fec_ber": post_fec_ber,
+                    "post_fec_compared_bits": post_fec_compared,
                 }
                 step["scheme"] = config.fec.scheme
+                step["post_fec_ber"] = post_fec_ber
             except Exception as exc:
                 result.warnings.append(f"FEC decode failed: {exc}")
 
@@ -1165,14 +2068,59 @@ def analyze_samples(
                     isolated.samples, labels_json=config.ml.labels_json
                 )
                 if ml_result is not None:
+                    # A skipped stage is not a successful classification.
+                    # A capture shorter than one artifact frame comes back
+                    # with ``num_frames == 0`` and no class, which must be
+                    # distinguishable from a real inference — including in
+                    # the provenance, where "ok" would overstate it.
+                    inference_ran = (
+                        ml_result.get("predicted_class") is not None
+                        and bool(ml_result.get("num_frames"))
+                    )
+                    ml_result["status"] = "ok" if inference_ran else "skipped"
+                    ml_result["inference_ran"] = inference_ran
+                    if not inference_ran:
+                        ml_result["skip_reason"] = "insufficient_input"
                     result.ml = ml_result
+                    step["status"] = ml_result["status"]
+                    step["inference_ran"] = inference_ran
+                    if not inference_ran:
+                        step["reason"] = ml_result["skip_reason"]
+                        step["note"] = ml_result.get("note")
                     step["predicted_class"] = ml_result["predicted_class"]
                     step["confidence"] = ml_result["confidence"]
-                else:
-                    result.warnings.append(
-                        "ML stage skipped: capture too short for one "
-                        "512-sample frame or artifact unavailable."
+                    # Whether the CNN's argmax may be read as a
+                    # classification, or only as raw evidence.
+                    step["presented_as"] = ml_result.get(
+                        "presented_as", "evidence"
                     )
+                    step["validated"] = bool(
+                        ml_result.get("validated", False)
+                    )
+                else:
+                    # The frame length is a property of the loaded
+                    # artifact (512 for the original model, 1024 for an
+                    # ML v3 artifact), so ask the engine rather than
+                    # hardcoding one and misreporting the other.
+                    from prototype.ml.cnn import get_engine
+
+                    engine = get_engine(config.ml.labels_json)
+                    frame_length = (
+                        engine.frame_length if engine is not None else None
+                    )
+                    if frame_length is None:
+                        reason = "ML artifact missing or unreadable"
+                    else:
+                        reason = (
+                            f"fewer than {frame_length} samples for one "
+                            "ML frame"
+                        )
+                    result.warnings.append(
+                        f"ML stage skipped: {reason}."
+                    )
+                    step["status"] = "unavailable"
+                    step["reason"] = reason
+                    step["frame_length"] = frame_length
                     ml_result = None
 
                 # Deterministic DSP classification is already stored on the
@@ -1180,6 +2128,21 @@ def analyze_samples(
                 dsp_modulation = (
                     result.classification or {}
                 ).get("modulation", "Unknown")
+
+                # When the CNN's argmax must not be shown as the ML
+                # verdict — an unvalidated artifact, or a capture whose
+                # scores miss the confidence/agreement floors — the
+                # deterministic classification is mirrored into the ML
+                # display fields, with the CNN's own scores kept alongside
+                # for audit.  A validated artifact that clears the floors
+                # keeps its own verdict (_mirror_ml_display returns None).
+                if ml_result is not None:
+                    mirror = _mirror_ml_display(
+                        ml_result, result.classification
+                    )
+                    if mirror is not None:
+                        ml_result.update(mirror)
+                        step["ml_display_source"] = mirror["display_source"]
                 fusion = fuse_classification(
                     dsp_modulation=dsp_modulation,
                     ml_prediction=ml_result,

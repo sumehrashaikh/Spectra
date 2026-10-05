@@ -24,6 +24,11 @@ from .config import GNURadioAcquisitionConfig, GNURadioSourceConfig
 from .streaming import GNURadioStreamer
 from .source import GNURadioSource
 from .adapter import signal_from_gnuradio_source, signal_from_gnuradio_chunks
+from .viz import (
+    compute_spectrum_waterfall,
+    gnuradio_python,
+    viz_script_path,
+)
 
 
 __all__ = [
@@ -33,18 +38,12 @@ __all__ = [
     "GNURadioStreamer",
     "make_gnuradio_source",
     "gnuradio_available",
+    "gnuradio_runtime_status",
     "signal_from_gnuradio_source",
     "signal_from_gnuradio_chunks",
-]
-from .source import GNURadioSource
-from .adapter import signal_from_gnuradio_source, signal_from_gnuradio_chunks
-
-__all__ = [
-    "GNURadioAcquisitionConfig",
-    "GNURadioSourceConfig",
-    "GNURadioStreamer",
-    "make_gnuradio_source",
-    "gnuradio_available",
+    "compute_spectrum_waterfall",
+    "gnuradio_python",
+    "viz_script_path",
 ]
 
 logger = logging.getLogger("spectra.io.gnuradio")
@@ -77,6 +76,44 @@ def _import_gnuradio():
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def gnuradio_runtime_status() -> tuple[bool, str]:
+    """Whether a *usable* GNU Radio runtime exists: ``(available, detail)``.
+
+    ``gnuradio_available()`` answers a narrower question -- is ``gnuradio``
+    importable into this very Python process?  GNU Radio normally lives in
+    its own environment (radioconda), so that check is False while a
+    perfectly good GNU Radio is installed and runnable, which made the GUI
+    claim "GNU Radio is not installed" permanently.
+
+    This function answers the question the acquisition and visualization
+    paths actually care about: can a GNU Radio runtime be executed?  It
+    uses the headless flowgraph probe (``viz.gnuradio_available``, a
+    subprocess in the GNU Radio interpreter) and only falls back to the
+    in-process import check.
+
+    ``detail`` is ``"GNU Radio <version>"`` on success, otherwise a
+    human-readable reason for the failure.
+    """
+    reason = "GNU Radio runtime not detected"
+    try:
+        from .viz import gnuradio_available as _runtime_check
+
+        available, detail = _runtime_check()
+        if available:
+            return True, str(detail)
+        reason = str(detail)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        reason = f"GNU Radio runtime check failed: {exc}"
+
+    # Fallback: this interpreter itself can import GNU Radio.
+    try:
+        import gnuradio
+
+        return True, f"GNU Radio {getattr(gnuradio, '__version__', 'unknown')}"
+    except Exception:  # noqa: BLE001
+        return False, reason
 
 
 def _ensure_gnuradio_importable():

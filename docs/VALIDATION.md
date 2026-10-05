@@ -1,14 +1,18 @@
 # Spectra Validation Report
 
-**Date:** 2026-09-22
-**Software version:** 2.1.0
+**Date:** 2026-10-05 (latest full-suite run)
+**Software version:** 2.2.0
 **Environment:** Windows, Python 3.13.1, numpy/scipy (pip-installed), CPU only
-**Test command:** `python -m pytest -q` (136 passed at the time of this report)
+**Test command:** `QT_QPA_PLATFORM=offscreen python -m pytest -q` → **538 passed, 2 warnings**
 
 > The current requirement-level status for the SIH-147 work (FEC
 > identification, interleaving, frame search, GUI + CLI coverage) is kept
-> in [`docs/SIH_REQUIREMENTS.md`](SIH_REQUIREMENTS.md). As of 2026-09-29 the
-> suite is `QT_QPA_PLATFORM=offscreen python -m pytest -q` → 433 passed.
+> in [`docs/SIH_REQUIREMENTS.md`](SIH_REQUIREMENTS.md). The validation
+> matrix in section 2 records the original 136-test run (2026-09-22);
+> the suite has since grown to **538 tests, all passing** (2026-10-05),
+> covering the FEC/interleaving families, frame layer, GNU Radio bridge,
+> ML v3 artifact validation, theme/GUI regressions and the optional
+> external-dataset harness.
 
 ## 1. What "validated" means here
 
@@ -62,6 +66,27 @@ below ~10 dB for 8 sps RRC-QPSK at this capture length. Failure modes
 are recorded, not masked. Longer captures and lower rolloff improve
 the low-SNR floor (not yet systematically tuned — see limitations).
 
+### 3b. External / public-benchmark inputs (optional, recorded — not a claim)
+
+Two external inputs exist and both are *recorded evidence*, never a
+validation claim:
+
+- **Public benchmark (RadioML 2016.10a).** A frozen transfer run over
+  1100 frames lives in `prototype/docs/evidence/PUBLIC_DATASET.md`: the
+  symbol-rate estimator fails on 128-sample benchmark slices (reported
+  for completeness, with the record-length analysis that explains why),
+  and cross-dataset classification agreement is 25.0% raw / 22.2% with
+  the pipeline's own preprocessing in front (which converts a silent
+  confident `BPSK`-on-everything collapse into honest `Unknown`
+  abstention). This is a *transfer* measurement on out-of-distribution
+  frames, not the classifier's in-domain accuracy.
+- **Optional off-air dataset.** `spectra dataset-inspect` /
+  `spectra dataset-eval` run the existing preprocessing + DSP
+  classifier (+ optional ML assist) over a third-party HDF5 dataset
+  (downloaded locally; never committed, never used for training or
+  tuning). Unsupported classes are reported as unsupported, never
+  scored as errors. See `prototype/dataset/README.md`.
+
 ## 4. Known limitations
 
 1. **Synthetic-only validation.** No real-world captures have been
@@ -79,13 +104,21 @@ the low-SNR floor (not yet systematically tuned — see limitations).
    estimators only).
 5. **Classifier scope.** BPSK/QPSK/16-QAM/BFSK/Unknown only.
    8-PSK, MSK/GMSK, OQPSK, 64/256-QAM, AM/FM are not implemented.
-6. **No frame/protocol layer.** Preamble correlation exists
-   (`dsp/correlation.find_sync_word`), but no protocol parser.
-7. **No ML subsystem.** Deterministic DSP only, by design.
-8. **GUI scalability.** The GUI runs analysis on the UI thread for
-   some operations; large captures should use the CLI.
-9. **Windows-first.** CI is not configured; Linux/macOS are expected
-   to work (pure Python + numpy/scipy) but are untested.
+6. **Frame/protocol layer scope.** A frame layer exists
+   (`prototype/protocol/`) but it is explicit configuration only: sync
+   word and payload size must be supplied. Automatic discovery of an
+   unknown frame format is not implemented and not claimed.
+7. **ML scope.** An optional CNN stage exists (NumPy runtime, trained
+   in-project on synthetic data). It is supplementary evidence with an
+   explicit validation floor; it is never a calibrated detector and its
+   scores are model scores, not probabilities.
+8. **GUI scalability.** Analysis runs on a background `QThread`; very
+   large captures are still faster through the CLI, which avoids Qt
+   overhead entirely.
+9. **Platform coverage.** CI runs on GitHub Actions (ubuntu/windows ×
+   Python 3.10/3.12); development and the runs documented here are
+   Windows-first. Linux/macOS are expected to work (pure Python +
+   numpy/scipy) but are not separately certified.
 
 ## 5. What would be required to extend validation
 

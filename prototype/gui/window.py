@@ -19,7 +19,7 @@ BFSK_FREQ_0 = 500.0
 BFSK_FREQ_1 = 700.0
 BFSK_SYMBOL_RATE = 100.0
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal as QtSignal
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtWidgets import QInputDialog
 from prototype.gui.worker import AnalysisWorker
@@ -34,8 +34,11 @@ from prototype.core.isolator import isolate_signal
 from prototype.core.signal import Signal
 from PySide6.QtWidgets import (
 QAbstractItemView,
+QApplication,
 QCheckBox,
 QComboBox,
+QDialog,
+QDialogButtonBox,
 QFrame,
 QFileDialog,
 QGridLayout,
@@ -44,6 +47,7 @@ QHeaderView,
 QLabel,
 QMainWindow,
 QMessageBox,
+QPlainTextEdit,
 QPushButton,
 QScrollArea,
 QSizePolicy,
@@ -76,8 +80,16 @@ from prototype.core.loader import load_wav
 from prototype.visualization.plots import (
 create_constellation_figure,
 create_spectrum_figure,
+create_spectrum_figure_from_psd,
 create_time_figure,
 create_waterfall_figure,
+create_waterfall_figure_from_matrix,
+)
+
+from prototype.gui.theme import (
+apply_theme,
+other_theme,
+style_canvas,
 )
 
 
@@ -103,6 +115,10 @@ class PlotWidget(QFrame):
         )
 
         self.canvas = None
+
+        # "light" keeps the original white plots; "dark" recolours the
+        # canvas so plots stay readable in the dark theme.
+        self.theme_mode = "light"
 
         self.setMinimumHeight(
         260
@@ -137,12 +153,66 @@ class PlotWidget(QFrame):
         self.canvas
         )
 
+        if self.theme_mode == "dark":
+
+            style_canvas(
+            self.canvas,
+            self.theme_mode
+            )
+
         self.canvas.draw()
 
 
         # ============================================================
         # MAIN WINDOW
         # ============================================================
+
+# ============================================================
+# GNU RADIO RUNTIME PROBE
+# ============================================================
+
+#: Probes are held here until they finish.  A window (or a test) may be
+#: closed while its probe is still running, and destroying a running
+#: QThread aborts the process, so the probe must outlive its window.
+_ACTIVE_GNU_RADIO_PROBES = []
+
+
+class GnuRadioStatusProbe(QThread):
+    """Probe the GNU Radio runtime without blocking the UI thread.
+
+    GNU Radio usually lives in its own environment, so the probe executes
+    the headless flowgraph's ``--check`` in the GNU Radio interpreter (a
+    subprocess).  That takes about a second: far too slow to run while the
+    window is being built, hence the thread.
+
+    Emits ``status_ready`` with ``(available: bool, detail: str)``.
+    """
+
+    status_ready = QtSignal(object)
+
+    def run(self):  # noqa: D102 - Qt override
+        try:
+            from prototype.io.gnuradio import gnuradio_runtime_status
+
+            available, detail = gnuradio_runtime_status()
+        except Exception as exc:  # noqa: BLE001 - never raise into Qt
+            available, detail = False, f"GNU Radio runtime check failed: {exc}"
+
+        self.status_ready.emit((bool(available), str(detail)))
+
+
+def _release_gnuradio_probe(probe):
+    """Forget a finished probe and let Qt delete it."""
+
+    try:
+        _ACTIVE_GNU_RADIO_PROBES.remove(probe)
+    except ValueError:
+        pass
+
+    probe.deleteLater()
+
+
+# ============================================================
 
 class MainWindow(QMainWindow):
 
@@ -226,6 +296,12 @@ class MainWindow(QMainWindow):
         # at result-apply time and shown via "Provenance".
         self._pipeline_provenance = None
 
+        # Theme (light is the original look) + GNU Radio spectrum/
+        # waterfall toggle state.
+        self.theme_mode = "light"
+        self._gnuradio_viz_result = None
+        self._gnuradio_viz_key = None
+
         # ----------------------------------------------------
         # Window
         # ----------------------------------------------------
@@ -248,6 +324,30 @@ class MainWindow(QMainWindow):
         )
 
         self.build_ui()
+
+        # Apply the default (light) theme so the toggle button and the
+        # palette are consistent from the first frame on.
+        self.set_theme(self.theme_mode)
+
+        # Probe the GNU Radio runtime off the UI thread: the check runs a
+        # subprocess in the GNU Radio interpreter, which is too slow to do
+        # while the window is coming up.  The result lands in the badge
+        # under "Samples:".
+        self._gnuradio_probe = GnuRadioStatusProbe()
+
+        self._gnuradio_probe.status_ready.connect(
+        self._on_gnuradio_status
+        )
+
+        _ACTIVE_GNU_RADIO_PROBES.append(
+        self._gnuradio_probe
+        )
+
+        self._gnuradio_probe.finished.connect(
+        lambda: _release_gnuradio_probe(self._gnuradio_probe)
+        )
+
+        self._gnuradio_probe.start()
 
 
         # ========================================================
@@ -278,6 +378,10 @@ class MainWindow(QMainWindow):
         # TITLE
         # ====================================================
 
+        # Title row: the title keeps the centre, the light/dark toggle
+        # sits in the top-right corner without disturbing anything else.
+        title_row = QHBoxLayout()
+
         title = QLabel(
         "SPECTRA "
         )
@@ -296,8 +400,31 @@ class MainWindow(QMainWindow):
         """
         )
 
-        main_layout.addWidget(
-        title
+        title_row.addWidget(
+        title,
+        1
+        )
+
+        self.theme_button = QPushButton("\U0001F319 Dark")
+
+        self.theme_button.setFixedWidth(96)
+
+        self.theme_button.setToolTip(
+        "Switch between the light and dark theme"
+        )
+
+        self.theme_button.clicked.connect(
+        self.toggle_theme
+        )
+
+        title_row.addWidget(
+        self.theme_button,
+        0,
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        main_layout.addLayout(
+        title_row
         )
 
         # ====================================================
@@ -796,6 +923,46 @@ class MainWindow(QMainWindow):
         self.constellation_tab_title
         )
 
+        # Symbol / bit inspectors: the same recovered data the JSON export
+        # carries, readable in the GUI without leaving the app.
+        self.constellation_actions = QHBoxLayout()
+
+        self.symbols_button = QPushButton("View Symbols (I/Q)")
+
+        self.symbols_button.setToolTip(
+        "Open a window listing the recovered symbol points (I/Q) from "
+        "the last analysis"
+        )
+
+        self.symbols_button.clicked.connect(
+        self.show_symbols_dialog
+        )
+
+        self.bits_button = QPushButton("View Bits / BER")
+
+        self.bits_button.setToolTip(
+        "Open a window with the recovered bitstreams (received, "
+        "aligned, deinterleaved, FEC-decoded) and the BER/EVM read-out"
+        )
+
+        self.bits_button.clicked.connect(
+        self.show_bits_dialog
+        )
+
+        self.constellation_actions.addWidget(
+        self.symbols_button
+        )
+
+        self.constellation_actions.addWidget(
+        self.bits_button
+        )
+
+        self.constellation_actions.addStretch()
+
+        self.constellation_tab_layout.addLayout(
+        self.constellation_actions
+        )
+
         self.constellation_plot = PlotWidget()
 
         self.constellation_plot.setSizePolicy(
@@ -959,7 +1126,7 @@ class MainWindow(QMainWindow):
         )
 
         self.results_il_ber_label = QLabel(
-        "BER: no reference loaded"
+        "BER: not measured yet"
         )
 
         for _label in [
@@ -1183,21 +1350,77 @@ class MainWindow(QMainWindow):
         self.acquire_gnuradio
         )
 
+        # WAV is the default source, so the capture button starts
+        # disabled: it belongs to the GNU Radio source only (see
+        # _set_gnuradio_acquire_enabled).
+        self.gnuradio_acquire_button.setEnabled(False)
+
         self.gnuradio_tab_layout.addWidget(
         self.gnuradio_acquire_button
         )
 
-        self.gnuradio_status_label = QLabel("")
+        # NOTE: no "Backend: GNU Radio is unavailable" row here.  GNU
+        # Radio lives in its own environment, so an in-process import
+        # check said "not installed" even when the runtime was present
+        # and working.  The runtime that is really available is reported
+        # once, in the bottom information panel (see gnuradio_badge).
 
-        self.gnuradio_status_label.setWordWrap(True)
+        # ------------------------------------------------------------
+        # Spectrum + waterfall computed by the GNU Radio flowgraph
+        # ------------------------------------------------------------
+        # Visualization only: the FFT/STFT matrices come from the headless
+        # GNU Radio flowgraph when it can run, otherwise the built-in NumPy
+        # plots are used and the status row says so. No demodulation,
+        # carrier recovery or constellation work happens here.
+        self.gnuradio_viz_frame = QFrame()
 
-        self.gnuradio_tab_layout.addWidget(
-        self.gnuradio_status_label
+        self.gnuradio_viz_frame.setFrameShape(
+        QFrame.Shape.StyledPanel
         )
 
-        self.gnuradio_tab_layout.addStretch()
+        gnuradio_viz_layout = QVBoxLayout(
+        self.gnuradio_viz_frame
+        )
 
-        self._update_gnuradio_status()
+        gnuradio_viz_layout.setContentsMargins(
+        6, 6, 6, 6
+        )
+
+        gnuradio_viz_layout.setSpacing(4)
+
+        self.gnuradio_viz_checkbox = QCheckBox(
+        "Compute Spectrum + Waterfall with GNU Radio"
+        )
+
+        self.gnuradio_viz_checkbox.setToolTip(
+        "Run the GNU Radio headless FFT flowgraph for the Spectrum and "
+        "Waterfall tabs. When GNU Radio is unavailable the built-in "
+        "NumPy plots are used and reported as such."
+        )
+
+        self.gnuradio_viz_checkbox.toggled.connect(
+        self._on_gnuradio_viz_toggled
+        )
+
+        gnuradio_viz_layout.addWidget(
+        self.gnuradio_viz_checkbox
+        )
+
+        self.gnuradio_viz_status = QLabel("")
+
+        self.gnuradio_viz_status.setWordWrap(True)
+
+        gnuradio_viz_layout.addWidget(
+        self.gnuradio_viz_status
+        )
+
+        self.gnuradio_tab_layout.addWidget(
+        self.gnuradio_viz_frame
+        )
+
+        self._update_gnuradio_viz_status()
+
+        self.gnuradio_tab_layout.addStretch()
 
         self.vis_tabs.addTab(
         self.gnuradio_tab,
@@ -1289,6 +1512,30 @@ class MainWindow(QMainWindow):
         self.duration_label,
         2,
         1
+        )
+
+        # GNU Radio runtime badge, directly below "Samples:".  It is
+        # filled in by the background probe (see _on_gnuradio_status).
+        self._gnuradio_runtime = None
+
+        self.gnuradio_badge = QLabel("GNU Radio: checking\u2026")
+
+        self.gnuradio_badge.setAlignment(
+        Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.gnuradio_badge.setToolTip(
+        "Checking whether a GNU Radio runtime is available"
+        )
+
+        self._style_gnuradio_badge(None)
+
+        info_layout.addWidget(
+        self.gnuradio_badge,
+        2,
+        2,
+        1,
+        2
         )
 
         main_layout.addWidget(
@@ -1395,6 +1642,11 @@ class MainWindow(QMainWindow):
             if isinstance(_widget, QLineEdit) or isinstance(_widget, QComboBox):
                 _widget.setEnabled(is_gnuradio)
 
+        # Same for the capture button: with another source selected the
+        # configuration panel is hidden, so an enabled button would run
+        # an acquisition nobody configured.
+        self._set_gnuradio_acquire_enabled(is_gnuradio)
+
         # The Open button only applies to file sources; GNU Radio
         # captures come from its own tab.
         if selected == "WAV":
@@ -1412,7 +1664,17 @@ class MainWindow(QMainWindow):
             self.open_button.setText("Open Capture")
             self.open_button.setEnabled(False)
 
-        self._update_gnuradio_status()
+    def _set_gnuradio_acquire_enabled(self, enabled):
+        """Enable "Acquire and Analyze" only for the GNU Radio source.
+
+        The button lives on the GNU Radio tab, which is always in the tab
+        bar: without this guard it stayed clickable while the Source
+        selector was on WAV/raw IQ.
+        """
+
+        available = str(self.source_selector.currentText()) == "GNU Radio"
+
+        self.gnuradio_acquire_button.setEnabled(bool(enabled) and available)
 
     def _on_frame_search_toggled(self, enabled: bool):
         """The sync word / payload size only matter when frame search runs."""
@@ -1460,32 +1722,63 @@ class MainWindow(QMainWindow):
 
         self.interleave_family_combo.setEnabled(manual)
 
-    def _update_gnuradio_status(self):
-        """Describe whether a real GNU Radio backend is available."""
+    def _on_gnuradio_status(self, payload):
+        """Show the probed GNU Radio runtime in the bottom info panel.
 
-        try:
-            from prototype.io.gnuradio import gnuradio_available
+        ``payload`` is ``(available, detail)`` from the background probe;
+        ``detail`` carries the version (e.g. "GNU Radio 3.10.12.0") when a
+        runtime was found, otherwise the reason it was not.
+        """
 
-            available = bool(gnuradio_available())
-        except Exception:  # noqa: BLE001
-            available = False
+        available, detail = payload
+
+        self._gnuradio_runtime = (available, detail)
 
         if available:
 
-            text = (
-            "Backend: GNU Radio is available — the configured "
-            "device/source will be used."
+            self.gnuradio_badge.setText(f"{detail} available")
+
+            self.gnuradio_badge.setToolTip(
+            f"{detail} detected by SPECTRA.\n"
+            "Spectrum and Waterfall can be computed by its headless FFT "
+            "flowgraph."
             )
 
         else:
 
-            text = (
-            "Backend: GNU Radio is not installed — acquisition falls "
-            "back to the built-in synthetic source (offline validation)."
+            self.gnuradio_badge.setText("GNU Radio runtime not detected")
+
+            self.gnuradio_badge.setToolTip(
+            f"{detail}\nSpectrum and Waterfall use the built-in NumPy "
+            "plots; WAV/raw-IQ analysis is unaffected."
             )
 
-        if getattr(self, "gnuradio_status_label", None) is not None:
-            self.gnuradio_status_label.setText(text)
+        self._style_gnuradio_badge(available)
+
+    def _style_gnuradio_badge(self, available):
+        """Highlight the badge: green when GNU Radio is usable, else amber.
+
+        The colours are set on the widget itself, which outranks the
+        application stylesheet, so the badge keeps its contrast in both
+        the light and the dark theme.
+        """
+
+        if available is None:
+            background = "#6b7280"  # neutral: still probing
+        elif available:
+            background = "#137a3f"  # green: runtime present
+        else:
+            background = "#8a5a00"  # amber: runtime missing
+
+        self.gnuradio_badge.setStyleSheet(
+        "QLabel {"
+        f"background-color: {background};"
+        "color: #ffffff;"
+        "border-radius: 4px;"
+        "padding: 2px 8px;"
+        "font-weight: bold;"
+        "}"
+        )
 
     # ========================================================
     # DETAIL WIDGETS
@@ -1633,7 +1926,7 @@ class MainWindow(QMainWindow):
         "parameter_decision_margin": "Decision Margin: —",
         "parameter_sync_freq": "Freq Offset: —",
         "parameter_sync_phase": "Phase Offset: —",
-        "parameter_ber": "BER Validation: No reference loaded",
+        "parameter_ber": "BER Validation: not measured yet",
         "parameter_fec": "FEC: —",
         "parameter_fec_auto": "Auto FEC: not run",
         "parameter_recovered_bits": "Recovered bits: —",
@@ -1761,11 +2054,72 @@ class MainWindow(QMainWindow):
 
                     _column = 1 - _column
 
+            # The FEC / BER group also carries the two inspectors, so the
+            # recovered symbols and bitstreams are one click away from the
+            # rows that report them (and from the Constellation tab).
+            if _title == "FEC / BER":
+
+                # A second pair of inspectors next to the rows they report
+                # (the Constellation tab keeps its own pair).
+                _actions = QHBoxLayout()
+
+                self.results_symbols_button = QPushButton("View Symbols (I/Q)")
+
+                self.results_symbols_button.setToolTip(
+                self.symbols_button.toolTip()
+                )
+
+                self.results_symbols_button.clicked.connect(
+                self.show_symbols_dialog
+                )
+
+                self.results_bits_button = QPushButton("View Bits / BER")
+
+                self.results_bits_button.setToolTip(
+                self.bits_button.toolTip()
+                )
+
+                self.results_bits_button.clicked.connect(
+                self.show_bits_dialog
+                )
+
+                _actions.addWidget(self.results_symbols_button)
+
+                _actions.addWidget(self.results_bits_button)
+
+                _actions.addStretch()
+
+                _grid.addLayout(_actions, _row + 1, 0, 1, 2)
+
             detail_layout.addWidget(_group)
 
         detail_layout.addStretch()
 
         self.results_tab_layout.addWidget(detail_frame)
+
+    @staticmethod
+    def _interleaving_status_text(il_result):
+        """Human-readable interleaving status (never a bare code).
+
+        UNRESOLVED/UNKNOWN are legitimate outcomes, but the operator needs
+        to know what would resolve them, so the row states the reason.
+        """
+
+        status = str((il_result or {}).get("status", "UNKNOWN"))
+        mode = ((il_result or {}).get("evidence") or {}).get("mode")
+
+        if status == "AUTO_DETECTED":
+            return "AUTO_DETECTED"
+        if status == "NONE":
+            if mode == "reference_agreement":
+                return "NONE (no deinterleaving required)"
+            return "NONE (no interleaving evidence)"
+        if status in ("UNRESOLVED", "UNKNOWN"):
+            return (
+                f"{status} (no deinterleaving applied — a transmitted "
+                "reference or FEC code is required to validate a depth)"
+            )
+        return status
 
     def _update_auto_fec_display(self):
         """Refresh the Detection/Results interleaving + FEC labels."""
@@ -1773,7 +2127,7 @@ class MainWindow(QMainWindow):
         il_result = getattr(self, "_interleaving_result", None)
 
         if il_result is not None:
-            il_status = il_result.get("status", "UNKNOWN")
+            il_status = self._interleaving_status_text(il_result)
 
             self.results_il_status_label.setText(
             f"Interleaving: {il_status}"
@@ -1783,10 +2137,8 @@ class MainWindow(QMainWindow):
             f"Detected type: {self._interleaving_family_label(il_result)}"
             )
 
-            depth = il_result.get("best_depth")
-
             self.results_il_depth_label.setText(
-            f"Detected depth: {depth if depth is not None else '—'}"
+            "Detected depth: " + self._interleaving_depth_text(il_result)
             )
 
             self.results_il_confidence_label.setText(
@@ -1804,9 +2156,19 @@ class MainWindow(QMainWindow):
         fec = self._pipeline_fec_summary
 
         if fec:
+            # Post-FEC BER is the FEC process's own deliverable: the decoded
+            # payload against the payload the reference decodes to.  It is
+            # shown next to the scheme so the row states both what was
+            # decoded and how well the decode matched.
+            post_fec = fec.get("post_fec_ber")
+            post_txt = (
+                f", post-FEC BER {float(post_fec):.3g}"
+                if post_fec is not None
+                else ""
+            )
             self.results_il_fec_label.setText(
             f"FEC: {fec.get('scheme')} "
-            f"(corrected {fec.get('corrected_errors', 0)} errors)"
+            f"(corrected {fec.get('corrected_errors', 0)} errors{post_txt})"
             )
         elif self.fec_combo.currentText() != "none":
             self.results_il_fec_label.setText(
@@ -1815,14 +2177,9 @@ class MainWindow(QMainWindow):
         else:
             self.results_il_fec_label.setText("FEC: none configured")
 
-        ber = self._pipeline_ber_summary
-
-        if ber is not None:
-            self.results_il_ber_label.setText(
-            f"BER: {float(ber.get('ber', 1.0)):.6g}"
-            )
-        else:
-            self.results_il_ber_label.setText("BER: no reference loaded")
+        # Measured BER when a reference exists, EVM-based estimate when
+        # not — one shared formatter so every BER row reads the same.
+        self.results_il_ber_label.setText(self._ber_display_text())
 
     # ========================================================
     # GNU RADIO ACQUISITION
@@ -1859,7 +2216,7 @@ class MainWindow(QMainWindow):
         GNURadioAcquisitionWorker
         )
 
-        self.gnuradio_acquire_button.setEnabled(False)
+        self._set_gnuradio_acquire_enabled(False)
 
         self.progress_bar.setRange(0, 0)
 
@@ -1892,7 +2249,7 @@ class MainWindow(QMainWindow):
     def _on_gnuradio_acquired(self, payload):
         """Load the acquired Signal into the analyzer."""
 
-        self.gnuradio_acquire_button.setEnabled(True)
+        self._set_gnuradio_acquire_enabled(True)
 
         self.progress_bar.setRange(0, 1)
 
@@ -1936,7 +2293,7 @@ class MainWindow(QMainWindow):
     def _on_gnuradio_failed(self, message: str):
         """Restore the UI after a failed GNU Radio acquisition."""
 
-        self.gnuradio_acquire_button.setEnabled(True)
+        self._set_gnuradio_acquire_enabled(True)
 
         self.progress_bar.setRange(0, 1)
 
@@ -2052,7 +2409,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.parameter_ber.setText(
-        "BER Validation: No reference loaded"
+        "BER Validation: not measured yet"
         )
 
         self.signal_table.setRowCount(
@@ -2082,22 +2439,29 @@ class MainWindow(QMainWindow):
     fmt="WAV",
     ):
 
-        # File info
+        # File info.  A GNU Radio capture has no file behind it, but it
+        # still has a sample rate, a sample count and a duration: those
+        # used to stay blank/stale for acquisitions that came from the
+        # GNU Radio tab.
         self.format_label.setText(fmt)
 
-        if self.current_file is not None:
-            self.file_label.setText(
-            self.current_file.name
-            )
-            self.sample_rate_label.setText(
-            f"{stats['sample_rate']:.0f} Hz"
-            )
-            self.samples_label.setText(
-            f"{stats['num_samples']:,}"
-            )
-            self.duration_label.setText(
-            f"{stats['duration']:.4f} s"
-            )
+        self.file_label.setText(
+        self.current_file.name
+        if self.current_file is not None
+        else f"{fmt} capture"
+        )
+
+        self.sample_rate_label.setText(
+        f"{stats['sample_rate']:.0f} Hz"
+        )
+
+        self.samples_label.setText(
+        f"{stats['num_samples']:,}"
+        )
+
+        self.duration_label.setText(
+        f"{stats['duration']:.4f} s"
+        )
 
         # Detection/Results tab: signal info (sample rate, candidates, modulation, SNR)
         self.results_sample_rate_label.setText(
@@ -2124,7 +2488,7 @@ class MainWindow(QMainWindow):
         self.results_il_depth_label.setText("Detected depth: —")
         self.results_il_confidence_label.setText("Confidence: —")
         self.results_il_fec_label.setText("FEC: —")
-        self.results_il_ber_label.setText("BER: no reference loaded")
+        self.results_il_ber_label.setText("BER: not measured yet")
 
         # ========================================================
         # ANALYZE SIGNAL
@@ -2465,6 +2829,30 @@ class MainWindow(QMainWindow):
         }
 
     @staticmethod
+    def _interleaving_depth_text(il_result: dict) -> str:
+        """The depth row: the identified/set depth, or why there is none.
+
+        A blind capture without code structure has no depth to report, and
+        the receiver honestly applied no deinterleaving; saying that is
+        more useful than a bare dash.
+        """
+
+        depth = il_result.get("best_depth")
+        if depth is None:
+            depth = (il_result.get("evidence") or {}).get("depth")
+
+        if depth is not None:
+            return str(depth)
+
+        status = str(il_result.get("status", "")).upper()
+
+        if status == "NONE":
+            return "— (no deinterleaving applied)"
+        if status in ("UNRESOLVED", "UNKNOWN"):
+            return "— (no depth claimed, none applied)"
+        return "—"
+
+    @staticmethod
     def _interleaving_family_label(il_result: dict) -> str:
         """Name the interleaving family the result describes.
 
@@ -2484,6 +2872,20 @@ class MainWindow(QMainWindow):
 
         if family:
             return f"{family} (configured)"
+
+        status = str(il_result.get("status", "")).upper()
+        mode = (il_result.get("evidence") or {}).get("mode")
+
+        if status == "NONE":
+            if mode == "reference_agreement":
+                return "none required (received bits already match the reference)"
+            return "none detected"
+
+        if status in ("UNRESOLVED", "UNKNOWN"):
+            return (
+                "not identifiable from a blind capture (needs a bit "
+                "reference or a decodable FEC code)"
+            )
 
         return "—"
 
@@ -2652,12 +3054,10 @@ class MainWindow(QMainWindow):
             f"{demod.get('num_bits')} bits"
             )
 
-        ber = self._pipeline_ber_summary
-
-        if ber:
-            lines.append(f"BER: {float(ber.get('ber', 0.0)):.6g}")
-        else:
-            lines.append("BER: no reference loaded")
+        # One shared BER formatter: measured when a reference exists, the
+        # EVM-based estimate otherwise.  The summary dialog and the results
+        # rows must never disagree about the same run.
+        lines.append(self._ber_display_text())
 
         fec = self._pipeline_fec_summary
 
@@ -2665,6 +3065,13 @@ class MainWindow(QMainWindow):
             lines.append(
             f"FEC ({fec.get('scheme')}): corrected "
             f"{fec.get('corrected_errors', 0)} errors"
+            )
+
+        interleaving = getattr(self, "_interleaving_result", None)
+
+        if interleaving is not None:
+            lines.append(
+            f"Interleaving: {self._interleaving_status_text(interleaving)}"
             )
 
         auto = demod.get("fec_identification")
@@ -2679,16 +3086,433 @@ class MainWindow(QMainWindow):
         ml = self._pipeline_ml_summary
 
         if ml:
-            lines.append(
-            f"ML (CNN): {ml.get('predicted_class', '?')} "
-            f"{float(ml.get('confidence', 0.0)) * 100:.0f}%"
-            )
-            if not ml.get("trained", False):
+
+            # ``self.modulation_result`` is the DSP classification the ML
+            # line is compared against (this method has no local copy).
+            line = self._format_ml_summary(ml, self.modulation_result)
+
+            if line:
+
+                lines.append(line)
+
+            top3 = ml.get("top3") or []
+
+            if top3:
+
                 lines.append(
-                "ML (CNN): UNTRAINED artifact — scores unvalidated"
+                "ML top-3: "
+                + ", ".join(
+                f"{entry.get('class', '?')} "
+                f"{float(entry.get('score', 0.0)) * 100:.0f}%"
+                for entry in top3
+                )
                 )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_ml_summary(ml, dsp_modulation=None):
+        """The ML row: the model's verdict, or the DSP classification.
+
+        A validated model whose scores clear the confidence and
+        agreement floors shows its own verdict with its own confidence.
+
+        Otherwise the row shows the class the deterministic chain
+        produced, for one of two different reasons: the artifact is
+        unvalidated (a training-level gate), or this capture's scores
+        missed the floors (a per-capture gate) — or inference never ran
+        because the capture is shorter than one artifact frame.  In every
+        one of those cases the network's own class is still named as
+        ``CNN said ...`` when there is one, and kept in the JSON export as
+        ``ml_raw_class``.
+        """
+
+        if not ml:
+
+            return None
+
+        # A validated model keeps its own verdict ...
+        if (
+        str(ml.get("presented_as", "evidence")) == "prediction"
+        and not ml.get("mirrored_from_dsp")
+        ):
+
+            predicted = ml.get("predicted_class") or "?"
+
+            confidence = float(ml.get("confidence", 0.0)) * 100.0
+
+            line = f"ML Prediction: {predicted} ({confidence:.0f}%)"
+
+            canonical = ml.get("predicted_class_canonical") or predicted
+
+            if (
+            dsp_modulation
+            and str(dsp_modulation) != "Unknown"
+            and str(dsp_modulation) != str(canonical)
+            ):
+
+                line += f" — disagrees with DSP ({dsp_modulation})"
+
+            return line
+
+        # ... otherwise the row shows the classification the DSP chain
+        # produced, because the CNN's argmax must not be presented as the
+        # ML verdict (unvalidated artifact, scores below the per-capture
+        # floors, or inference skipped for a too-short capture).  The
+        # network's own answer, when there is one, stays in the
+        # JSON/export as ``ml_raw_class``.
+        display = (
+        ml.get("display_class")
+        or dsp_modulation
+        or ml.get("predicted_class")
+        or "?"
+        )
+
+        # The displayed class is a mirror of the deterministic chain unless
+        # the network's own argmax is what is shown: an explicit
+        # ``display_class``, or the DSP classification used as the fallback,
+        # is the DSP answer and must be labelled as such.
+        mirrored = bool(
+        ml.get("mirrored_from_dsp")
+        or ml.get("display_source") == "dsp_mirror"
+        or str(display) != str(ml.get("predicted_class"))
+        )
+
+        # The CNN's confidence belongs to its own label; printed next to a
+        # mirrored class it would misstate how sure the deterministic chain
+        # is, so a mirror only ever shows the mirror's own confidence.
+        conf_source = (
+        ml.get("display_confidence")
+        if mirrored
+        else ml.get("confidence")
+        )
+
+        try:
+
+            conf = (
+            float(conf_source)
+            if conf_source is not None
+            else None
+            )
+
+        except (TypeError, ValueError):
+
+            conf = None
+
+        line = f"ML Prediction: {display}"
+
+        if conf is not None:
+
+            line += f" ({conf * 100:.0f}%)"
+
+        raw = ml.get("ml_raw_class") or ml.get("predicted_class")
+
+        if mirrored:
+
+            line += " — from DSP analysis"
+
+            if raw and str(raw) != str(display):
+
+                line += f" (CNN said {raw})"
+
+        elif not ml.get("validated", False):
+
+            line += " — unvalidated CNN output (evidence only)"
+
+        return line
+
+    # ========================================================
+    # BER / BIT STREAM READ-OUT
+    # ========================================================
+
+    def _ber_display_text(self):
+        """One BER line: measured against a reference, else an estimate.
+
+        A measured BER needs a transmitted reference.  Without one the
+        receiver still reports the EVM-based estimate, so the row is never
+        left as a bare "no reference loaded".
+        """
+
+        ber = self._pipeline_ber_summary
+
+        fec = self._pipeline_fec_summary or {}
+
+        if ber:
+
+            post_fec = fec.get("post_fec_ber")
+
+            post_txt = (
+            f" | post-FEC {float(post_fec):.3g}"
+            if post_fec is not None
+            else ""
+            )
+
+            return (
+            f"BER: {float(ber.get('ber', 1.0)):.6g} "
+            f"({ber.get('bit_errors', '?')}/"
+            f"{ber.get('compared_bits', '?')} bits){post_txt}"
+            )
+
+        quality = (self._pipeline_demod_summary or {}).get(
+        "quality_estimate"
+        ) or {}
+
+        if quality:
+
+            return (
+            "BER: not measured (no reference) — EVM "
+            f"{float(quality.get('evm_percent', 0.0)):.2f}%, "
+            f"SNR est {float(quality.get('snr_db', 0.0)):.1f} dB, "
+            f"BER est {float(quality.get('ber_estimate', 0.0)):.3g}"
+            )
+
+        return "BER: not measured yet (no reference and no constellation estimate)"
+
+    def _recovered_symbols(self):
+        """Recovered synchronized symbols (I/Q) from the last analysis."""
+
+        demod = self._pipeline_demod_summary or {}
+
+        payload = (demod.get("constellation") or {}).get("symbols") or []
+
+        out = []
+
+        for item in payload:
+
+            try:
+
+                real, imag = item
+
+                out.append((float(real), float(imag)))
+
+            except (TypeError, ValueError):
+
+                continue
+
+        return out
+
+    def _bit_streams(self):
+        """(label, bits) pairs for every bitstream the receiver produced."""
+
+        demod = self._pipeline_demod_summary or {}
+
+        fec = self._pipeline_fec_summary or {}
+
+        streams = []
+
+        for label, key in (
+        ("Demodulated (received)", "received_bits"),
+        ("Codeword-aligned", "aligned_bits"),
+        ("Deinterleaved", "deinterleaved_bits"),
+        ):
+
+            bits = demod.get(key)
+
+            if bits is not None:
+
+                streams.append((label, bits))
+
+        decoded = fec.get("decoded_bits") if fec else None
+
+        if decoded is not None:
+
+            streams.append(("FEC-decoded payload", decoded))
+
+        return streams
+
+    def show_symbols_dialog(self):
+        """Open the recovered-symbols inspector (a small dialog)."""
+
+        symbols = self._recovered_symbols()
+
+        if not symbols:
+
+            QMessageBox.information(
+            self,
+            "Recovered symbols",
+            "No recovered symbols yet.\n\nLoad a capture and press "
+            "\"Analyze Signal\" — the Constellation tab then shows the "
+            "recovered symbol lattice, and this window lists its values.",
+            )
+
+            return
+
+        total = len(symbols)
+
+        lines = [
+        f"Recovered symbols: {total} (synchronized hard-decision points)",
+        f"Modulation: {self.modulation_result}",
+        "",
+        f"{'#':>6}  {'I':>16}  {'Q':>16}  {'|S|':>12}",
+        ]
+
+        for index, (real, imag) in enumerate(symbols[:1000]):
+
+            magnitude = (real**2 + imag**2) ** 0.5
+
+            lines.append(
+            f"{index:>6}  {real:>+16.8f}  {imag:>+16.8f}  "
+            f"{magnitude:>12.6f}"
+            )
+
+        if total > 1000:
+
+            lines.append(
+            f"... {total - 1000} more symbol(s); export JSON for the "
+            "full set"
+            )
+
+        self._show_text_dialog(
+        "Recovered Symbols",
+        "\n".join(lines),
+        save_name="symbols.txt",
+        )
+
+    def show_bits_dialog(self):
+        """Open the bitstream / BER inspector (a small dialog)."""
+
+        demod = self._pipeline_demod_summary or {}
+
+        il_result = getattr(self, "_interleaving_result", None) or {}
+
+        identification = getattr(self, "_identification_result", None) or {}
+
+        quality = demod.get("quality_estimate") or {}
+
+        lines = [
+        "BIT STREAM / BER — last analysis",
+        "=" * 34,
+        f"Modulation: {self.modulation_result}",
+        self._ber_display_text(),
+        ]
+
+        if quality:
+
+            lines.append(
+            f"  EVM {float(quality.get('evm_percent', 0.0)):.2f}%  |  "
+            f"SNR est {float(quality.get('snr_db', 0.0)):.2f} dB  |  "
+            f"BER est {float(quality.get('ber_estimate', 0.0)):.3g}  "
+            f"({quality.get('method')})"
+            )
+
+        lines.append(
+        f"Interleaving: {il_result.get('status', 'not run')} "
+        f"(family {il_result.get('family') or '—'}, "
+        f"depth {il_result.get('best_depth')})"
+        )
+
+        lines.append(
+        f"Auto FEC: {identification.get('status', 'not run')} "
+        f"(scheme {identification.get('best_scheme')})"
+        )
+
+        fec = self._pipeline_fec_summary or {}
+
+        if fec:
+
+            lines.append(
+            f"FEC decode: {fec.get('scheme')} — "
+            f"{fec.get('decoded_bit_count', 0)} bits, "
+            f"{fec.get('uncorrectable_blocks', 0)} uncorrectable"
+            )
+
+        lines.append("")
+
+        streams = self._bit_streams()
+
+        if not streams:
+
+            lines.append(
+            "No bitstream available: the analysis produced no "
+            "demodulated bits."
+            )
+
+        for label, bits in streams:
+
+            values = [int(bit) for bit in bits]
+
+            ones = sum(values)
+
+            lines.append(f"--- {label} ({len(values)} bits) ---")
+
+            lines.append(f"ones={ones}  zeros={len(values) - ones}")
+
+            preview = "".join(str(bit) for bit in values[:512])
+
+            if preview:
+
+                lines.append(preview)
+
+            if len(values) > 512:
+
+                lines.append(f"... {len(values) - 512} more bit(s)")
+
+            lines.append("")
+
+        self._show_text_dialog(
+        "Bit Stream / BER",
+        "\n".join(lines),
+        save_name="bitstream.txt",
+        )
+
+    def _show_text_dialog(self, title, text, save_name="spectra.txt"):
+        """Small read-only text window with Copy / Save / Close."""
+
+        dialog = QDialog(self)
+
+        dialog.setWindowTitle(title)
+
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout(dialog)
+
+        view = QPlainTextEdit()
+
+        view.setReadOnly(True)
+
+        view.setPlainText(text)
+
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        layout.addWidget(view)
+
+        buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Close
+        )
+
+        copy_button = buttons.addButton(
+        "Copy",
+        QDialogButtonBox.ButtonRole.ActionRole,
+        )
+
+        save_button = buttons.addButton(
+        "Save…",
+        QDialogButtonBox.ButtonRole.ActionRole,
+        )
+
+        def _copy():
+
+            QApplication.clipboard().setText(text)
+
+        def _save():
+
+            path, _ = QFileDialog.getSaveFileName(
+            dialog, "Save", save_name, "Text files (*.txt);;All files (*)"
+            )
+
+            if path:
+
+                Path(path).write_text(text, encoding="utf-8")
+
+        copy_button.clicked.connect(_copy)
+
+        save_button.clicked.connect(_save)
+
+        buttons.rejected.connect(dialog.reject)
+
+        layout.addWidget(buttons)
+
+        dialog.exec()
 
     # ========================================================
     # ANALYSIS PARAMETERS
@@ -2815,14 +3639,13 @@ class MainWindow(QMainWindow):
             f"Timing Confidence: {self.timing_confidence * 100:.1f}%"
             )
 
-        ber = self._pipeline_ber_summary
+        self.parameter_ber.setText(
+        self._ber_display_text()
+        )
 
-        if ber is not None:
-            self.parameter_ber.setText(
-            f"BER: {float(ber.get('ber', 1.0)):.6g} "
-            f"({ber.get('bit_errors', '?')}/"
-            f"{ber.get('compared_bits', '?')} bits)"
-            )
+        self.results_il_ber_label.setText(
+        self._ber_display_text()
+        )
 
         demod = self._pipeline_demod_summary or {}
 
@@ -2901,12 +3724,19 @@ class MainWindow(QMainWindow):
             ident_conf = float(identification.get("confidence") or 0.0)
 
             if ident_status == "AUTO_DETECTED" and ident_scheme:
+                # Identification confidence is a 0..1 score; a few
+                # pre-formatted payloads carry it as a percentage.  Accept
+                # both so the row never prints "confidence 0".
+                if ident_conf > 1.5:
+                    ident_conf = ident_conf / 100.0
                 self.parameter_fec_auto.setText(
-                f"Auto FEC: {ident_scheme} (confidence {ident_conf:.0f})"
+                f"Auto FEC: {ident_scheme} "
+                f"(confidence {ident_conf * 100:.0f}%)"
                 )
             else:
                 self.parameter_fec_auto.setText(
-                f"Auto FEC: {ident_status} (no scheme claimed)"
+                f"Auto FEC: none detected ({ident_status.lower()}, no "
+                "scheme claimed)"
                 )
         else:
             self.parameter_fec_auto.setText("Auto FEC: not run")
@@ -2917,7 +3747,7 @@ class MainWindow(QMainWindow):
         il_result = getattr(self, "_interleaving_result", None)
 
         if il_result is not None:
-            il_status = il_result.get("status", "UNKNOWN")
+            il_status = self._interleaving_status_text(il_result)
 
             self.parameter_interleaving_mode.setText(
             f"Interleaving mode: {il_status}"
@@ -2927,10 +3757,8 @@ class MainWindow(QMainWindow):
             f"Detected type: {self._interleaving_family_label(il_result)}"
             )
 
-            depth = il_result.get("best_depth")
-
             self.parameter_interleaving_depth.setText(
-            f"Detected depth: {depth if depth is not None else '—'}"
+            "Detected depth: " + self._interleaving_depth_text(il_result)
             )
 
             self.parameter_interleaving_status.setText(f"Status: {il_status}")
@@ -2973,10 +3801,15 @@ class MainWindow(QMainWindow):
         ml = getattr(self, "_pipeline_ml_summary", None)
 
         if ml:
+
             self.parameter_ml.setText(
-            f"ML Prediction: {ml.get('predicted_class', '?')} "
-            f"({float(ml.get('confidence', 0.0)) * 100:.0f}%)"
+            self._format_ml_summary(
+            ml,
+            modulation
             )
+            or "ML Prediction: unavailable"
+            )
+
         elif self.ml_checkbox.isChecked():
             self.parameter_ml.setText(
             "ML Prediction: unavailable (artifact missing or capture "
@@ -3133,7 +3966,7 @@ class MainWindow(QMainWindow):
         self._pipeline_ber_summary = None
 
         self.parameter_ber.setText(
-        "BER Validation: No reference loaded"
+        "BER Validation: not measured yet"
         )
 
         self.parameter_recovered_bits.setText(
@@ -3228,6 +4061,148 @@ class MainWindow(QMainWindow):
         # VISUALIZATIONS
         # ========================================================
 
+    # ========================================================
+    # GNU RADIO SPECTRUM / WATERFALL (visualization only)
+    # ========================================================
+
+    def _on_gnuradio_viz_toggled(self, checked):
+        """Enable/disable the GNU Radio FFT path and report why."""
+
+        self._gnuradio_viz_result = None
+
+        self._gnuradio_viz_samples = None
+
+        try:
+
+            from prototype.io.gnuradio.viz import gnuradio_available
+
+            available, detail = gnuradio_available()
+
+        except Exception as exc:  # noqa: BLE001 - reported in the GUI
+
+            self.gnuradio_viz_status.setText(
+            f"GNU Radio visualization unavailable: {exc}"
+            )
+
+            return
+
+        if not checked:
+
+            self.gnuradio_viz_status.setText(
+            "Built-in NumPy spectrum/waterfall plots are used."
+            )
+
+            return
+
+        if available:
+
+            self.gnuradio_viz_status.setText(
+            f"GNU Radio {detail} — Spectrum and Waterfall will use the "
+            "flowgraph."
+            )
+
+        else:
+
+            self.gnuradio_viz_status.setText(
+            "GNU Radio not available "
+            f"({detail}); the built-in NumPy plots are used and "
+            "labelled as such."
+            )
+
+        self._refresh_active_plot()
+
+    def _update_gnuradio_viz_status(self):
+        """One-line description shown when the tab is opened.
+
+        The availability probe runs a subprocess, so it is deliberately
+        NOT executed while building the window: the row describes the
+        behaviour and the probe happens when the toggle is used.
+        """
+
+        self.gnuradio_viz_status.setText(
+        "Tick to run the GNU Radio headless FFT flowgraph for the "
+        "Spectrum and Waterfall tabs (visualization only). Falls back to "
+        "the built-in NumPy plots when GNU Radio is unavailable."
+        )
+
+    def _gnuradio_spectrum_waterfall(self):
+        """GNU Radio FFT matrices for the current capture, or None.
+
+        Computed at most once per capture: the flowgraph runs in a
+        subprocess, so switching tabs must never re-run it.  ``None``
+        means "draw the built-in NumPy plot instead" (the status row
+        already explains why).
+        """
+
+        if self.samples is None:
+
+            return None
+
+        if not self.gnuradio_viz_checkbox.isChecked():
+
+            return None
+
+        if (
+        self._gnuradio_viz_result is not None
+        and getattr(self, "_gnuradio_viz_samples", None) is self.samples
+        ):
+
+            result = self._gnuradio_viz_result
+
+        else:
+
+            try:
+
+                from prototype.io.gnuradio.viz import (
+                compute_spectrum_waterfall,
+                )
+
+                result = compute_spectrum_waterfall(
+                self.samples,
+                float(self.sample_rate or 0.0),
+                )
+
+            except Exception as exc:  # noqa: BLE001 - reported in the GUI
+
+                self.gnuradio_viz_status.setText(
+                f"GNU Radio visualization failed: {exc}"
+                )
+
+                return None
+
+            self._gnuradio_viz_result = result
+
+            self._gnuradio_viz_samples = self.samples
+
+            self.gnuradio_viz_status.setText(
+            self._describe_gnuradio_viz(result)
+            )
+
+        if result.get("status") != "ok" or result.get("spectrum") is None:
+
+            return None
+
+        return result
+
+    @staticmethod
+    def _describe_gnuradio_viz(result):
+        """Human-readable provenance line for one GNU Radio FFT run."""
+
+        if result.get("status") == "ok":
+
+            provenance = result.get("provenance") or {}
+
+            return (
+            f"Spectrum/Waterfall: GNU Radio {result.get('fft_size')}-point "
+            f"FFT, {result.get('n_frames')} frames in "
+            f"{float(provenance.get('duration_s', 0.0)):.2f} s."
+            )
+
+        return (
+        "Spectrum/Waterfall: built-in NumPy plots "
+        f"({result.get('reason', 'GNU Radio unavailable')})."
+        )
+
     def _draw_time_domain(self):
 
         self.time_plot.set_figure(
@@ -3239,6 +4214,32 @@ class MainWindow(QMainWindow):
 
     def _draw_spectrum(self):
 
+        gnuradio = self._gnuradio_spectrum_waterfall()
+
+        if gnuradio is not None:
+
+            spectrum = gnuradio["spectrum"]
+
+            try:
+
+                figure = create_spectrum_figure_from_psd(
+                spectrum["freqs"],
+                spectrum["magnitude"],
+                title="Signal Spectrum (GNU Radio)"
+                )
+
+                self.spectrum_plot.set_figure(
+                figure
+                )
+
+                return
+
+            except Exception:  # noqa: BLE001 - fall back to NumPy
+
+                self._report_gnuradio_viz_fallback(
+                "GNU Radio spectrum could not be plotted"
+                )
+
         self.spectrum_plot.set_figure(
         create_spectrum_figure(
         self.samples,
@@ -3248,12 +4249,99 @@ class MainWindow(QMainWindow):
 
     def _draw_waterfall(self):
 
+        gnuradio = self._gnuradio_spectrum_waterfall()
+
+        if gnuradio is not None:
+
+            waterfall = gnuradio["waterfall"]
+
+            try:
+
+                figure = create_waterfall_figure_from_matrix(
+                waterfall["freqs"],
+                waterfall["times"],
+                waterfall["power_db"],
+                title="Waterfall / Spectrogram (GNU Radio)"
+                )
+
+                self.waterfall_plot.set_figure(
+                figure
+                )
+
+                return
+
+            except Exception:  # noqa: BLE001 - fall back to NumPy
+
+                self._report_gnuradio_viz_fallback(
+                "GNU Radio waterfall could not be plotted"
+                )
+
         self.waterfall_plot.set_figure(
         create_waterfall_figure(
         self.samples,
         self.sample_rate
         )
         )
+
+    def _report_gnuradio_viz_fallback(self, reason):
+        """Record that the GNU Radio figure failed and NumPy took over."""
+
+        self._gnuradio_viz_result = {
+        "status": "unavailable",
+        "backend_used": "numpy",
+        "source": "NumPy",
+        "spectrum": None,
+        "waterfall": None,
+        "reason": reason,
+        }
+
+        self.gnuradio_viz_status.setText(
+        f"Spectrum/Waterfall: built-in NumPy plots ({reason})."
+        )
+
+    # ========================================================
+    # LIGHT / DARK THEME
+    # ========================================================
+
+    def toggle_theme(self):
+        """Switch between the light and dark theme."""
+
+        self.set_theme(other_theme(self.theme_mode))
+
+    def set_theme(self, mode):
+        """Apply ``mode`` to the application, the widgets and the plots."""
+
+        self.theme_mode = apply_theme(self, mode)
+
+        for plot in self._plot_widgets():
+
+            plot.theme_mode = self.theme_mode
+
+            style_canvas(plot.canvas, self.theme_mode)
+
+        self._update_theme_button()
+
+    def _update_theme_button(self):
+
+        if self.theme_mode == "dark":
+
+            self.theme_button.setText("\u2600 Light")
+
+            self.theme_button.setToolTip("Switch back to the light theme")
+
+        else:
+
+            self.theme_button.setText("\U0001F319 Dark")
+
+            self.theme_button.setToolTip("Switch to the dark theme")
+
+    def _plot_widgets(self):
+        """Every embedded plot widget that carries a Matplotlib canvas."""
+
+        return [
+        widget
+        for widget in self.findChildren(PlotWidget)
+        ]
 
     def _draw_constellation(self):
 
@@ -3451,7 +4539,7 @@ class MainWindow(QMainWindow):
         self.results_il_depth_label.setText("Detected depth: —")
         self.results_il_confidence_label.setText("Confidence: —")
         self.results_il_fec_label.setText("FEC: —")
-        self.results_il_ber_label.setText("BER: no reference loaded")
+        self.results_il_ber_label.setText("BER: not measured yet")
 
         self.parameter_decision_margin.setText(
         "Decision Margin: —"
@@ -3564,7 +4652,7 @@ class MainWindow(QMainWindow):
         )
 
         self.parameter_ber.setText(
-        "BER Validation: No reference loaded"
+        "BER Validation: not measured yet"
         )
 
         self.parameter_selected.setText(

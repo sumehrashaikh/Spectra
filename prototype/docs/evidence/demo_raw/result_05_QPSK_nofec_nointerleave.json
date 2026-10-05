@@ -1,0 +1,51 @@
+{
+  "case": "QPSK_nofec_nointerleave",
+  "origin": "matrix",
+  "expected_modulation": "QPSK",
+  "expected_fec": null,
+  "expected_interleaver": null,
+  "expected_interleave_param": null,
+  "payload_bits": 1024,
+  "coded_bits": 1024,
+  "capture_samples": 40973,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": false,
+  "notes": [
+    "modulation=QPSK",
+    "fec=None",
+    "interleave=None",
+    "awgn_amplitude=0.004"
+  ],
+  "auto": {
+    "detected_modulation": "QPSK",
+    "symbol_rate_est": 99.970711705555,
+    "symbol_rate_confidence": 99.99999778475916,
+    "symbol_rate_method": "delay_multiply+cyclostationarity",
+    "snr_db": 53.71790576046322,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNRESOLVED",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": null,
+    "warnings": []
+  },
+  "configured": {
+    "detected_modulation": "QPSK",
+    "symbol_rate_est": 99.970711705555,
+    "snr_db": 53.71790576046322,
+    "coded_stream_ber": null,
+    "fec_scheme": null,
+    "fec_source": null,
+    "uncorrectable_blocks": null,
+    "corrected_errors": null,
+    "decoded_bits": 0,
+    "payload_prefix_matched": 0,
+    "payload_recovered": false,
+    "interleaver_status": "NONE",
+    "codeword_alignment": null,
+    "warnings": []
+  }
+}

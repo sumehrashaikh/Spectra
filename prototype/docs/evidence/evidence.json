@@ -1,0 +1,1099 @@
+{
+  "project": "SPECTRA",
+  "problem_statement": {
+    "id": "SIH26147 (PS 147)",
+    "title": "Automated model for analysis of .IQ and .wav files along with signal parameter extraction",
+    "organisation": "NTRO",
+    "theme": "Miscellaneous",
+    "category": "Software"
+  },
+  "environment": {
+    "python": "3.13.1",
+    "platform": "Windows-10-10.0.19045-SP0",
+    "generated_utc": "2026-09-29 16:31 UTC",
+    "numpy": "2.2.3",
+    "scipy": "1.17.1",
+    "PySide6": "6.11.2",
+    "matplotlib": "3.11.2",
+    "gnuradio": "not installed (synthetic fallback used)",
+    "git_commit": "8b697cc",
+    "git_branch": "feature/gnuradio-gui-v1",
+    "git_commit_count": "8",
+    "git_first_commit": [
+      "2026-09-16"
+    ],
+    "git_last_commit": "2026-09-29"
+  },
+  "requirement_matrix": [
+    {
+      "rid": "R01",
+      "area": "Capture ingest",
+      "requirement": "Load .wav and .IQ captures that store the waveform differently",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "io/loaders.py",
+        "core/loader.py"
+      ],
+      "tests": [
+        "tests/test_io_loaders.py"
+      ],
+      "evidence_note": "WAV (mono -> Hilbert analytic, stereo -> IQ, 8/16/32-bit PCM and float) plus raw interleaved IQ (complex64/128, float32/64, int8/uint8/int16/int32, both endianness, I-first or Q-first), separate I/Q files, JSON sidecars and chunked streaming.",
+      "missing": []
+    },
+    {
+      "rid": "R02",
+      "area": "Pre-processing",
+      "requirement": "Condition the capture before measurement",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "core/preprocessor.py"
+      ],
+      "tests": [
+        "tests/test_core_modules.py"
+      ],
+      "evidence_note": "DC removal, noise-floor estimate, SNR, normalisation.",
+      "missing": []
+    },
+    {
+      "rid": "R03",
+      "area": "Detection / segmentation",
+      "requirement": "Find the signals inside a wide capture",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "detection/detector.py",
+        "core/analyzer.py",
+        "dsp/spectral.py"
+      ],
+      "tests": [
+        "tests/test_dsp.py",
+        "tests/test_detection_isolation.py"
+      ],
+      "evidence_note": "FFT/STFT spectral peaks and regions with an energy threshold; multi-candidate output with frequency/bandwidth/peak level.",
+      "missing": []
+    },
+    {
+      "rid": "R04",
+      "area": "Extraction / DDC",
+      "requirement": "Isolate one signal for measurement",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "core/isolator.py",
+        "dsp/filters.py"
+      ],
+      "tests": [
+        "tests/test_detection_isolation.py"
+      ],
+      "evidence_note": "Digital down-conversion: mix to baseband, low-pass, decimate.",
+      "missing": []
+    },
+    {
+      "rid": "R05",
+      "area": "Parameter extraction",
+      "requirement": "Identify signal parameters (sampling frequency and beyond)",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "parameters/extractor.py",
+        "parameters/symbol_rate.py"
+      ],
+      "tests": [
+        "tests/test_parameter_extractor.py",
+        "tests/test_symbol_rate.py",
+        "tests/test_symbol_rate_rect_qam.py",
+        "tests/test_bpsk_parameters.py"
+      ],
+      "evidence_note": "Sample rate (from file/sidecar), centre frequency, bandwidth, SNR, PAPR, DC offset, symbol rate (M-th power / QAM-specific / BFSK estimators), samples-per-symbol and pulse-shape roll-off.",
+      "missing": []
+    },
+    {
+      "rid": "R06",
+      "area": "Synchronisation",
+      "requirement": "Make the measurement valid before deciding anything",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "core/synchronizer.py",
+        "core/carrier_sync.py",
+        "synchronization/timing.py",
+        "synchronization/frequency.py"
+      ],
+      "tests": [
+        "tests/test_synchronizer.py",
+        "tests/test_synchronization.py",
+        "tests/test_timing_recovery.py",
+        "tests/test_carrier_recovery.py"
+      ],
+      "evidence_note": "Gardner-type timing recovery plus carrier phase/frequency recovery.",
+      "missing": []
+    },
+    {
+      "rid": "R07",
+      "area": "Modulation classification",
+      "requirement": "Identify the modulation type",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 0.85,
+      "weight": 1.0,
+      "modules": [
+        "modulation/classifier.py",
+        "classification/classifier.py",
+        "modulation/digital.py"
+      ],
+      "tests": [
+        "tests/test_classification_pipeline.py",
+        "tests/test_advanced_modulation.py"
+      ],
+      "evidence_note": "Waveform gates (frequency/magnitude bimodality, r2 phase coherence, amplitude spread) plus a constellation classifier on synchronised symbols. Six classes are returned; anything the evidence does not support is returned as 'Unknown', which costs autonomy but is the honest behaviour.",
+      "missing": []
+    },
+    {
+      "rid": "R08",
+      "area": "Demodulation",
+      "requirement": "Demodulate FSK, QAM and PSK",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 0.9,
+      "weight": 1.0,
+      "modules": [
+        "demodulation/demodulator.py",
+        "demodulation/qpsk_sync.py",
+        "modulation/fsk.py",
+        "modulation/psk.py",
+        "modulation/qam.py"
+      ],
+      "tests": [
+        "tests/test_demodulation_pipeline.py",
+        "tests/test_end_to_end_qpsk_full.py",
+        "tests/test_end_to_end_qam16_full.py",
+        "tests/test_end_to_end_bpsk_full.py",
+        "tests/test_qpsk_phase_resolution.py"
+      ],
+      "evidence_note": "BPSK, QPSK, 8-PSK, 16-QAM, BFSK and OOK/ASK decision chains. Known residuals are documented rather than hidden: 16-QAM blind phase keeps a non-90-degree rotation and 8-PSK keeps a pi/4 rotation; both are resolved against a reference when one exists.",
+      "missing": []
+    },
+    {
+      "rid": "R09",
+      "area": "Quality measurement (BER)",
+      "requirement": "Quantify how good the recovered bit stream is",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 0.9,
+      "weight": 1.0,
+      "modules": [
+        "core/ber.py",
+        "core/provenance.py"
+      ],
+      "tests": [
+        "tests/test_pipeline.py",
+        "tests/test_end_to_end_qpsk.py"
+      ],
+      "evidence_note": "BER against the transmitted reference with an explicit ambiguity search (BPSK polarity, QPSK 90-degree, 16-QAM rotation x symbol origin). Without a reference the tool says 'no reference loaded' instead of inventing a number.",
+      "missing": []
+    },
+    {
+      "rid": "R10",
+      "area": "FEC decoder library",
+      "requirement": "FEC: convolutional + Viterbi, RS block codes, concatenated codes, LDPC",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 0.0,
+      "weight": 1.0,
+      "modules": [
+        "fec/framework.py",
+        "fec/convolutional.py",
+        "fec/reed_solomon.py",
+        "fec/ldpc.py",
+        "fec/concatenated.py",
+        "fec/hamming.py",
+        "fec/repetition.py",
+        "fec/crc.py"
+      ],
+      "tests": [
+        "tests/test_fec.py",
+        "tests/test_fec_schemes_extended.py"
+      ],
+      "evidence_note": "Six registered schemes: hamming74, repetition3, conv12 (K=7 rate-1/2 Viterbi), reedsolomon (shortened GF(256), 32+8, t=4), ldpc (compact (3,6) regular, hard-decision bit-flip) and concatenated (RS outer + convolutional inner). Autonomy is 0 by design: FEC is never inferred, the caller selects the scheme.",
+      "missing": []
+    },
+    {
+      "rid": "R11",
+      "area": "FEC identification",
+      "requirement": "Identify FEC from the observation data itself",
+      "status": "PARTIAL",
+      "implementation": 0.55,
+      "autonomy": 0.55,
+      "weight": 1.0,
+      "modules": [
+        "fec/identification.py"
+      ],
+      "tests": [
+        "tests/test_fec_identification.py",
+        "tests/test_fec_identification_extended.py",
+        "tests/test_pipeline_fec_identification.py"
+      ],
+      "evidence_note": "A candidate evaluator, not a decoder-and-hope: it runs the real decoders and scores structural/decoder evidence, reports AUTO_DETECTED only at MIN_CONFIDENCE=60 with compatible structure, and otherwise returns UNKNOWN/UNRESOLVED. CRC16/CRC32 are used as validity evidence only, never as a decoding hypothesis. Known gap: the scored candidate set is fixed; unknown/vendor schemes and long-block LDPC recognition are the roadmap.",
+      "missing": []
+    },
+    {
+      "rid": "R12",
+      "area": "De-interleaver library",
+      "requirement": "De-interleaving: block, convolutional, diagonal, pseudo-random",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 0.0,
+      "weight": 1.0,
+      "modules": [
+        "fec/interleaving.py"
+      ],
+      "tests": [
+        "tests/test_interleaving_families.py",
+        "tests/test_cli_interleaving.py"
+      ],
+      "evidence_note": "All four families implemented and round-trip tested through the receiver's own deinterleaver, including the frame-length constraints (block/convolutional/pseudo-random need a whole multiple of the stride; diagonal needs exactly depth^2 bits). Autonomy is 0 by design: the family and depth are configured.",
+      "missing": []
+    },
+    {
+      "rid": "R13",
+      "area": "Interleaver identification",
+      "requirement": "Identify the interleaver from the observation data itself",
+      "status": "PARTIAL",
+      "implementation": 0.45,
+      "autonomy": 0.45,
+      "weight": 1.0,
+      "modules": [
+        "fec/identification_interleaving.py"
+      ],
+      "tests": [
+        "tests/test_interleaving_identification.py",
+        "tests/test_pipeline_interleaving.py"
+      ],
+      "evidence_note": "Structural identification of the row-column block interleaver only: bounded depth search, applicability as a gate, deterministic scoring; AUTO_DETECTED requires confidence >= 55 and a >= 12 margin over the no-interleaving baseline, otherwise NO_INTERLEAVING/UNKNOWN. Convolutional, diagonal and pseudo-random are deliberately down-weighted: they appear as weak hypotheses, never as a claim.",
+      "missing": []
+    },
+    {
+      "rid": "R14",
+      "area": "Bit stream correlation",
+      "requirement": "Correlate the bit stream to find header and payload",
+      "status": "PARTIAL",
+      "implementation": 0.35,
+      "autonomy": 0.35,
+      "weight": 1.0,
+      "modules": [
+        "protocol/config.py",
+        "protocol/parser.py",
+        "protocol/semantics.py",
+        "dsp/correlation.py"
+      ],
+      "tests": [
+        "tests/test_protocol.py",
+        "tests/test_protocol_pipeline.py",
+        "tests/test_protocol_semantics.py"
+      ],
+      "evidence_note": "Sync-word correlation, frame extraction and semantic field parsing run against an explicitly configured FrameConfig; an unmatched capture returns Unknown rather than a guess. Known gap: automatic discovery of an unknown frame format / header length / payload partition is roadmap, and prototype/correlation/ is still empty.",
+      "missing": []
+    },
+    {
+      "rid": "R15",
+      "area": "GUI + reporting",
+      "requirement": "GUI-based model with visualisation and export",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "gui/window.py",
+        "gui/worker.py",
+        "visualization/plots.py",
+        "reporting/export.py"
+      ],
+      "tests": [
+        "tests/test_gui_fec_demo.py",
+        "tests/test_gui_interleaving.py",
+        "tests/test_gui_gnuradio.py"
+      ],
+      "evidence_note": "PySide6 desktop GUI: source selection, spectrum / waterfall / time-domain / recovered-constellation tabs, per-signal parameter rows, FEC and interleaving controls, frame-search controls, batch candidate analysis, JSON/HTML export and a provenance dialog.",
+      "missing": []
+    },
+    {
+      "rid": "R16",
+      "area": "Automation + provenance",
+      "requirement": "Automated analysis with a defensible result",
+      "status": "VERIFIED",
+      "implementation": 1.0,
+      "autonomy": 1.0,
+      "weight": 1.0,
+      "modules": [
+        "pipeline.py",
+        "pipeline_batch.py",
+        "core/provenance.py",
+        "cli.py"
+      ],
+      "tests": [
+        "tests/test_pipeline.py",
+        "tests/test_pipeline_batch.py",
+        "tests/test_final_integration.py"
+      ],
+      "evidence_note": "One call drives the whole chain (analyze_samples/analyze_capture), batch mode sweeps every detected candidate, and every stage records method, timings, software version and git commit in a provenance manifest that is exported with the result.",
+      "missing": []
+    },
+    {
+      "rid": "R17",
+      "area": "GNU Radio / live ingest",
+      "requirement": "Work with the tooling named in the statement",
+      "status": "PARTIAL",
+      "implementation": 0.5,
+      "autonomy": 0.5,
+      "weight": 0.5,
+      "modules": [
+        "io/gnuradio/source.py",
+        "io/gnuradio/adapter.py",
+        "io/gnuradio/config.py",
+        "io/gnuradio/streaming.py",
+        "io/gnuradio/gui_controller.py"
+      ],
+      "tests": [
+        "tests/test_gnuradio.py"
+      ],
+      "evidence_note": "GNU Radio is integrated as an input/streaming layer behind a documented chunk contract, with a deterministic offline synthetic source so the flow is testable without hardware. Live SDR backends (RTL-SDR/HackRF/USRP) and hardware validation are roadmap -- the GNU Radio package is not installed in this checkout.",
+      "missing": []
+    },
+    {
+      "rid": "R18",
+      "area": "ML assist",
+      "requirement": "Advanced models (optional, evidence only)",
+      "status": "EXPERIMENTAL",
+      "implementation": 0.3,
+      "autonomy": 0.3,
+      "weight": 0.25,
+      "modules": [
+        "ml/cnn.py",
+        "ml/fusion.py",
+        "ml/train.py",
+        "ml/dataset.py"
+      ],
+      "tests": [
+        "tests/test_ml_cnn.py"
+      ],
+      "evidence_note": "A NumPy-only CNN runtime with configurable fusion (side_by_side, dsp_over_ml, ml_over_dsp, max_confidence). It is a second opinion that never gates the DSP result. The packaged trained artifact reaches only 0.3125 validation accuracy on synthetic frames and the alternative artifact is unlabelled, so ML output is reported as scores, never as a calibrated detector.",
+      "missing": []
+    }
+  ],
+  "build_coverage_pct": 87.6,
+  "autonomy_pct": 73.6,
+  "tests": {
+    "command": "C:\\Users\\eiraa\\AppData\\Local\\Programs\\Python\\Python313\\python.exe -m pytest tests -q --tb=line -p no:cacheprovider",
+    "returncode": 0,
+    "summary": "435 passed",
+    "passed": 435,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "duration_s": 95.2,
+    "tail": "...                                                                      [100%]\n============================== warnings summary ===============================\nprototype/tests/test_dsp.py::TestSpectral::test_stft_inverse_roundtrip\n  C:\\Users\\eiraa\\SpectraV2\\prototype\\tests\\test_dsp.py:57: UserWarning: Input data is complex, switching to return_onesided=False\n    _, _, complex_stft = _stft(x, fs=8000, nperseg=256, noverlap=128)\n\nprototype/tests/test_negative_property.py::TestDSPProperties::test_stft_inverse_is_unit\n  C:\\Users\\eiraa\\SpectraV2\\prototype\\tests\\test_negative_property.py:157: UserWarning: Input data is complex, switching to return_onesided=False\n    _, _, complex_stft = scipy_stft(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n435 passed, 2 warnings in 92.33s (0:01:32)"
+  },
+  "auto_id_ladder": {
+    "fec_bit_level_short": [
+      {
+        "truth": "none",
+        "bit_count": 256,
+        "status": "UNKNOWN",
+        "best_scheme": null,
+        "confidence": 40.0,
+        "validation_status": "insufficient_evidence",
+        "correct": true
+      },
+      {
+        "truth": "hamming74",
+        "bit_count": 448,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "hamming74",
+        "confidence": 80.0,
+        "validation_status": "AUTO_DETECTED",
+        "correct": true
+      },
+      {
+        "truth": "repetition3",
+        "bit_count": 768,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "repetition3",
+        "confidence": 80.0,
+        "validation_status": "AUTO_DETECTED",
+        "correct": true
+      },
+      {
+        "truth": "conv12",
+        "bit_count": 524,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "conv12",
+        "confidence": 80.0,
+        "validation_status": "AUTO_DETECTED",
+        "correct": true
+      },
+      {
+        "truth": "reedsolomon",
+        "bit_count": 320,
+        "status": "UNKNOWN",
+        "best_scheme": null,
+        "confidence": 40.0,
+        "validation_status": "insufficient_evidence",
+        "correct": false
+      },
+      {
+        "truth": "ldpc",
+        "bit_count": 512,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "ldpc",
+        "confidence": 80.0,
+        "validation_status": "AUTO_DETECTED",
+        "correct": true
+      },
+      {
+        "truth": "concatenated",
+        "bit_count": 652,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "conv12",
+        "confidence": 80.0,
+        "validation_status": "AUTO_DETECTED",
+        "correct": false
+      }
+    ],
+    "fec_bit_level_short_correct": 5,
+    "fec_bit_level_long": [
+      {
+        "truth": "conv12",
+        "bit_count": 2060,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "conv12",
+        "confidence": 80.0,
+        "correct": true
+      },
+      {
+        "truth": "reedsolomon",
+        "bit_count": 1280,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "reedsolomon",
+        "confidence": 70.0,
+        "correct": true
+      },
+      {
+        "truth": "concatenated",
+        "bit_count": 2572,
+        "status": "AUTO_DETECTED",
+        "best_scheme": "concatenated",
+        "confidence": 83.0,
+        "correct": true
+      }
+    ],
+    "fec_bit_level_long_correct": 3,
+    "interleaver_blind": {
+      "truth_family": "block",
+      "truth_depth": 8,
+      "status": "UNRESOLVED",
+      "best_type": null,
+      "best_depth": null,
+      "confidence": 0.5,
+      "validator_supplied": false
+    },
+    "interleaver_with_oracle": {
+      "status": "AUTO_DETECTED",
+      "best_type": "block",
+      "best_depth": 8,
+      "confidence": 1.0,
+      "validator_supplied": true,
+      "correct": true
+    }
+  },
+  "demo_summary": {
+    "cases": 11,
+    "modulation_classified_correctly": 11,
+    "payload_recovered_with_ground_truth": 3,
+    "fec_bearing_cases": 4,
+    "fec_payloads_recovered": 3,
+    "coded_stream_decoded": 4,
+    "auto_fec_claims": 0,
+    "auto_interleaver_claims": 0,
+    "symbol_rate_max_rel_error": 0.00059,
+    "symbol_rate_mean_rel_error": 0.0003
+  },
+  "demo_matrix": [
+    {
+      "case": "16-QAM_nofec_nointerleave",
+      "origin": "matrix",
+      "expected_modulation": "16-QAM",
+      "expected_fec": null,
+      "expected_interleaver": null,
+      "expected_interleave_param": null,
+      "payload_bits": 1024,
+      "coded_bits": 1024,
+      "capture_samples": 20493,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": true,
+      "notes": [
+        "modulation=16-QAM",
+        "fec=None",
+        "interleave=None",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.9414405621706,
+        "symbol_rate_confidence": 99.9999184206112,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 45.690052256924176,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": 0.003048780487804878,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.9414405621706,
+        "snr_db": 45.690052256924176,
+        "coded_stream_ber": 0.003048780487804878,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "NONE",
+        "codeword_alignment": true,
+        "warnings": []
+      }
+    },
+    {
+      "case": "16-QAM_conv12_nointerleave",
+      "origin": "matrix",
+      "expected_modulation": "16-QAM",
+      "expected_fec": "conv12",
+      "expected_interleaver": null,
+      "expected_interleave_param": null,
+      "payload_bits": 1024,
+      "coded_bits": 2060,
+      "capture_samples": 41213,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": true,
+      "notes": [
+        "modulation=16-QAM",
+        "fec=conv12",
+        "interleave=None",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97088226730078,
+        "symbol_rate_confidence": 99.99995163180208,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 48.36480124731296,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": 0.0,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97088226730078,
+        "snr_db": 48.36480124731296,
+        "coded_stream_ber": 0.0,
+        "fec_scheme": "conv12",
+        "fec_source": "explicit_config",
+        "uncorrectable_blocks": 0,
+        "corrected_errors": null,
+        "decoded_bits": 1004,
+        "payload_prefix_matched": 1001,
+        "payload_recovered": false,
+        "interleaver_status": "NONE",
+        "codeword_alignment": true,
+        "warnings": []
+      }
+    },
+    {
+      "case": "16-QAM_reedsolomon_block",
+      "origin": "matrix",
+      "expected_modulation": "16-QAM",
+      "expected_fec": "reedsolomon",
+      "expected_interleaver": "block",
+      "expected_interleave_param": 8,
+      "payload_bits": 1024,
+      "coded_bits": 1280,
+      "capture_samples": 25613,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": true,
+      "notes": [
+        "modulation=16-QAM",
+        "fec=reedsolomon",
+        "interleave=block",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.95314696236139,
+        "symbol_rate_confidence": 99.99976615831834,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 44.92594095655698,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": 0.0,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.95314696236139,
+        "snr_db": 44.92594095655698,
+        "coded_stream_ber": 0.0,
+        "fec_scheme": "reedsolomon",
+        "fec_source": "explicit_config",
+        "uncorrectable_blocks": 0,
+        "corrected_errors": null,
+        "decoded_bits": 1024,
+        "payload_prefix_matched": 1024,
+        "payload_recovered": true,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": true,
+        "warnings": []
+      }
+    },
+    {
+      "case": "16-QAM_concatenated_block",
+      "origin": "matrix",
+      "expected_modulation": "16-QAM",
+      "expected_fec": "concatenated",
+      "expected_interleaver": "block",
+      "expected_interleave_param": 8,
+      "payload_bits": 1024,
+      "coded_bits": 2576,
+      "capture_samples": 51533,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": true,
+      "notes": [
+        "modulation=16-QAM",
+        "fec=concatenated",
+        "interleave=block",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97671349840876,
+        "symbol_rate_confidence": 99.99999392650943,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 52.130214042374774,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": 0.0,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97671349840876,
+        "snr_db": 52.130214042374774,
+        "coded_stream_ber": 0.0,
+        "fec_scheme": "concatenated",
+        "fec_source": "explicit_config",
+        "uncorrectable_blocks": 0,
+        "corrected_errors": null,
+        "decoded_bits": 1024,
+        "payload_prefix_matched": 1024,
+        "payload_recovered": true,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": true,
+        "warnings": []
+      }
+    },
+    {
+      "case": "16-QAM_concatenated_pseudo_random",
+      "origin": "matrix",
+      "expected_modulation": "16-QAM",
+      "expected_fec": "concatenated",
+      "expected_interleaver": "pseudo_random",
+      "expected_interleave_param": 3,
+      "payload_bits": 1024,
+      "coded_bits": 2572,
+      "capture_samples": 51453,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": true,
+      "notes": [
+        "modulation=16-QAM",
+        "fec=concatenated",
+        "interleave=pseudo_random",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97667729145613,
+        "symbol_rate_confidence": 99.99998560863746,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 50.118364084140865,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": 0.0,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "16-QAM",
+        "symbol_rate_est": 99.97667729145613,
+        "snr_db": 50.118364084140865,
+        "coded_stream_ber": 0.0,
+        "fec_scheme": "concatenated",
+        "fec_source": "explicit_config",
+        "uncorrectable_blocks": 0,
+        "corrected_errors": null,
+        "decoded_bits": 1024,
+        "payload_prefix_matched": 1024,
+        "payload_recovered": true,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": true,
+        "warnings": []
+      }
+    },
+    {
+      "case": "QPSK_nofec_nointerleave",
+      "origin": "matrix",
+      "expected_modulation": "QPSK",
+      "expected_fec": null,
+      "expected_interleaver": null,
+      "expected_interleave_param": null,
+      "payload_bits": 1024,
+      "coded_bits": 1024,
+      "capture_samples": 40973,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=QPSK",
+        "fec=None",
+        "interleave=None",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "symbol_rate_confidence": 99.99999778475916,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 53.71790576046322,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "snr_db": 53.71790576046322,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "NONE",
+        "codeword_alignment": null,
+        "warnings": []
+      }
+    },
+    {
+      "case": "QPSK_nofec_block",
+      "origin": "matrix",
+      "expected_modulation": "QPSK",
+      "expected_fec": null,
+      "expected_interleaver": "block",
+      "expected_interleave_param": 8,
+      "payload_bits": 1024,
+      "coded_bits": 1024,
+      "capture_samples": 40973,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=QPSK",
+        "fec=None",
+        "interleave=block",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "symbol_rate_confidence": 99.99999595861891,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 53.30554307762223,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "snr_db": 53.30554307762223,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": null,
+        "warnings": []
+      }
+    },
+    {
+      "case": "QPSK_nofec_convolutional",
+      "origin": "matrix",
+      "expected_modulation": "QPSK",
+      "expected_fec": null,
+      "expected_interleaver": "convolutional",
+      "expected_interleave_param": 2,
+      "payload_bits": 1024,
+      "coded_bits": 1024,
+      "capture_samples": 40973,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=QPSK",
+        "fec=None",
+        "interleave=convolutional",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "symbol_rate_confidence": 99.99999201870597,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 51.78008369916489,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.970711705555,
+        "snr_db": 51.78008369916489,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": null,
+        "warnings": []
+      }
+    },
+    {
+      "case": "QPSK_nofec_diagonal",
+      "origin": "matrix",
+      "expected_modulation": "QPSK",
+      "expected_fec": null,
+      "expected_interleaver": "diagonal",
+      "expected_interleave_param": 80,
+      "payload_bits": 6400,
+      "coded_bits": 6400,
+      "capture_samples": 256013,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=QPSK",
+        "fec=None",
+        "interleave=diagonal",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.99531271971627,
+        "symbol_rate_confidence": 99.99999948610709,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 57.583174996422464,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "QPSK",
+        "symbol_rate_est": 99.99531271971627,
+        "snr_db": 57.583174996422464,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": null,
+        "warnings": [
+          "Manual diagonal deinterleaving not applied: 6396 bits != diagonal depth^2=6400"
+        ]
+      }
+    },
+    {
+      "case": "8-PSK_nofec_block",
+      "origin": "matrix",
+      "expected_modulation": "8-PSK",
+      "expected_fec": null,
+      "expected_interleaver": "block",
+      "expected_interleave_param": 8,
+      "payload_bits": 1008,
+      "coded_bits": 1008,
+      "capture_samples": 26893,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=8-PSK",
+        "fec=None",
+        "interleave=block",
+        "awgn_amplitude=0.004"
+      ],
+      "auto": {
+        "detected_modulation": "8-PSK",
+        "symbol_rate_est": 99.9553770638108,
+        "symbol_rate_confidence": 99.99993356627861,
+        "symbol_rate_method": "delay_multiply+cyclostationarity",
+        "snr_db": 47.17822262402534,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNKNOWN",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": [
+          "interleaving identification did not reach a decision"
+        ]
+      },
+      "configured": {
+        "detected_modulation": "8-PSK",
+        "symbol_rate_est": 99.9553770638108,
+        "snr_db": 47.17822262402534,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "MANUALLY_CONFIGURED",
+        "codeword_alignment": null,
+        "warnings": []
+      }
+    },
+    {
+      "case": "BFSK_nofec_nointerleave",
+      "origin": "fsk",
+      "expected_modulation": "BFSK",
+      "expected_fec": null,
+      "expected_interleaver": null,
+      "expected_interleave_param": null,
+      "payload_bits": 1000,
+      "coded_bits": 1000,
+      "capture_samples": 80000,
+      "sample_rate_hz": 8000.0,
+      "true_symbol_rate": 100.0,
+      "reference_sidecar": false,
+      "notes": [
+        "modulation=BFSK",
+        "tones=500/700 Hz"
+      ],
+      "auto": {
+        "detected_modulation": "BFSK",
+        "symbol_rate_est": 99.98529627995883,
+        "symbol_rate_confidence": 100.0,
+        "symbol_rate_method": "fsk_run_length",
+        "snr_db": 58.05104480318231,
+        "fec_status": "UNKNOWN",
+        "fec_scheme": null,
+        "fec_confidence": 40.0,
+        "interleaver_status": "UNRESOLVED",
+        "interleaver_type": null,
+        "interleaver_depth": null,
+        "ber": null,
+        "warnings": []
+      },
+      "configured": {
+        "detected_modulation": "BFSK",
+        "symbol_rate_est": 99.98529627995883,
+        "snr_db": 58.05104480318231,
+        "coded_stream_ber": null,
+        "fec_scheme": null,
+        "fec_source": null,
+        "uncorrectable_blocks": null,
+        "corrected_errors": null,
+        "decoded_bits": 0,
+        "payload_prefix_matched": 0,
+        "payload_recovered": false,
+        "interleaver_status": "NONE",
+        "codeword_alignment": null,
+        "warnings": []
+      }
+    }
+  ]
+}

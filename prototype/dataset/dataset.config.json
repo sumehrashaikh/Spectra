@@ -1,0 +1,42 @@
+{
+  "dataset_id": "real-world-iq-amr-multipath",
+  "title": "Real-World IQ Dataset for Automatic Radio Modulation Recognition under Multipath Channels",
+  "role": "optional external real-world validation dataset for SPECTRA",
+  "note": "This dataset is an INPUT to validation only. Its published baseline accuracy (84.3% test accuracy reported by the dataset authors) is NOT a SPECTRA result and must never be reported as one.",
+  "files": {
+    "train": "subset_train.h5",
+    "val": "subset_val.h5",
+    "test": "subset_test.h5"
+  },
+  "frame_length": 1024,
+  "sample_rate_hz": 2000000.0,
+  "carrier_frequency_hz": 2400000000.0,
+  "snr_levels_db": [20, 22, 24, 26, 28, 30],
+  "channels": { "0": "clean", "1": "multipath" },
+  "classes": {
+    "0": "BPSK",
+    "1": "QPSK",
+    "2": "QAM",
+    "3": "GMSK",
+    "4": "OFDM",
+    "5": "NBFM",
+    "6": "WBFM"
+  },
+  "hdf5_layout": {
+    "X": "(N, 1024, 2) float16 IQ pairs (I in [:, 0], Q in [:, 1])",
+    "y_mod": "(N,) int8/int16 modulation id from classes",
+    "y_chan": "(N,) int8 channel id from channels",
+    "y_snr": "(N,) int16 labelled SNR in dB"
+  },
+  "git": {
+    "committed": false,
+    "reason": "~833 MB of binary data; not appropriate for Git",
+    "ignored_by": "dataset/.gitignore"
+  },
+  "honest_limits": [
+    "SNR coverage is 20-30 dB only: this dataset can say nothing about low-SNR behaviour, in either direction.",
+    "7 coarse classes (QAM is not split into 16/64/256-QAM; there is no 8-PSK, FSK, OOK, AM or noise class).",
+    "Captured at 2 MSps / 2.4 GHz with a HackRF One; SPECTRA's synthetic chain runs at 8 kHz baseband. Sample-rate domain shift applies.",
+    "The 84.3% baseline in the bundled paper was produced by the dataset authors' TensorFlow model, not by SPECTRA."
+  ]
+}
