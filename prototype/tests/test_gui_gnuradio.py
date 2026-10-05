@@ -61,7 +61,12 @@ _setup_offscreen_qt()
 
 # Import after the platform is configured.
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QComboBox,
+    QLabel,
+    QLineEdit,
+)
 
 from prototype.gui.window import MainWindow  # noqa: E402
 
@@ -271,6 +276,24 @@ def test_gnu_radio_controls_disabled_outside_gnuradio() -> None:
         window.deleteLater()
 
 
+def test_capture_button_requires_the_gnuradio_source() -> None:
+    """The tab is always in the tab bar, so the button must follow Source."""
+    window = _make_window()
+
+    try:
+        # Default source is WAV.
+        assert window.gnuradio_acquire_button.isEnabled() is False
+
+        window.source_selector.setCurrentText("GNU Radio")
+        assert window.gnuradio_acquire_button.isEnabled() is True
+
+        window.source_selector.setCurrentText("WAV")
+        assert window.gnuradio_acquire_button.isEnabled() is False
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def test_no_gnuradio_acquisition_starts_on_selector_change() -> None:
     """Changing the selector must NOT start GNU Radio acquisition."""
     assert not GNURadio_INSTALLED
@@ -292,6 +315,131 @@ def test_no_gnuradio_acquisition_starts_on_selector_change() -> None:
 # ---------------------------------------------------------------------------
 # GNU Radio backend integration (optional synthetic path) -- Phase 1 scope
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# GNU Radio runtime reporting (bottom information panel)
+# ---------------------------------------------------------------------------
+
+
+def test_gnuradio_tab_no_longer_claims_the_backend_is_missing() -> None:
+    """The tab must not carry a permanent "not installed" status row.
+
+    GNU Radio normally lives in its own environment, so an in-process
+    import check reported it missing while a working runtime was present;
+    that row is gone and the runtime is reported once, in the bottom
+    information panel.
+    """
+    window = _make_window()
+
+    try:
+        assert not hasattr(window, "gnuradio_status_label")
+        texts = [
+            label.text()
+            for label in window.gnuradio_tab.findChildren(QLabel)
+        ]
+        assert not any("not installed" in text.lower() for text in texts)
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_gnuradio_badge_sits_below_the_sample_count() -> None:
+    """The badge is placed directly under "Samples:" in the info panel."""
+    window = _make_window()
+
+    try:
+        layout = window.gnuradio_badge.parentWidget().layout()
+        row, column, _, column_span = layout.getItemPosition(
+            layout.indexOf(window.gnuradio_badge)
+        )
+        samples_row, samples_column, _, _ = layout.getItemPosition(
+            layout.indexOf(window.samples_label)
+        )
+
+        assert row == samples_row + 1
+        # The badge spans the two trailing columns, so it starts one
+        # column left of the "Samples:" value and covers it fully.
+        assert column == samples_column - 1
+        assert column_span == 2
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_gnuradio_badge_highlights_the_available_version() -> None:
+    window = _make_window()
+
+    try:
+        window._on_gnuradio_status((True, "GNU Radio 3.10.12.0"))
+
+        text = window.gnuradio_badge.text()
+        assert "GNU Radio 3.10.12.0" in text
+        assert "available" in text
+        assert "#137a3f" in window.gnuradio_badge.styleSheet()
+        assert window._gnuradio_runtime == (True, "GNU Radio 3.10.12.0")
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_gnuradio_badge_is_neutral_when_no_runtime_is_found() -> None:
+    window = _make_window()
+
+    try:
+        window._on_gnuradio_status((False, "no runtime (test)"))
+
+        text = window.gnuradio_badge.text()
+        assert "not detected" in text
+        style = window.gnuradio_badge.styleSheet()
+        assert "#137a3f" not in style
+        assert "#8a5a00" in style  # amber, not the green "available" look
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_runtime_probe_reports_the_runtime_status(monkeypatch) -> None:
+    """The probe is what feeds the badge; it must use the runtime check."""
+    from prototype.gui.window import GnuRadioStatusProbe
+    from prototype.io import gnuradio as gnuradio_pkg
+
+    monkeypatch.setattr(
+        gnuradio_pkg,
+        "gnuradio_runtime_status",
+        lambda: (True, "GNU Radio 3.10.test"),
+    )
+
+    seen: list = []
+    probe = GnuRadioStatusProbe()
+    probe.status_ready.connect(seen.append)
+    probe.run()  # synchronous: no thread needed for the assertion
+
+    assert seen == [(True, "GNU Radio 3.10.test")]
+
+
+def test_fileless_capture_fills_the_information_panel() -> None:
+    """A GNU Radio capture has no file, but still has rate/samples/duration."""
+    from prototype.core.analyzer import basic_stats
+
+    window = _make_window()
+
+    try:
+        window.current_file = None
+        window.samples = np.zeros(1000, dtype=np.complex64)
+        window.sample_rate = 8000.0
+
+        window.update_basic_information(
+            basic_stats(window.samples, window.sample_rate), "GNU Radio"
+        )
+
+        assert window.file_label.text() == "GNU Radio capture"
+        assert window.format_label.text() == "GNU Radio"
+        assert window.samples_label.text() == "1,000"
+        assert "8000" in window.sample_rate_label.text()
+    finally:
+        window.close()
+        window.deleteLater()
 
 
 def test_gnuradio_source_config_defaults(gnuradio_installed) -> None:

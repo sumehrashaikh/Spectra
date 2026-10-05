@@ -1,9 +1,9 @@
 # Spectra — SIH-147 Requirement Matrix
 
-**Date:** 2026-09-29
+**Date:** 2026-10-05
 **Branch:** `feature/gnuradio-gui-v1`
-**Software version:** 2.1.0
-**Test command:** `QT_QPA_PLATFORM=offscreen python -m pytest -q` → **433 passed**
+**Software version:** 2.2.0
+**Test command:** `QT_QPA_PLATFORM=offscreen python -m pytest -q` → **538 passed**
 
 Legend: ✅ working and tested · 🟡 implemented but limited / manual only · ❌ not implemented
 
@@ -63,8 +63,9 @@ validation — none of those are implemented.
 | 30 | Analyze (single + batch) | ✅ | `AnalysisWorker` on a QThread |
 | 31 | Batch shows candidate-specific results | ✅ | candidate combo + per-candidate detail (regression fixed) |
 | 32 | Manual FEC / interleaving / frame controls reach the backend | ✅ | `tests/test_gui_fec_demo.py`, `test_gui_interleaving.py` |
-| 33 | GNU Radio tab + source switching | ✅ synthetic · 🟡 real | Real backend when `gnuradio` is installed (not installed in this environment); falls back to the built-in synthetic source otherwise |
-| 34 | ML CNN stage + fusion | ✅ | Fixed this pass: the pipeline called `predict_modulation` without importing it |
+| 33 | GNU Radio tab + source switching | ✅ synthetic · 🟡 real | Real backend when `gnuradio` is installed (not installed in this environment); falls back to the built-in synthetic source otherwise. Spectrum + waterfall can be computed by the standalone flowgraph (`io/gnuradio/viz.py`, subprocess bridge with honest `numpy` fallback). |
+| 34 | ML CNN stage + fusion | ✅ | Fixed this pass: the pipeline called `predict_modulation` without importing it. ML v3 artifact (PyTorch-trained, 1024-sample TemporalCNN) declares holdout ≈ 0.83 > the 0.60 validation floor; below the floor the row mirrors the DSP result instead of showing an argmax. |
+| 34b | Light/dark theme + symbol/bit inspectors | ✅ | `gui/theme.py` toggle (light = original stylesheet); `View Symbols (I/Q)` / `View Bits / BER` dialogs |
 
 ## 5. CLI
 
@@ -84,7 +85,7 @@ validation — none of those are implemented.
 | 41 | Deterministic demo set (PSK/QAM/FSK + FEC + interleavers) | ✅ | `tests/demo_captures.py` (11 cases) + reference sidecars; every case classifies correctly and coded cases decode cleanly |
 | 42 | Reference-free alignment | ❌ | Not implemented and not claimed |
 | 43 | Non-block automatic interleaving identification | ❌ | See #21 |
-| 44 | Real-world capture validation | ❌ | Synthetic only |
+| 44 | Real-world capture validation | 🟡 optional harness | Core chain: synthetic fixed-seed captures only. An optional external-dataset harness (`dataset-inspect`/`dataset-eval`) reports real-world results but never tunes the tool; see `prototype/dataset/README.md` and `docs/evidence/PUBLIC_DATASET.md` |
 | 45 | Hardware / SDR validation | ❌ | Not performed |
 
 ## 7. Bugs fixed in this pass (2026-09-29)

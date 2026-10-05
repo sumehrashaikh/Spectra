@@ -34,11 +34,73 @@ NUM_SYMBOLS = 512
 # 11 -> +1, 10 -> +3, exactly as modulation.demodulator expects.
 QAM16_LEVELS = np.array([-3.0, -1.0, 3.0, 1.0]) / np.sqrt(10.0)
 
-# QPSK Gray levels per axis: 0 -> -1/sqrt(2), 1 -> +1/sqrt(2).
-QPSK_LEVELS = np.array([-1.0, 1.0]) / np.sqrt(2.0)
+def _receiver_derived_levels(modulation: str) -> np.ndarray:
+    """Transmitter level table built from the *receiver's* decision kernel.
 
-# 8-PSK Gray constellation offsets (units of pi/4).
-PSK8_ANGLES = np.pi / 4.0 * np.arange(8)
+    The demo transmitter must place every bit word on exactly the symbol
+    the receiver's hard decision maps back to that word; otherwise the
+    receiver is bit-exact to within a quadrant permutation and the BER
+    plateaus around 25% no matter how good the synchronization is.  That
+    is not a synchronization limit and no receiver-side search can repair
+    it, so the table is derived from the decision kernel instead of being
+    hand-written: evaluate the kernel on the ideal constellation and read
+    off the word -> symbol mapping it actually implements.
+    """
+    if modulation == "QPSK":
+        from prototype.modulation.demodulator import qpsk_decision
+
+        points = np.exp(1j * (np.pi / 4.0 + np.arange(4) * np.pi / 2.0))
+        bits, decided, _ = qpsk_decision(points)
+        words = np.asarray(bits, dtype=np.uint8).reshape(-1, 2)
+        levels = np.zeros(points.size, dtype=np.complex128)
+        for word, point in zip(words, decided):
+            levels[int(word[0]) * 2 + int(word[1])] = point / np.sqrt(2.0)
+        return levels
+
+    if modulation == "8-PSK":
+        from prototype.modulation.digital import psk8_decision
+
+        points = np.exp(1j * (2 * np.arange(8) + 1) * np.pi / 8.0)
+        bits, decided, _ = psk8_decision(points)
+        words = np.asarray(bits, dtype=np.uint8).reshape(-1, 3)
+        levels = np.zeros(points.size, dtype=np.complex128)
+        for word, point in zip(words, decided):
+            levels[int(word[0]) * 4 + int(word[1]) * 2 + int(word[2])] = point
+        return levels
+
+    raise ValueError(f"no receiver-derived table for {modulation!r}")
+
+
+# QPSK Gray constellation, in the receiver's convention.  Derived from
+# modulation.demodulator.qpsk_decision so the transmitter cannot drift from
+# it: the hand-written form had 11 and 10 swapped on the -I half, which
+# capped the measured BER near 25%.
+QPSK_LEVELS = _receiver_derived_levels("QPSK")
+
+# 8-PSK Gray constellation, in the receiver's convention
+# (modulation.digital.psk8_decision): ideal points at odd multiples of
+# 22.5 degrees, with the Gray word table below around the circle.
+PSK8_GRAY_WORDS = np.array(
+    [
+        [0, 0, 0],
+        [0, 0, 1],
+        [0, 1, 1],
+        [0, 1, 0],
+        [1, 1, 0],
+        [1, 1, 1],
+        [1, 0, 1],
+        [1, 0, 0],
+    ],
+    dtype=np.uint8,
+)
+PSK8_ANGLES = (2 * np.arange(8) + 1) * np.pi / 8.0
+
+# Inverse table: bit word (b0 b1 b2 as an integer) -> transmitted symbol,
+# derived from the receiver's own psk8_decision table for the same reason
+# as QPSK_LEVELS above.
+PSK8_LEVELS = _receiver_derived_levels("8-PSK")
+
+del _receiver_derived_levels
 
 
 @dataclass
@@ -109,14 +171,20 @@ def map_symbols(bits: np.ndarray, modulation: str) -> np.ndarray:
             b[2::4] * 2 + b[3::4]
         ]
     if modulation == "QPSK":
+        # The receiver's qpsk_decision Gray convention, so the hard
+        # decisions return exactly the transmitted bit pairs.
         usable = (n // 2) * 2
-        b = bits[:usable]
-        return QPSK_LEVELS[b[0::2]] + 1j * QPSK_LEVELS[b[1::2]]
+        b = bits[:usable].reshape(-1, 2)
+        index = b[:, 0] * 2 + b[:, 1]
+        return QPSK_LEVELS[index]
     if modulation == "8-PSK":
+        # The receiver's psk8_decision Gray convention (odd multiples of
+        # 22.5 degrees), so the hard decisions return the transmitted
+        # bit triples rather than a permuted fold of them.
         usable = (n // 3) * 3
         b = bits[:usable].reshape(-1, 3)
         index = b[:, 0] * 4 + b[:, 1] * 2 + b[:, 2]
-        return np.exp(1j * PSK8_ANGLES[index])
+        return PSK8_LEVELS[index]
     raise ValueError(f"unsupported demo modulation {modulation!r}")
 
 
@@ -288,16 +356,27 @@ def write_reference(path: str, bits: np.ndarray) -> str:
 
 
 def reference_is_usable(capture: "DemoCapture") -> bool:
-    """Whether a BER reference helps this capture (not every case can use one).
+    """Whether a BER reference is meaningful for this capture.
 
     The reference drives the codeword-alignment stage, which resolves the
-    blind phase/origin fold for 16-QAM (and, with FEC, for the coded
-    stream).  It is *not* implemented for uncoded QPSK/8-PSK, so writing a
-    reference there would only make the receiver report a misleading ~0.5
-    BER from the unresolved constellation rotation; those captures are left
-    without a sidecar so the GUI honestly says "No reference loaded".
+    blind phase/origin fold against the transmitted bits.  That is
+    implemented for 16-QAM (lattice fold x symbol origin) and, since the
+    PSK folds were added, for QPSK (90-degree fold x the axis-aligned twin
+    of its diagonal lattice x symbol origin) — measured on these captures:
+    an uncoded QPSK demo now reports BER 0.00 against its own reference.
+
+    BFSK clears its reference too (measured BER 0.00 on the FSK demo: the
+    tones are estimated from the capture itself and the bits are decided
+    per symbol, so there is no constellation fold to resolve).
+
+    8-PSK is still excluded: these captures are classified as 16-QAM, so
+    the decision device applied to them is the wrong one and a reference
+    would only produce a misleading ~0.45 BER.
     """
-    return capture.modulation == "16-QAM" or capture.fec_scheme is not None
+    return (
+        capture.modulation in ("16-QAM", "QPSK", "BFSK")
+        or capture.fec_scheme is not None
+    )
 
 
 def write_capture(path: str, capture: "DemoCapture", with_reference: bool = True) -> str:

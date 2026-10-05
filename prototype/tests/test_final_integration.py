@@ -206,12 +206,40 @@ def test_demo_reference_sidecar_enables_clean_decode(tmp_path):
 
 
 def test_demo_reference_skipped_for_unresolvable_cases(tmp_path):
-    """No sidecar for uncoded QPSK (a reference there would show ~0.5 BER)."""
+    """No sidecar for 8-PSK demo captures: they classify as 16-QAM."""
     from prototype.core.ber import reference_path_for_wav
 
-    capture = dc.build_capture(modulation="QPSK", nbits=1024)
+    capture = dc.build_capture(modulation="8-PSK", nbits=1020)
     assert dc.reference_is_usable(capture) is False
+
+    wav = tmp_path / "psk8.wav"
+    dc.write_capture(str(wav), capture)
+    assert not Path(reference_path_for_wav(str(wav))).is_file()
+
+
+def test_uncoded_qpsk_demo_measures_a_zero_ber(tmp_path):
+    """Uncoded QPSK carries a reference now, and the BER is exact.
+
+    The receiver's QPSK folds (90-degree lattice fold, axis-aligned twin,
+    symbol origin) resolve against the transmitted bits, so an uncoded
+    QPSK capture reports a measured BER like any coded one.
+    """
+    from prototype.core.ber import load_transmitted_bits
+    from prototype.core.loader import load_wav
+    from prototype.pipeline import analyze_samples
+
+    capture = dc.build_capture(modulation="QPSK", nbits=1024)
+    assert dc.reference_is_usable(capture) is True
 
     wav = tmp_path / "qpsk.wav"
     dc.write_capture(str(wav), capture)
-    assert not Path(reference_path_for_wav(str(wav))).is_file()
+    bits, reference_path = load_transmitted_bits(str(wav))
+    assert bits is not None and reference_path.is_file()
+
+    samples, sample_rate = load_wav(str(wav))
+    result = analyze_samples(samples, sample_rate, reference_bits=bits)
+
+    assert result.ber is not None and result.ber["status"] == "measured"
+    assert result.ber["ber"] == 0.0, result.ber
+    interleaving = (result.demodulation or {}).get("interleaving_result") or {}
+    assert interleaving.get("status") == "NONE", interleaving

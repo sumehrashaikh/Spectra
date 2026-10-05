@@ -1,0 +1,51 @@
+{
+  "case": "16-QAM_reedsolomon_block",
+  "origin": "matrix",
+  "expected_modulation": "16-QAM",
+  "expected_fec": "reedsolomon",
+  "expected_interleaver": "block",
+  "expected_interleave_param": 8,
+  "payload_bits": 1024,
+  "coded_bits": 1280,
+  "capture_samples": 25613,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": true,
+  "notes": [
+    "modulation=16-QAM",
+    "fec=reedsolomon",
+    "interleave=block",
+    "awgn_amplitude=0.004"
+  ],
+  "auto": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.95314696236139,
+    "symbol_rate_confidence": 99.99976615831834,
+    "symbol_rate_method": "delay_multiply+cyclostationarity",
+    "snr_db": 44.92594095655698,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNRESOLVED",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": 0.0,
+    "warnings": []
+  },
+  "configured": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.95314696236139,
+    "snr_db": 44.92594095655698,
+    "coded_stream_ber": 0.0,
+    "fec_scheme": "reedsolomon",
+    "fec_source": "explicit_config",
+    "uncorrectable_blocks": 0,
+    "corrected_errors": null,
+    "decoded_bits": 1024,
+    "payload_prefix_matched": 1024,
+    "payload_recovered": true,
+    "interleaver_status": "MANUALLY_CONFIGURED",
+    "codeword_alignment": true,
+    "warnings": []
+  }
+}

@@ -3,9 +3,11 @@
 Spectra is an offline signal-analysis prototype: load an RF capture
 (WAV audio or raw IQ), and it detects the signals inside, classifies
 their modulation, estimates symbol timing and carrier offset,
-demodulates bits, and — when you supply the transmitted bits —
-measures bit error rate. Every number it reports is traceable to the
-stage that produced it; it never invents a result it cannot measure.
+demodulates bits, de-interleaves and FEC-decodes (when configured),
+runs an explicit frame/sync-word layer, and — when you supply the
+transmitted bits — measures bit error rate. Every number it reports is
+traceable to the stage that produced it; it never invents a result it
+cannot measure.
 
 ## 1. Installation
 
@@ -14,6 +16,12 @@ stage that produced it; it never invents a result it cannot measure.
 pip install -e .[dev]        # from the repository root
 python -m pytest -q          # verify the suite passes
 ```
+
+Optional components install separately and are never required for the
+core pipeline: `.[gnuradio]` (real GNU Radio runtime), `.[ml-tools]`
+(h5py, one-time pickled-model conversion), `.[docs]` (python-docx), and
+the CPU-PyTorch `.venv-mltrain` environment used only for ML training.
+Runtime ML inference is NumPy-only.
 
 No internet connection is required at runtime. The software performs
 no telemetry and makes no network requests.
@@ -36,18 +44,23 @@ python main.py            # from the repository root
    switch the detail panels between them.
 5. Detail panels update automatically: classification, symbol rate,
    samples/symbol, timing confidence, recovered symbols/bits, BER,
-   decision margin, FEC result, and synchronization frequency/phase
-   offsets.
+   decision margin, FEC/interleaving/protocol rows, and synchronization
+   frequency/phase offsets.
 6. **Constellation** — after analysis this shows the *recovered*
    symbol lattice (the actual analysis deliverable), not the raw IQ
-   smear. A clean grid means the receive chain locked.
+   smear. A clean grid means the receive chain locked. **View Symbols
+   (I/Q)** and **View Bits / BER** open read-only inspectors listing the
+   exact symbol/bit arrays the JSON export carries.
 7. **Export JSON** — save the full result payload (all stages,
    warnings, provenance). **Provenance** — per-stage timings,
    configuration, software version and git commit of the last run.
-8. **FEC selector** — if the transmitter used forward error
-   correction, pick the scheme (conv12, hamming74, repetition3)
-   *before* analyzing; decoded results appear in the FEC row. FEC is
-   explicit configuration: it is never guessed from data.
+8. **FEC / interleaving / frame controls** — if the transmitter used
+   forward error correction or an interleaver, select the mode and
+   scheme *before* analyzing (see §9); the Frame search checkbox
+   configures the sync-word layer (§11). All of these are explicit
+   configuration: never guessed from data.
+9. **Theme** — the 🌙/☀ button in the title row toggles dark mode;
+   light is the original look and toggling back restores it exactly.
 
 Mode presets: `quick` (fast triage), `balanced` (default),
 `deep` (weak signals), `realtime` (minimal smoothing).
@@ -137,11 +150,13 @@ print(result.ber)   # {'ber': 0.0, 'ambiguity_resolution': '...', ...}
 ```
 
 Blind ambiguities are searched and the applied correction is reported:
-BPSK polarity (0/180°), QPSK/16-QAM rotation folds (0/90/180/270°),
-and the 16-QAM frame origin (±16 symbols) — the payload's
+BPSK polarity (0/180°), QPSK 45°-step quadrature folds, 8-PSK
+rotations, and the 16-QAM frame origin (±24 symbols) — the payload's
 `ambiguity_resolution` field names the correction that won. Without a
-reference the pipeline stops after demodulation and reports no BER —
-it never invents one.
+reference the pipeline stops after demodulation and reports no BER;
+the GUI then shows a labelled EVM-based estimate (method
+`evm_estimate`) instead of a measured BER — an estimate, never a
+measurement.
 
 ## 5. Choosing a processing mode
 
@@ -205,19 +220,25 @@ Nothing is guessed past what the decoders actually measure.
 
 ### 9.1 How it works
 
-Supported automatically evaluated schemes:
+Supported automatically evaluated schemes (the full registry):
 
 - `none` - uncoded bitstream; kept as an honest weak hypothesis
 - `repetition3` - rate-1/3 majority-vote decoder
 - `hamming74` - systematic Hamming(7,4)
 - `conv12` - K=7 convolutional code, Viterbi decoding
+- `reedsolomon` - shortened RS over GF(256), 32 data + 8 parity bytes
+- `ldpc` - compact (3,6)-regular (16,8) hard-decision bit-flip code
+- `concatenated` - serial RS (outer) + convolutional (inner)
 
 The identifier is a *candidate evaluator*, not a decoder. It only ever
 runs the existing `prototype.fec` decoders to measure how well a
-hypothesis fits the data. It never rewrites a supported FEC family
-(Phase 2). The evaluation is deterministic, explainable and conservative.
+hypothesis fits the data. The evaluation is deterministic, explainable
+and conservative; each hypothesis is scored on decoder evidence (conv12
+Viterbi path metric, Hamming/repetition corrections, RS residual
+syndromes, LDPC zero-flip validity, inner+outer status for the
+concatenated scheme).
 
-- clean supported FEC candidate -> score **80**, AUTO_DETECTED
+- clean supported FEC candidate -> score **70-83**, AUTO_DETECTED
 - corrupted/ambiguous -> score 40, UNKNOWN
 - insufficient / invalid -> score 0, UNKNOWN
 
@@ -242,14 +263,27 @@ The result panel shows:
   validation
 - candidate evidence list
 
+The toolbar also carries the interleaving controls (`Auto` / `Manual` /
+`None` plus `Family:` and `Depth:` for manual), and a Frame search
+checkbox with sync-word/payload fields. When a transmitted reference
+accompanies the capture, the reference-validated joint search can
+resolve the interleaving family *and* its parameter (block depths,
+seeded pseudo-random permutations, convolutional strides, the square
+diagonal) by testing which hypothesis makes the code stream decodable
+again. Uncoded interleaved captures stay honestly unresolved by
+construction (their received stream is the transmitted stream).
+
 ### 9.3 CLI
 
-`--fec-mode auto | manual | none` on `analyze`/`report`:
+`--fec-mode auto | manual | none` plus `--fec-scheme` and the
+interleaving flags on `analyze`/`report`:
 
 ```bash
 spectra analyze file.wav --fec-mode auto
-spectra analyze file.wav --fec-mode manual --fec scheme=hamming74
+spectra analyze file.wav --fec-mode manual --fec-scheme hamming74
 spectra analyze file.wav --fec-mode none
+spectra analyze file.wav --interleaving-mode manual \
+    --interleave-family pseudo_random --interleave-depth 3
 ```
 
 Identification fields (status, best_scheme, confidence, candidates,
@@ -277,8 +311,8 @@ evidence and honest limitations — is kept in
 | Frame / sync-word search | Implemented + tested | `protocol/`; GUI frame-search control; CLI `--sync-word/--data-bytes` |
 | Recovered bits / info + BER | Implemented | `demodulation.fec.decoded_bits`; "Recovered bits"/"BER" GUI rows |
 | Provenance / JSON export | Implemented | `core/provenance.py`; GUI Export JSON |
-| Reference-free alignment | NOT implemented | codeword alignment requires a reference; resolves 16-QAM only |
-| Real-world / hardware validation | NOT done | synthetic fixed-seed captures only |
+| Reference-free alignment | NOT implemented | codeword alignment requires a reference; resolves 16-QAM and coded streams |
+| Real-world / hardware validation | NOT done for the core chain | synthetic fixed-seed captures remain the validated set; an optional external-dataset harness (`dataset-eval`) exists for *reporting*, never for tuning, and no SDR hardware is validated |
 
 ### 9.6 Limitations
 
@@ -300,20 +334,24 @@ families are applied from explicit configuration.
 Spectra includes an optional CNN stage that scores modulation class
 from raw IQ. Design rules (matching the rest of the project):
 
-- **Evidence, never authority.** The CNN's prediction is stored in the
-  payload next to the rule-based DSP classification (`result.ml`);
+- **Evidence first, authority never.** The CNN's output is stored in
+  the payload next to the rule-based DSP classification (`result.ml`);
   it never overrides or gates the DSP verdict.
-- **No pickle loading.** The shipped `modulation_cnn.pkl` (a Keras 3
-  Sequential CNN: input `(512, 2)`, 3× Conv1D/BN/MaxPool, Dense(16)
-  softmax head) is converted once by a static opcode-walking tool that
-  never executes the pickle. Runtime inference is a NumPy
+- **NumPy-only runtime, no pickle loading.** Inference is a NumPy
   implementation of the forward pass — no TensorFlow or PyTorch
-  dependency.
-- **Honest labels.** The original file embedded no label map, so the
-  conversion shipped with neutral `class_00`..`class_15` names and the
-  BatchNorm statistics in the file proved the network had **never been
-  trained** (optimizer iteration 0, BN parameters at init). The
-  project therefore trains its own artifact on synthetic data.
+  install is needed at runtime, and the shipped
+  `modulation_cnn.pkl` was converted purely statically (pickle opcodes
+  walked, never executed).
+- **Trained in-project and validated honestly.** The promoted artifact
+  (`prototype/ml/modulation_cnn_trained.npz`; a global-average-pooled
+  temporal CNN over 1024-sample IQ frames, 16 classes, ~115k
+  parameters) is trained on synthetic frames from this repository's
+  own generator. It declares `best_val_accuracy ≈ 0.83`; the runtime's
+  `ML_VALIDATION_FLOOR` is 0.60, so this artifact is **validated** and
+  its argmax may be shown as a *prediction* when the capture also
+  clears the confidence/agreement floors. Below the floor the row
+  shows the DSP result with the CNN's own answer as a labelled second
+  opinion (and the raw answer stays in the JSON either way).
 
 ### Using ML
 
@@ -324,40 +362,46 @@ from dataclasses import replace
 from prototype.core.config import processing_mode_config
 from prototype.pipeline import analyze_samples
 
-config = replace(
-    processing_mode_config("balanced"),
-    ml=replace(config.ml, enabled=True),   # off by default
-)
+base = processing_mode_config("balanced")
+config = replace(base, ml=replace(base.ml, enabled=True))  # off by default
 result = analyze_samples(samples, sample_rate, config=config)
 print(result.ml["predicted_class"], result.ml["confidence"])
 ```
 
 GUI: tick `ML assist (CNN)` (see `docs/GUI_USER_GUIDE.md`, Section 15).
 
-### Training your own artifact
+### Training and validating your own artifact
 
-The trainer uses the same synthetic-dataset + channel-simulator stack
+The trainers use the same synthetic-dataset + channel-simulator stack
 as the rest of Spectra; labels are exact by construction.
 
 ```bash
-# from the prototype/ folder; NumPy only, ~10 min on CPU
-python -m prototype.ml.train --frames-per-class 60 --epochs 15 \
+# NumPy trainer (dependency-free, gradient-checked)
+spectra ml-train --frames-per-class 60 --epochs 15 \
     --output ml/modulation_cnn_trained.npz
+
+# PyTorch trainer (v3 architecture; needs the optional .venv-mltrain env)
+python -m prototype.ml.torch_train --frames-per-class 1500 --epochs 24 \
+    --output ml/modulation_cnn_trained.npz
+
+# Independent artifact validation: NumPy-vs-trainer parity, fresh-seed
+# hold-out scored through the runtime, per-class and per-SNR accuracy
+spectra ml-eval --artifact ml/modulation_cnn_trained.npz
 ```
 
-- Every run first performs a finite-difference **gradient check** and
-  refuses to train if backprop is wrong.
+- Every NumPy run first performs a finite-difference **gradient check**
+  and refuses to train if backprop is wrong.
 - The dataset generator covers 16 classes (BPSK … GMSK, AM, Noise)
-  with randomized SNR (0–18 dB), CFO, phase, symbol rate and rolloff.
+  with randomized SNR (0–18 dB), CFO, phase, symbol rate and rolloff;
+  train/val/test splits are separated by *realization*, not frame.
 - The runtime automatically prefers `modulation_cnn_trained.npz` over
   the as-shipped conversion; per-frame unit-RMS normalization makes
   predictions amplitude-invariant.
-- Holdout accuracy of the first in-project run: ~31% across 16 classes
-  (chance is 6.25%) — a verified baseline, not a finished model.
-  Increase `--frames-per-class`/`--epochs` for better results.
-
-A future `labels.json` next to the artifact remaps the 16 output
-indices to real class names without touching weights.
+- `ml/validation.py` (via `spectra ml-eval`) re-scores the shipped
+  artifact through the NumPy runtime on a fresh-seed hold-out; the
+  calibration report in the artifact records ECE and confidence
+  behaviour (softmax scores are model scores, not calibrated
+  probabilities).
 
 ## 11. Protocol / frame analysis
 
@@ -405,14 +449,47 @@ Command line
 
 ```bash
 spectra analyze my_capture.wav --sync-word 0xAA55AA55 --data-bytes 4
-spectrum_samples report my_capture.wav --sync-word 0xAA55AA55 \
+spectra report my_capture.wav --sync-word 0xAA55AA55 \
     --data-bytes 4 --html frame_report.html --json frame_payload.json
 ```
 
 The `--json` output then carries a `protocol` section (see §8 for JSON
 export). Without a frame definition the pipeline reports `protocol: null`.
 
-## 12. Feature checklist
+## 12. GNU Radio: spectrum and waterfall
+
+GNU Radio is optional and never imported into the Spectra process. When
+a GNU Radio runtime is available (e.g. a Radioconda environment), the
+GUI's GNU Radio tab can compute the PSD and STFT waterfall by running
+the headless flowgraph in `gnuradio_integration/` in a subprocess; the
+status row names the backend actually used (`gnuradio` or `numpy`). Set
+`SPECTRA_GNURADIO_PYTHON` to the interpreter that has GNU Radio and
+`SPECTRA_GNURADIO_VIZ_SCRIPT` to override the flowgraph script. Every
+failure falls back to the built-in NumPy plots and says so. Demodulation,
+carrier recovery and constellation work always stay on the NumPy DSP
+path.
+
+## 13. Optional external real-world dataset (validation only)
+
+`prototype/dataset/` documents an optional third-party off-air dataset
+(Mendeley; ~833 MB of HDF5, never committed). Install `h5py` and place
+the `subset_*.h5` files there (or pass `--dataset-dir`) to use it as an
+*external validation input only* — it is never used for training:
+
+```bash
+spectra dataset-inspect                 # shapes, labels, balance
+spectra dataset-eval --subset test --per-cell 3 --table
+```
+
+`dataset-eval` runs Spectra's existing preprocessing + DSP classifier
+(and optionally the ML assist) over sampled frames and breaks the results
+down by modulation, clean/multipath channel and labelled SNR. Unsupported
+classes are reported as unsupported, never scored as errors. Separately,
+`prototype/docs/evidence/` contains the frozen public-benchmark evidence
+pack (RadioML 2016.10a transfer results, demo matrix, requirement
+matrix) used by the SIH deck.
+
+## 14. Feature checklist
 
 | Feature | GUI | CLI | Python API |
 |---|---|---|---|
@@ -422,11 +499,16 @@ export). Without a frame definition the pipeline reports `protocol: null`.
 | Batch analysis of all candidates + timeline | ✓ (selector) | — | ✓ |
 | Classification (BPSK/QPSK/8-PSK/16-QAM/OOK/BFSK) | ✓ | ✓ | ✓ |
 | Blind synchronization + demodulation | ✓ | ✓ | ✓ |
-| BER with ambiguity search | ✓ | ✓ | ✓ |
-| FEC decode (conv12 / hamming74 / repetition3) | ✓ (selector) | config | ✓ |
-| Recovered-constellation view | ✓ | — | payload |
+| BER with ambiguity search (+ EVM estimate without reference) | ✓ | ✓ | ✓ |
+| FEC decode (6 schemes) | ✓ (mode + scheme) | ✓ (flags) | ✓ |
+| Automatic FEC identification (AUTO) | ✓ (Auto FEC row) | ✓ (--fec-mode auto) | ✓ |
+| De-interleaving (block/conv/diagonal/pseudo-random) | ✓ (family + depth) | ✓ (flags) | ✓ |
+| Protocol/frame decode (explicit FrameConfig) | ✓ (Frame search) | ✓ (flags) | ✓ |
+| Recovered-constellation view + symbol/bit inspectors | ✓ | payload | payload |
+| GNU Radio spectrum/waterfall (optional backend) | ✓ (checkbox) | — | ✓ |
+| Light/dark theme | ✓ | — | — |
 | Provenance (stage timings, versions, config) | ✓ (dialog) | ✓ (JSON) | ✓ |
 | JSON / HTML / CSV export | ✓ (JSON) | ✓ | ✓ |
-| ML (CNN) classification, NumPy runtime | ✓ (toggle) | config | ✓ |
-| ML training (synthetic dataset, gradient-checked) | — | — | ✓ |
-| Protocol/frame decode (explicit FrameConfig) | ✓ (Protocol row) | ✓ (flags) | ✓ |
+| ML assist (CNN), NumPy runtime, validated artifact | ✓ (toggle) | ✓ (--ml) | ✓ |
+| ML training + independent artifact validation | — | ✓ (ml-train/ml-eval) | ✓ |
+| External real-world dataset harness (optional, h5py) | — | ✓ (dataset-*) | ✓ |

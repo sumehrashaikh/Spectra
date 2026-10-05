@@ -48,13 +48,18 @@ you are on a headless machine — the GUI needs a desktop session.
 
 From top to bottom:
 
-1. **Toolbar** — `Open WAV`, `Analyze Signal`, `Analyze Selected`,
-   `Isolate Selected`, `Mode:`, `Analyze all candidates`,
-   `ML assist (CNN)`, `FEC:`, `Clear`.
+0. **Title row** — the 🌙/☀ button toggles dark mode. Light is the
+   original look and toggling back restores it exactly.
+1. **Toolbar** — `Source:`, `Open Capture`, `Analyze Signal`,
+   `Analyze Selected`, `Isolate Selected`, `Mode:`,
+   `Analyze all candidates`, `ML assist (CNN)`, `Interleaving:`
+   (mode + `Depth:` + `Family:`), `FEC mode:` + `FEC scheme:`,
+   `Frame search` (sync word + payload bytes), `Clear`.
 2. **Progress bar** — a thin bar that animates while an analysis runs on
    a background thread (the window stays responsive).
 3. **Export bar** — `Export JSON` and `Provenance` buttons (enabled
-   after an analysis).
+   after an analysis). The **source selector** also exposes the GNU
+   Radio tab (see Section 17).
 4. **File information** — File, Format, Sample Rate, Samples, Duration.
 5. **TIME DOMAIN** — amplitude of the whole capture.
 6. **SPECTRUM** — power spectral density; spikes are your signals.
@@ -181,9 +186,11 @@ shows all detections.
 | Samples/Symbol / Symbol Rate | timing estimate; the rate estimate carries a confidence |
 | Timing Confidence | how sure the estimator is — below ~50% treat the rate as provisional |
 | Recovered Symbols/Bits | how much data was demodulated |
-| **BER** | bit error rate against a reference (Section 10); "No reference loaded" otherwise |
+| **BER** | bit error rate against a reference (Section 10); an EVM-based estimate when no reference exists |
 | Decision Margin | average distance from each symbol to its nearest wrong decision point — bigger is cleaner |
-| **FEC** | error-correction summary: scheme, corrected errors, uncorrectable blocks |
+| **FEC** / **Auto FEC** | error-correction summary: scheme, corrected errors, uncorrectable blocks; AUTO identification status and its confidence |
+| **Recovered bits** / **Sync word** | the decoded bitstream and the frame-layer result (Section 16) |
+| **Interleaving** rows | mode, detected type/family, depth, status and confidence |
 | Freq Offset / Phase Offset | residual carrier frequency (Hz) and phase (degrees) measured by the synchronizer |
 | **ML Prediction** | the optional CNN's verdict with its score and the top-3 ranking (Section 15); `off` until you enable `ML assist (CNN)` |
 | Selected Signal | which table row you selected |
@@ -196,20 +203,28 @@ there means timing/noise problems, a clean grid means good demodulation.
 
 ## 9. FEC decoding (forward error correction)
 
-If the transmitter encoded its data with an error-correcting code, pick
-the scheme in the **FEC:** selector before analyzing:
+The **FEC mode:** selector offers `Auto`, `Manual` and `None`, and the
+**FEC scheme:** selector names the scheme used by `Manual`:
 
-- `none` — plain demodulation (default)
+- `none` — plain demodulation (default for `Manual`)
 - `conv12` — rate-1/2 convolutional K=7 + Viterbi
 - `hamming74` — Hamming(7,4) block code
 - `repetition3` — 3× repetition
+- `reedsolomon` — shortened RS over GF(256), 32 data + 8 parity bytes
+- `ldpc` — compact (3,6)-regular (16,8) bit-flip code
+- `concatenated` — RS (outer) + convolutional (inner)
 
-FEC is **never guessed**: if you select a scheme, the demodulated bits
-are run through it and the parameters panel reports how many bit errors
-were corrected (and whether any blocks were beyond repair). Note the
-block schemes need the bit count to divide evenly (7 bits per Hamming
-block, 3 per repetition block) — otherwise you get an honest
-"no FEC stage output" note instead of a wrong answer.
+`Auto` runs the evidence-based identifier (it executes the real decoders
+and reports `AUTO_DETECTED` only when one is corroborated; otherwise
+`UNKNOWN`). `Manual` uses your scheme as-is and `None` skips FEC. The
+parameters panel reports how many bit errors were corrected and whether
+any blocks were beyond repair. Block schemes need the bit count to
+divide evenly (7 bits per Hamming block, 3 per repetition block) —
+otherwise you get an honest "no FEC stage output" note instead of a
+wrong answer. The **Interleaving:** controls (`Auto` / `Manual` /
+`None`, plus `Family:` and `Depth:`) work the same way; automatic
+identification is block-only, and the other three families are applied
+from explicit configuration.
 
 ---
 
@@ -232,9 +247,11 @@ the capture:
 When the reference is found, the parameters panel and the summary
 dialog report the BER, the number of bit errors, and how many bits were
 compared. For BPSK the receiver also searches both polarities; QPSK
-searches the four 90° phase ambiguities; 16-QAM searches the symbol
-origin. Without a reference the GUI still demodulates — it just
-reports "No reference loaded" instead of inventing a BER.
+searches 45°-step quadrature folds; 8-PSK searches its rotations; and
+16-QAM searches the symbol origin (±24 symbols). Without a reference
+the GUI still demodulates — it reports "not measured (no reference)"
+together with a labelled EVM-based *estimate* rather than inventing a
+measured BER.
 
 ---
 
@@ -281,12 +298,16 @@ The **Mode:** selector trades speed for thoroughness:
 ## 14. Known limitations
 
 - Validated on synthetic signals only; not certified for operational use.
-- Supported modulations: BPSK, QPSK, 16-QAM, BFSK end-to-end; 8-PSK,
-  OOK/ASK demodulation via the isolate-and-analyze path. Anything else
-  is reported honestly as `Unknown`.
+- Supported modulations: BPSK, QPSK, 8-PSK, 16-QAM, BFSK, OOK/ASK.
+  Anything else is reported honestly as `Unknown`.
 - The symbol-rate estimator can lock onto subharmonics on short
   captures (affects QPSK captures equally — it is not QAM-specific).
-- FEC must be configured explicitly; it is never auto-detected.
+- FEC `Auto` mode is evidence-based and deliberately conservative: it
+  returns `UNKNOWN` rather than guessing when decoder evidence is weak.
+  Automatic interleaver identification is block-only.
+- Blind phase/origin alignment (and therefore a measured BER against a
+  reference) is resolved for 16-QAM and coded streams; uncoded QPSK/8-PSK
+  captures show an EVM estimate instead of a measured BER.
 
 ---
 
@@ -297,26 +318,29 @@ convolutional neural network over the selected signal, reported in the
 **ML Prediction** parameter row and in the completion dialog, e.g.
 
 ```
-ML Prediction: QPSK (41%, 8 frames)  QPSK 0.41 8FSK 0.23 GMSK 0.17
+ML Prediction: QPSK (97%) — from DSP analysis (CNN said 64QAM)
 ```
 
-The verdict, its score, and the top-3 ranking are *supplementary
-evidence*: the CNN never overrides or replaces the rule-based DSP
-classification, and the two are reported side by side so you can
-compare them.
+The CNN never overrides or replaces the rule-based DSP classification —
+the two are reported side by side. The promoted artifact is trained
+inside this project on synthetic signals and declares its holdout
+accuracy; when that accuracy clears the 0.60 validation floor *and* the
+capture's scores clear the confidence/agreement floors, the row may
+show the CNN's verdict as a prediction. Otherwise it shows the DSP
+result with the network's own answer after the dash, and the raw CNN
+output always remains in the JSON export.
 
 Under the hood:
 
 - The network runs on a NumPy-only engine — no TensorFlow/PyTorch
   install is needed, and nothing leaves your machine.
-- The shipped model was **trained inside this project on synthetic
-  signals** (the same generator and channel impairments the rest of
-  Spectra uses) and is validated on synthetic holdouts only. Treat its
-  scores as a weak second opinion, not a guarantee.
 - The original `modulation_cnn.pkl` shipped with an untrained network
-  (verified from its weights); the trained artifact in
-  `prototype/ml/` supersedes it. You can retrain any time — see
+  (verified from its weights); the trained artifact in `prototype/ml/`
+  supersedes it. You can retrain and re-validate any time — see
   `docs/USER_GUIDE.md`, section "Machine learning".
+- **View Symbols (I/Q)** and **View Bits / BER** (Constellation tab and
+  the FEC/BER group) open read-only inspectors listing the recovered
+  symbols and every bitstream the receiver produced, with Copy/Save.
 
 ## 16. Protocol / frame analysis
 
@@ -329,12 +353,12 @@ PARAMETERS panel, alongside the FEC and constellation views.
 2. In the SIGNAL PARAMETERS panel a **Protocol** row reports the decoded
    frame when the transmitter prepended a known sync word.
 3. Configure the frame definition so the app knows what to look for:
-   - Go to the **FEC** selector area, which mirrors frame configuration
-     — open the **Configuration** prompter or pass the frame definition
-     to the pipeline before analyzing.
-   - The frame definition declares the sync word (an integer, MSB-first)
-     and the expected payload size in bytes; the app searches the
-     recovered bits for that word and reports the payload and CRC status.
+   - Tick **Frame search** in the toolbar and fill in the **Sync word**
+     (an integer, MSB-first; hex accepted) and **Payload bytes** fields
+     before clicking Analyze.
+   - The frame definition declares the sync word and the expected
+     payload size in bytes; the app searches the recovered bits for
+     that word and reports the payload and CRC status.
    - Equivalent CLI: `spectra analyze my_capture.wav --sync-word
      0xAA55AA55 --data-bytes 4`.
 
@@ -347,7 +371,25 @@ The full payload and the sync position are available in JSON for
 downstream processing; see `docs/USER_GUIDE.md`, section "Protocol /
 frame analysis".
 
-## 17. Where to go next
+## 17. GNU Radio tab (spectrum + waterfall)
+
+The **GNU Radio** tab works like the other visualisation tabs, with one
+optional upgrade: a `Compute Spectrum + Waterfall with GNU Radio`
+checkbox. When a GNU Radio runtime is installed, ticking it runs the
+headless FFT flowgraph shipped in `gnuradio_integration/` in a
+subprocess and draws its PSD and STFT waterfall matrices. The status row
+names the backend actually used — `gnuradio` when the flowgraph ran,
+`numpy` (with the reason) when it did not. The result is cached per
+capture, so switching tabs never re-runs the flowgraph. GNU Radio is
+never imported into Spectra itself, and no demodulation, carrier
+recovery or constellation work moves off the NumPy chain.
+
+The tab also offers the synthetic GNU Radio source (sample source,
+sample rate, centre frequency, gain, chunk size) with an **Acquire**
+button; when the runtime is absent, it says so and uses the built-in
+synthetic source instead.
+
+## 18. Where to go next
 
 - `docs/USER_GUIDE.md` — the task-oriented guide including CLI usage
   and the machine-learning (training) workflow

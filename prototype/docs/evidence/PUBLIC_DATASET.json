@@ -1,0 +1,479 @@
+{
+  "frames_evaluated": 1100,
+  "estimator_failures": 0,
+  "raw_mode": {
+    "supported_frames": 400,
+    "supported_correct": 100,
+    "supported_accuracy": 0.25,
+    "decisive_rate": 1.0
+  },
+  "conditioned_mode": {
+    "supported_frames": 400,
+    "supported_correct": 89,
+    "supported_accuracy": 0.2225,
+    "decisive_rate": 0.4345
+  },
+  "per_class": {
+    "8PSK": {
+      "frames": 100,
+      "in_scope": true,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "Unknown": 99,
+        "OOK": 1
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          99
+        ],
+        [
+          "OOK",
+          1
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.99,
+      "raw_accuracy": 0.0,
+      "conditioned_accuracy": 0.0,
+      "accuracy": 0.0
+    },
+    "AM-DSB": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "OOK": 67,
+        "Unknown": 33
+      },
+      "conditioned_top": [
+        [
+          "OOK",
+          67
+        ],
+        [
+          "Unknown",
+          33
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.33,
+      "accuracy": null
+    },
+    "AM-SSB": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "OOK": 69,
+        "Unknown": 31
+      },
+      "conditioned_top": [
+        [
+          "OOK",
+          69
+        ],
+        [
+          "Unknown",
+          31
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.31,
+      "accuracy": null
+    },
+    "BPSK": {
+      "frames": 100,
+      "in_scope": true,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "BPSK": 85,
+        "OOK": 14,
+        "Unknown": 1
+      },
+      "conditioned_top": [
+        [
+          "BPSK",
+          85
+        ],
+        [
+          "OOK",
+          14
+        ],
+        [
+          "Unknown",
+          1
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.01,
+      "raw_accuracy": 1.0,
+      "conditioned_accuracy": 0.85,
+      "accuracy": 0.85
+    },
+    "CPFSK": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "BFSK": 11,
+        "Unknown": 88,
+        "OOK": 1
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          88
+        ],
+        [
+          "BFSK",
+          11
+        ],
+        [
+          "OOK",
+          1
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.88,
+      "accuracy": null
+    },
+    "GFSK": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "Unknown": 65,
+        "BPSK": 14,
+        "OOK": 21
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          65
+        ],
+        [
+          "OOK",
+          21
+        ],
+        [
+          "BPSK",
+          14
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.65,
+      "accuracy": null
+    },
+    "PAM4": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "OOK": 93,
+        "BPSK": 6,
+        "Unknown": 1
+      },
+      "conditioned_top": [
+        [
+          "OOK",
+          93
+        ],
+        [
+          "BPSK",
+          6
+        ],
+        [
+          "Unknown",
+          1
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.01,
+      "accuracy": null
+    },
+    "QAM16": {
+      "frames": 100,
+      "in_scope": true,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "Unknown": 96,
+        "OOK": 4
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          96
+        ],
+        [
+          "OOK",
+          4
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.96,
+      "raw_accuracy": 0.0,
+      "conditioned_accuracy": 0.0,
+      "accuracy": 0.0
+    },
+    "QAM64": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "Unknown": 89,
+        "OOK": 11
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          89
+        ],
+        [
+          "OOK",
+          11
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.89,
+      "accuracy": null
+    },
+    "QPSK": {
+      "frames": 100,
+      "in_scope": true,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "Unknown": 94,
+        "QPSK": 4,
+        "OOK": 1,
+        "BFSK": 1
+      },
+      "conditioned_top": [
+        [
+          "Unknown",
+          94
+        ],
+        [
+          "QPSK",
+          4
+        ],
+        [
+          "OOK",
+          1
+        ],
+        [
+          "BFSK",
+          1
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.94,
+      "raw_accuracy": 0.0,
+      "conditioned_accuracy": 0.04,
+      "accuracy": 0.04
+    },
+    "WBFM": {
+      "frames": 100,
+      "in_scope": false,
+      "raw_decisions": {
+        "BPSK": 100
+      },
+      "raw_top": [
+        [
+          "BPSK",
+          100
+        ]
+      ],
+      "conditioned_decisions": {
+        "OOK": 64,
+        "Unknown": 25,
+        "BPSK": 11
+      },
+      "conditioned_top": [
+        [
+          "OOK",
+          64
+        ],
+        [
+          "Unknown",
+          25
+        ],
+        [
+          "BPSK",
+          11
+        ]
+      ],
+      "raw_unknown_rate": 0.0,
+      "conditioned_unknown_rate": 0.25,
+      "accuracy": null
+    }
+  },
+  "amplitude_spread_by_class": {
+    "8PSK": 0.0365,
+    "AM-DSB": 0.0049,
+    "AM-SSB": 0.0406,
+    "BPSK": 0.0327,
+    "CPFSK": 0.0345,
+    "GFSK": 0.0267,
+    "PAM4": 0.0285,
+    "QAM16": 0.0378,
+    "QAM64": 0.0381,
+    "QPSK": 0.0358,
+    "WBFM": 0.0104
+  },
+  "symbol_rate": {
+    "truth_hz": 125000.0,
+    "estimates": 1100,
+    "median_estimate_hz": 7874.0,
+    "mean_relative_error": 0.893944,
+    "median_relative_error": 0.937008,
+    "within_1pct": 0.0,
+    "mean_confidence": 77.99
+  },
+  "symbol_rate_convergence": [
+    {
+      "samples": 128,
+      "symbols": 1.6,
+      "estimate_hz": 188.98,
+      "truth_hz": 100.0,
+      "relative_error": 0.8898,
+      "reported_confidence": 81.2
+    },
+    {
+      "samples": 256,
+      "symbols": 3.2,
+      "estimate_hz": 62.75,
+      "truth_hz": 100.0,
+      "relative_error": 0.3725,
+      "reported_confidence": 68.8
+    },
+    {
+      "samples": 512,
+      "symbols": 6.4,
+      "estimate_hz": 15.66,
+      "truth_hz": 100.0,
+      "relative_error": 0.8434,
+      "reported_confidence": 98.3
+    },
+    {
+      "samples": 1024,
+      "symbols": 12.8,
+      "estimate_hz": 23.46,
+      "truth_hz": 100.0,
+      "relative_error": 0.7654,
+      "reported_confidence": 100.0
+    },
+    {
+      "samples": 4096,
+      "symbols": 51.2,
+      "estimate_hz": 33.21,
+      "truth_hz": 100.0,
+      "relative_error": 0.6679,
+      "reported_confidence": 100.0
+    },
+    {
+      "samples": 40973,
+      "symbols": 512.2,
+      "estimate_hz": 99.97,
+      "truth_hz": 100.0,
+      "relative_error": 0.0003,
+      "reported_confidence": 100.0
+    }
+  ],
+  "source": "HF datasets-server: hitrs909/RML2016/6db_0 test split",
+  "label_map": [
+    "8PSK",
+    "AM-DSB",
+    "AM-SSB",
+    "BPSK",
+    "CPFSK",
+    "GFSK",
+    "PAM4",
+    "QAM16",
+    "QAM64",
+    "QPSK",
+    "WBFM"
+  ],
+  "snr_db": 6.0,
+  "baseband_fs_hz": 1000000.0
+}

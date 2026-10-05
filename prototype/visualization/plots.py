@@ -307,6 +307,75 @@ def create_constellation_figure(
     return figure
 
 
+def create_spectrum_figure_from_psd(
+    frequencies,
+    magnitude,
+    title="Signal Spectrum (GNU Radio)",
+):
+    """Spectrum figure from precomputed (frequencies, magnitude) arrays.
+
+    Used when the FFT was produced by an external backend (the GNU Radio
+    headless flowgraph) instead of :func:`compute_spectrum`.
+    """
+
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    magnitude = np.asarray(magnitude, dtype=np.float64)
+
+    if frequencies.size == 0 or frequencies.size != magnitude.size:
+        raise ValueError("Spectrum arrays are empty or mismatched.")
+
+    figure = Figure(figsize=(8, 3), tight_layout=True)
+
+    ax = figure.add_subplot(111)
+
+    ax.plot(frequencies, magnitude)
+
+    ax.set_title(title)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude")
+    ax.grid(True)
+
+    return figure
+
+
+def create_waterfall_figure_from_matrix(
+    frequencies,
+    times,
+    power_db,
+    title="Waterfall / Spectrogram (GNU Radio)",
+):
+    """Waterfall figure from a precomputed ``(bins, slices)`` power matrix.
+
+    ``power_db`` is laid out as rows = frequency bins, columns = time
+    slices (the same orientation the GNU Radio flowgraph emits).
+    """
+
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    power_db = np.asarray(power_db, dtype=np.float64)
+
+    if power_db.ndim != 2 or power_db.size == 0:
+        raise ValueError("Waterfall matrix is empty.")
+    if power_db.shape[0] != frequencies.size:
+        raise ValueError("Waterfall matrix rows do not match the frequency axis.")
+    if power_db.shape[1] != times.size:
+        raise ValueError("Waterfall matrix columns do not match the time axis.")
+
+    figure = Figure(figsize=(8, 3), tight_layout=True)
+
+    ax = figure.add_subplot(111)
+
+    mesh = ax.pcolormesh(times, frequencies, power_db, shading="auto")
+
+    ax.set_title(title)
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Frequency (Hz)")
+
+    figure.colorbar(mesh, ax=ax, label="Magnitude (dB)")
+
+    return figure
+
+
 def create_symbol_constellation_figure(
     symbols,
     max_points=4096,

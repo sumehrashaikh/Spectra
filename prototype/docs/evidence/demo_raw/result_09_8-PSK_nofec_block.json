@@ -1,0 +1,53 @@
+{
+  "case": "8-PSK_nofec_block",
+  "origin": "matrix",
+  "expected_modulation": "8-PSK",
+  "expected_fec": null,
+  "expected_interleaver": "block",
+  "expected_interleave_param": 8,
+  "payload_bits": 1008,
+  "coded_bits": 1008,
+  "capture_samples": 26893,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": false,
+  "notes": [
+    "modulation=8-PSK",
+    "fec=None",
+    "interleave=block",
+    "awgn_amplitude=0.004"
+  ],
+  "auto": {
+    "detected_modulation": "8-PSK",
+    "symbol_rate_est": 99.9553770638108,
+    "symbol_rate_confidence": 99.99993356627861,
+    "symbol_rate_method": "delay_multiply+cyclostationarity",
+    "snr_db": 47.17822262402534,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNKNOWN",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": null,
+    "warnings": [
+      "interleaving identification did not reach a decision"
+    ]
+  },
+  "configured": {
+    "detected_modulation": "8-PSK",
+    "symbol_rate_est": 99.9553770638108,
+    "snr_db": 47.17822262402534,
+    "coded_stream_ber": null,
+    "fec_scheme": null,
+    "fec_source": null,
+    "uncorrectable_blocks": null,
+    "corrected_errors": null,
+    "decoded_bits": 0,
+    "payload_prefix_matched": 0,
+    "payload_recovered": false,
+    "interleaver_status": "MANUALLY_CONFIGURED",
+    "codeword_alignment": null,
+    "warnings": []
+  }
+}

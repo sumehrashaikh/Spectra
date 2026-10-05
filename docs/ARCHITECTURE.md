@@ -3,44 +3,46 @@
 ## 1. System overview
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │                 ENTRY POINTS                 │
-                    │  cli.py (spectra ...)   gui/window.py (Qt)   │
-                    │  pipeline.py (analyze_samples/capture)       │
-                    └───────────────────────┬──────────────────────┘
-                                            │
-   ┌────────────────────────────────────────▼────────────────────────────────────────┐
-   │                             ANALYSIS PIPELINE STAGES                            │
-   │                                                                                 │
-   │  io/loaders          WAV / raw IQ / I+Q pair / sidecar → Signal                 │
-   │        │                                                                        │
-   │  core/preprocessor   validate → DC removal → noise floor → SNR → normalize      │
-   │        │                                                                        │
-   │  detection/detector  FFT → smoothing → peaks → region expansion/merge →         │
-   │        │              artifact suppression → [SignalCandidate]                  │
-   │        │                                                                        │
-   │  core/isolator       frequency shift (NCO) → Butterworth LPF (sosfiltfilt)      │
-   │        │              → isolated baseband Signal (provenance kept)              │
-   │        │                                                                        │
-   │  classification      coarse (waveform features) ──┐                             │
-   │  parameters          symbol rate (delay-multiply │ |x|^2 | FSK run-length)        │
-   │  core/synchronization│ carrier (M-th power) → timing (sampling-phase search)      │
-   │  classification      fine (constellation geometry) ◄──────────────────────────┘  │
-   │        │                                                                        │   │  demodulation        demodulate_signal() dispatch → modulation kernels          │
-   │        │                                                                        │
-   │  modulation/ber      polarity-aware / rotation-aware BER vs reference           │
-   │        │                                                                        │
-   │  fec (optional)      explicit scheme: decode_bits(bits, scheme)                 │
-   |  fec (interleaving)  block interleaving identification + deinterleave         |
-   │  protocol (optional)  explicit FrameConfig → sync-word search → payload + CRC   │
-   └────────────────────────────────────────┬────────────────────────────────────────┘
-                                            │
-                                             ┌──────────────────────▼───────────────────────┐
-                     │            OUTPUT / PERSISTENCE              │
-                     │  AnalysisResult dataclass → to_dict()        │
-                     │  reporting/export: JSON | CSV | HTML         │
-                     │  core/provenance: manifest w/ step timings   │
-                     └──────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────┐
+                 │                 ENTRY POINTS                 │
+                 │  cli.py (spectra ...)   gui/window.py (Qt)   │
+                 │  pipeline.py (analyze_samples/capture)       │
+                 └───────────────────────┬──────────────────────┘
+                                         │
+┌────────────────────────────────────────▼────────────────────────────────────────┐
+│                             ANALYSIS PIPELINE STAGES                            │
+│                                                                                 │
+│  io/loaders           WAV / raw IQ / I+Q pair / sidecar → Signal                │
+│        │             (io/gnuradio: optional GNU Radio ingest + viz bridge)      │
+│  core/preprocessor    validate → DC removal → noise floor → SNR → normalize     │
+│        │                                                                       │
+│  detection/detector   FFT → smoothing → peaks → region expansion/merge →        │
+│        │               artifact suppression → [SignalCandidate]                │
+│  core/isolator        frequency shift (NCO) → Butterworth LPF (sosfiltfilt)     │
+│        │               → isolated baseband Signal (provenance kept)            │
+│        │                                                                       │
+│  classification       coarse (waveform features) ─────┐                        │
+│  parameters           symbol-rate estimators ────────┤                        │
+│  core/synchronization carrier (M-th power) → timing ─┤                        │
+│  classification       fine (constellation geometry) ◄─┘                        │
+│        │             (one corrective re-sync when the fine label corrects      │
+│        │              the coarse one; scored on the corrected lattice)         │
+│  demodulation         demodulate_signal() dispatch → modulation kernels        │
+│        │                                                                       │
+│  modulation/ber       polarity/rotation/origin-aware BER vs reference          │
+│        │             (no reference → EVM estimate, labelled as an estimate)    │
+│  fec (optional)       explicit scheme: decode_bits(bits, scheme)               │
+│  fec (interleaving)   block/convolutional/diagonal/pseudo-random + AUTO ID     │
+│  protocol (optional)  explicit FrameConfig → sync-word search → payload + CRC  │
+│  ml (optional)        NumPy CNN second opinion + fusion (never gates DSP)      │
+└────────────────────────────────────────┬────────────────────────────────────────┘
+                                         │
+                  ┌──────────────────────▼───────────────────────┐
+                  │            OUTPUT / PERSISTENCE              │
+                  │  AnalysisResult dataclass → to_dict()        │
+                  │  reporting/export: JSON | CSV | HTML         │
+                  │  core/provenance: manifest w/ step timings   │
+                  └──────────────────────────────────────────────┘
 ```
 
 ## 2. Module responsibilities
@@ -69,7 +71,14 @@
 | `demodulation/demodulator.py` | Public demod dispatch (V2) | `DemodulationResult` |
 | `modulation/demodulator.py` | Symbol kernels: BPSK/QPSK/16-QAM/BFSK + BER (V1) | — |
 | `demodulation/qpsk_sync.py` | 90°-ambiguity resolution vs preamble | — |
-| `fec/*` | CRC, Hamming, repetition, convolutional+Viterbi, interleaver | `FECResult` |
+| `fec/*` | CRC, Hamming, repetition, convolutional+Viterbi, Reed-Solomon, LDPC, concatenated, interleavers | `FECResult` |
+| `fec/identification.py` | Evidence-based AUTO FEC identification (7 hypotheses, honest UNKNOWN) | `FECIdentification` |
+| `fec/identification_interleaving.py` | Block-interleaving structural identification (block-only by design) | — |
+| `io/gnuradio/*` | GNU Radio ingest + spectrum/waterfall bridge (subprocess, never imported) | `CaptureMetadata` |
+| `gui/theme.py` | Light/dark palette, stylesheet, Matplotlib canvas recolouring | — |
+| `ml/*` | NumPy CNN runtime, synthetic dataset, NumPy + PyTorch trainers, artifact validation | `ModulationCNN` |
+| `external_validation/*` | Optional third-party HDF5 dataset harness (lazy h5py; reporting only) | `RealWorldIqDataset` |
+| `visualization/plots.py` | Matplotlib figures (time/spectrum/waterfall/constellation/symbols) | — |
 | `simulation/channel.py` | Impairment chain with ground truth | `ChannelConfig`, `ChannelOutput` |
 | `reporting/export.py` | JSON/CSV/HTML serialization | — |
 | `benchmarking/snr_sweep.py` | SNR sweeps with honest failure reporting | — |
@@ -109,7 +118,10 @@ set; automatic identification runs only in `AnalysisConfig.fec.mode = auto` (see
 **Validation honesty.** Everything in `tests/` and `benchmarking/`
 runs on synthetic signals with ground truth. `docs/VALIDATION.md`
 separates validated claims from unvalidated ones; the HTML report
-footer and README repeat the limitation.
+footer and README repeat the limitation. Optional integrations
+(GNU Radio, h5py/external dataset, PyTorch training, scikit-learn)
+are never required dependencies: each one reports itself as
+unavailable and falls back to the built-in path instead of failing.
 
 ## 4. Data model conventions
 

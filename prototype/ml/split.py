@@ -59,6 +59,78 @@ def _attach_realization_id(frames: Iterable[LabeledFrame], start_id: int = 0) ->
     return frames_list
 
 
+def stratified_realization_split(
+    labels: np.ndarray,
+    realization_ids: np.ndarray,
+    *,
+    fractions: tuple[float, float, float] = (0.70, 0.15, 0.15),
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    """Stratified, leakage-safe train/validation/test split.
+
+    Two properties are enforced at once, which are easy to lose with a
+    naive per-frame split:
+
+    1. **No leakage** — every frame of a realization lands in exactly one
+       fold.  The unit of assignment is the realization, never the frame,
+       so two frames sharing a symbol stream or a channel draw can never
+       straddle the train/test boundary.
+    2. **Stratification** — each fold keeps the class distribution of the
+       whole set, so a balanced dataset stays balanced in every fold.
+
+    Returns ``{"train": idx, "validation": idx, "test": idx}`` with
+    ``np.ndarray`` of frame indices.  Folds are disjoint and their union
+    is every frame in the input.
+    """
+
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    realization_ids = np.asarray(realization_ids, dtype=np.int64).reshape(-1)
+    if labels.size != realization_ids.size:
+        raise ValueError(
+            "labels and realization_ids must have the same length: "
+            f"{labels.size} != {realization_ids.size}"
+        )
+    if abs(sum(fractions) - 1.0) > 1e-9:
+        raise ValueError(f"fractions must sum to 1.0, got {fractions}")
+
+    rng = np.random.default_rng(seed)
+    folds: dict[str, list[int]] = {"train": [], "validation": [], "test": []}
+    names = ("train", "validation", "test")
+
+    for klass in np.unique(labels):
+        mask = labels == klass
+        realizations = np.unique(realization_ids[mask])
+        rng.shuffle(realizations)
+
+        n = realizations.size
+        train_cut = int(np.floor(fractions[0] * n))
+        # Guarantee at least one realization per non-empty fold so tiny
+        # datasets (and tests) never produce an empty split.
+        if n >= 3:
+            train_cut = max(1, min(train_cut, n - 2))
+            validation_cut = train_cut + max(
+                1, min(int(np.floor(fractions[1] * n)), n - train_cut - 1)
+            )
+        else:
+            validation_cut = n
+
+        chunks = (
+            realizations[:train_cut],
+            realizations[train_cut:validation_cut],
+            realizations[validation_cut:],
+        )
+        for name, chunk in zip(names, chunks):
+            for realization in chunk:
+                folds[name].extend(
+                    np.flatnonzero(realization_ids == realization).tolist()
+                )
+
+    return {
+        name: np.asarray(sorted(indices), dtype=np.int64)
+        for name, indices in folds.items()
+    }
+
+
 def split_realizations(
     frames: Sequence[LabeledFrame],
     *,

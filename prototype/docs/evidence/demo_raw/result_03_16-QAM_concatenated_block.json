@@ -1,0 +1,51 @@
+{
+  "case": "16-QAM_concatenated_block",
+  "origin": "matrix",
+  "expected_modulation": "16-QAM",
+  "expected_fec": "concatenated",
+  "expected_interleaver": "block",
+  "expected_interleave_param": 8,
+  "payload_bits": 1024,
+  "coded_bits": 2576,
+  "capture_samples": 51533,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": true,
+  "notes": [
+    "modulation=16-QAM",
+    "fec=concatenated",
+    "interleave=block",
+    "awgn_amplitude=0.004"
+  ],
+  "auto": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.97671349840876,
+    "symbol_rate_confidence": 99.99999392650943,
+    "symbol_rate_method": "delay_multiply+cyclostationarity",
+    "snr_db": 52.130214042374774,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNRESOLVED",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": 0.0,
+    "warnings": []
+  },
+  "configured": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.97671349840876,
+    "snr_db": 52.130214042374774,
+    "coded_stream_ber": 0.0,
+    "fec_scheme": "concatenated",
+    "fec_source": "explicit_config",
+    "uncorrectable_blocks": 0,
+    "corrected_errors": null,
+    "decoded_bits": 1024,
+    "payload_prefix_matched": 1024,
+    "payload_recovered": true,
+    "interleaver_status": "MANUALLY_CONFIGURED",
+    "codeword_alignment": true,
+    "warnings": []
+  }
+}

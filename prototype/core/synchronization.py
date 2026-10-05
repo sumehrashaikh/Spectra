@@ -43,18 +43,75 @@ def _qam16_grid() -> np.ndarray:
     )
 
 
-def _lattice_fit_score(symbols: np.ndarray) -> float:
+def _normalized_lattice(lattice: np.ndarray | None) -> np.ndarray:
 
-    """Trimmed mean distance to the nearest 16-QAM grid point."""
+    """Reference constellation, scaled to unit RMS (16-QAM by default).
 
-    grid = _qam16_grid()
+    Normalizing makes one score comparable across constellations whose
+    ideal points carry different average power (QPSK at radius 1 vs the
+    16-QAM grid at unit RMS).
+    """
+
+    grid = _qam16_grid() if lattice is None else np.asarray(
+        lattice, dtype=np.complex128
+    ).reshape(-1)
+
+    rms = float(np.sqrt(np.mean(np.abs(grid) ** 2)))
+
+    if rms < 1e-12:
+        raise ValueError("lattice must carry energy")
+
+    return grid / rms
+
+
+#: Symbols used by the (phase, step) grid search scoring.  The criterion is
+#: a mean over symbols, so a spread-out subset estimates it just as well: the
+#: search is O(steps x phases x symbols) and a long capture would otherwise
+#: make the grid search dominate the analysis.
+_LATTICE_SCORE_SUBSET = 512
+
+
+def lattice_fit_score(
+    symbols: np.ndarray,
+    lattice: np.ndarray | None = None,
+) -> float:
+
+    """Trimmed mean distance to the nearest ``lattice`` point.
+
+    Public because callers that choose between two synchronization runs
+    need the same criterion the synchronizer optimizes.
+    """
+
+    return _lattice_fit_score(symbols, lattice)
+
+
+def _search_score(symbols: np.ndarray, lattice: np.ndarray) -> float:
+
+    """Lattice-fit score of a spread-out subset, for the timing search."""
+
+    step = max(1, int(np.ceil(symbols.size / _LATTICE_SCORE_SUBSET)))
+
+    return _lattice_fit_score(symbols[::step], lattice)
+
+
+def _lattice_fit_score(
+    symbols: np.ndarray,
+    lattice: np.ndarray | None = None,
+) -> float:
+
+    """Trimmed mean distance to the nearest reference-lattice point."""
 
     rms = float(np.sqrt(np.mean(np.abs(symbols) ** 2)))
 
     if rms < 1e-12:
         return float("inf")
 
-    normalized = symbols / rms
+    normalized = np.asarray(symbols) / rms
+
+    try:
+        grid = _normalized_lattice(lattice)
+    except ValueError:
+        return float("inf")
 
     distances = np.min(
         np.abs(normalized[:, None] - grid[None, :]),
@@ -66,11 +123,14 @@ def _lattice_fit_score(symbols: np.ndarray) -> float:
     return float(np.mean(np.sort(distances)[:keep]))
 
 
-def _decision_directed_phase(symbols: np.ndarray) -> tuple[np.ndarray, float]:
+def _decision_directed_phase(
+    symbols: np.ndarray,
+    lattice: np.ndarray | None = None,
+) -> tuple[np.ndarray, float]:
 
     """Static decision-directed phase correction; returns (symbols, angle)."""
 
-    grid = _qam16_grid()
+    grid = _normalized_lattice(lattice)
 
     current = symbols
 
@@ -104,9 +164,19 @@ def _decision_directed_phase(symbols: np.ndarray) -> tuple[np.ndarray, float]:
 def synchronize_qam_signal(
     signal: Signal,
     symbol_rate: float,
+    lattice: np.ndarray | None = None,
+    lattice_label: str = "16-QAM",
 ) -> FullSynchronizationResult:
     """
     Synchronize a 16-QAM (or other square-QAM) signal.
+
+    ``lattice`` selects the reference constellation the timing and phase
+    stages optimize against (default: the 16-QAM grid).  Passing the
+    modulation's own ideal points makes the same matched-filter +
+    lattice-fit treatment available to PSK: a QPSK capture whose coarse
+    label was wrong otherwise keeps the ISI of an unmatched RRC filter and
+    a sampling phase chosen for the wrong grid, which smears the
+    recovered cloud and caps the BER at ~25%.
 
     The generic chain (M-th power carrier phase + magnitude-variation
     timing) is tuned for constant-envelope PSK and fails on
@@ -270,6 +340,8 @@ def synchronize_qam_signal(
     # matter how accurate timing and carrier recovery are.
     # ---------------------------------------------------------
 
+    reference_lattice = _normalized_lattice(lattice)
+
     sps_f = sample_rate / float(symbol_rate)
 
     if sps_f >= 8.0:
@@ -352,8 +424,8 @@ def synchronize_qam_signal(
 
         for phase in range(sps_int):
 
-            score = _lattice_fit_score(
-                symbols_at(float(phase), step)
+            score = _search_score(
+                symbols_at(float(phase), step), reference_lattice
             )
 
             if score < best_score:
@@ -365,8 +437,8 @@ def synchronize_qam_signal(
 
     for d_phase in np.arange(-0.5, 0.51, 0.1):
 
-        score = _lattice_fit_score(
-            symbols_at(best_phase + d_phase, best_step)
+        score = _search_score(
+            symbols_at(best_phase + d_phase, best_step), reference_lattice
         )
 
         if score < best_score:
@@ -384,7 +456,7 @@ def synchronize_qam_signal(
     normalized = raw_symbols / rms
 
     phase_corrected, dd_angle = _decision_directed_phase(
-        normalized
+        normalized, reference_lattice
     )
 
     # ---------------------------------------------------------
@@ -404,7 +476,7 @@ def synchronize_qam_signal(
     # median phase (0 = no discrimination, 100 = sharp peak).
 
     all_scores = [
-        _lattice_fit_score(symbols_at(float(p), best_step))
+        _search_score(symbols_at(float(p), best_step), reference_lattice)
         for p in range(int(np.ceil(sps_f)))
     ]
 
@@ -427,6 +499,8 @@ def synchronize_qam_signal(
     synchronized_signal.add_metadata(
         synchronization="qam_lattice_fit",
         modulation_order=16,
+        lattice=lattice_label,
+        lattice_points=int(reference_lattice.size),
         frequency_offset=float(freq_offset),
         frequency_confidence=100.0 if freq_offset != 0.0 else 0.0,
         phase_offset=float(dd_angle),

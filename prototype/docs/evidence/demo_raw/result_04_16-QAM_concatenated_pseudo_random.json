@@ -1,0 +1,51 @@
+{
+  "case": "16-QAM_concatenated_pseudo_random",
+  "origin": "matrix",
+  "expected_modulation": "16-QAM",
+  "expected_fec": "concatenated",
+  "expected_interleaver": "pseudo_random",
+  "expected_interleave_param": 3,
+  "payload_bits": 1024,
+  "coded_bits": 2572,
+  "capture_samples": 51453,
+  "sample_rate_hz": 8000.0,
+  "true_symbol_rate": 100.0,
+  "reference_sidecar": true,
+  "notes": [
+    "modulation=16-QAM",
+    "fec=concatenated",
+    "interleave=pseudo_random",
+    "awgn_amplitude=0.004"
+  ],
+  "auto": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.97667729145613,
+    "symbol_rate_confidence": 99.99998560863746,
+    "symbol_rate_method": "delay_multiply+cyclostationarity",
+    "snr_db": 50.118364084140865,
+    "fec_status": "UNKNOWN",
+    "fec_scheme": null,
+    "fec_confidence": 40.0,
+    "interleaver_status": "UNRESOLVED",
+    "interleaver_type": null,
+    "interleaver_depth": null,
+    "ber": 0.0,
+    "warnings": []
+  },
+  "configured": {
+    "detected_modulation": "16-QAM",
+    "symbol_rate_est": 99.97667729145613,
+    "snr_db": 50.118364084140865,
+    "coded_stream_ber": 0.0,
+    "fec_scheme": "concatenated",
+    "fec_source": "explicit_config",
+    "uncorrectable_blocks": 0,
+    "corrected_errors": null,
+    "decoded_bits": 1024,
+    "payload_prefix_matched": 1024,
+    "payload_recovered": true,
+    "interleaver_status": "MANUALLY_CONFIGURED",
+    "codeword_alignment": true,
+    "warnings": []
+  }
+}

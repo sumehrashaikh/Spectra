@@ -1,0 +1,4 @@
+# External real-world IQ dataset (Mendeley) — NOT part of this repository.
+# ~833 MB of HDF5. Keep it local; see README.md for how to obtain it.
+*.h5
+*.hdf5

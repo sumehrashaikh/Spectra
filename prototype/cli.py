@@ -31,6 +31,7 @@ from prototype.core.exceptions import SpectraError
 from prototype.core.logging_config import configure_logging
 
 from prototype.cli_ml import cmd_convert, cmd_train
+from prototype.cli_dataset import cmd_dataset_eval, cmd_dataset_inspect
 
 
 def _add_loader_arguments(parser: argparse.ArgumentParser) -> None:
@@ -729,6 +730,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=str, default="ml/modulation_cnn_trained.npz")
     p.add_argument("--skip-grad-check", action="store_true")
     p.set_defaults(func=cmd_train)
+
+    p = subparsers.add_parser(
+        "dataset-inspect",
+        help=(
+            "Inspect the optional external real-world dataset "
+            "(shapes, labels, balance). Optional; needs h5py."
+        ),
+    )
+    p.add_argument("--dataset-dir", default=None,
+                   help="Folder holding subset_*.h5 (default: search "
+                        "dataset/, then correlation/dataset/).")
+    p.add_argument("--subset", action="append", default=None,
+                   choices=["train", "val", "test"],
+                   help="Subset to report (repeatable; default: all found).")
+    p.add_argument("--json", default="-", help="JSON output path ('-' = stdout)")
+    p.set_defaults(func=cmd_dataset_inspect)
+
+    p = subparsers.add_parser(
+        "dataset-eval",
+        help=(
+            "Evaluate the EXISTING preprocessing + DSP classifier + optional "
+            "ML assist on a sampled subset of the external real-world "
+            "dataset. Optional; needs h5py. Does not change the pipeline."
+        ),
+    )
+    p.add_argument("--dataset-dir", default=None,
+                   help="Folder holding subset_*.h5 (default: search "
+                        "dataset/, then correlation/dataset/).")
+    p.add_argument("--subset", action="append", default=None,
+                   choices=["train", "val", "test"],
+                   help="Subset to sample (repeatable; default: test).")
+    p.add_argument("--per-cell", type=int, default=3,
+                   help="Frames sampled per (modulation, channel, SNR) cell.")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--ml", action="store_true", default=True,
+                   help="Run the optional ML assist (default: on).")
+    p.add_argument("--no-ml", dest="ml", action="store_false",
+                   help="Skip the ML assist and report DSP results only.")
+    p.add_argument("--max-frames", type=int, default=None,
+                   help="Hard cap on evaluated frames.")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Parallel worker processes for per-frame evaluation.")
+    p.add_argument("--dump-frames", action="store_true",
+                   help="Include the per-frame records in the JSON output.")
+    p.add_argument("--table", action="store_true",
+                   help="Also print a compact human-readable table to stderr.")
+    p.add_argument("--json", default="-", help="JSON output path ('-' = stdout)")
+    p.set_defaults(func=cmd_dataset_eval)
 
     p = subparsers.add_parser("validate", help="Pipeline self-check")
     p.add_argument("--seed", type=int, default=42)

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from .evaluation import per_class_stats, summary_stats
+from .evaluation import _as_int_arrays, per_class_stats, summary_stats
 
 # Use a plain monotone mapping from scores to pseudo-probabilities.
 # Both the identity and a logistic (Platt-style) map are implemented so
@@ -220,6 +220,90 @@ def calibrate_predictions(
         out.append(calibrated_payload)
 
     return out
+
+
+def reliability_report(
+    y_true: Sequence[int],
+    probabilities: np.ndarray,
+    *,
+    bins: int = 10,
+) -> dict[str, Any]:
+    """Confidence/calibration statistics for a set of softmax outputs.
+
+    Reports what a user of a model actually needs to know: whether a high
+    softmax score means a high chance of being right, and how peaked the
+    scores are.  Expected calibration error is included because it is the
+    number that makes an over-confident softmax visible; nothing here
+    changes the scores themselves, and the result is explicitly labelled
+    as uncalibrated.
+    """
+
+    y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if y_true.size == 0 or probabilities.size == 0:
+        return {}
+
+    confidence = probabilities.max(axis=1)
+    predicted = probabilities.argmax(axis=1)
+    correct = (predicted == y_true).astype(np.float64)
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    bucket = np.clip(np.digitize(confidence, edges[1:-1]), 0, bins - 1)
+    per_bin = []
+    weighted_gap = 0.0
+    for index in range(bins):
+        selected = bucket == index
+        count = int(selected.sum())
+        if count:
+            mean_confidence = float(confidence[selected].mean())
+            accuracy = float(correct[selected].mean())
+            weighted_gap += (count / y_true.size) * abs(
+                accuracy - mean_confidence
+            )
+        else:
+            mean_confidence = accuracy = None
+        per_bin.append({
+            "bin": f"{edges[index]:.1f}-{edges[index + 1]:.1f}",
+            "count": count,
+            "mean_confidence": mean_confidence,
+            "accuracy": accuracy,
+        })
+
+    onehot = np.zeros_like(probabilities)
+    onehot[np.arange(y_true.size), y_true] = 1.0
+    true_score = np.clip(
+        probabilities[np.arange(y_true.size), y_true], 1e-12, 1.0
+    )
+    top2 = np.sort(probabilities, axis=1)[:, -2:] \
+        if probabilities.shape[1] > 1 else probabilities
+
+    return {
+        "samples": int(y_true.size),
+        "mean_confidence": float(confidence.mean()),
+        "mean_correct_confidence": (
+            float(confidence[correct > 0].mean()) if correct.any() else None
+        ),
+        "mean_wrong_confidence": (
+            float(confidence[correct == 0].mean())
+            if (correct == 0).any() else None
+        ),
+        "accuracy": float(correct.mean()),
+        "expected_calibration_error": float(weighted_gap),
+        "negative_log_likelihood": float(-np.log(true_score).mean()),
+        "brier_score": float(np.mean(np.sum(
+            (probabilities - onehot) ** 2, axis=1
+        ))),
+        "mean_score_margin": (
+            float((top2[:, 1] - top2[:, 0]).mean())
+            if probabilities.shape[1] > 1 else None
+        ),
+        "bins": per_bin,
+        "note": (
+            "Softmax scores are model scores, not calibrated probabilities. "
+            "An ECE well above zero means confidence must not be read as a "
+            "hit rate; ML_CONFIDENCE_FLOOR gates on the raw mean score."
+        ),
+    }
 
 
 def confidence_report(

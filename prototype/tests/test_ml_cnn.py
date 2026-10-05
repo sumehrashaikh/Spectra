@@ -14,6 +14,7 @@ import pytest
 
 from prototype.ml.cnn import (
     FRAME_LENGTH,
+    ML_VALIDATION_FLOOR,
     NUM_CLASSES,
     ModulationCNN,
     extract_frames,
@@ -93,10 +94,15 @@ def test_engine_loads_and_validates_config():
     engine = ModulationCNN(path)
 
     assert len(engine.labels) == NUM_CLASSES
-    assert engine.config["input_shape"] == [FRAME_LENGTH, 2]
+    # The input length is a property of the artifact, not a module
+    # constant (ML v3 ships 1024-sample artifacts).  What must hold is
+    # that the declaration and the geometry read back from the weights
+    # agree — resolve_architecture raises otherwise.
+    assert engine.config["input_shape"] == [engine.frame_length, 2]
+    assert engine.architecture["frame_length"] == engine.frame_length
+    assert engine.frame_length >= FRAME_LENGTH
+    assert engine.frame_length % 2 == 0
     assert engine.config["activation_head"] == "softmax"
-    # The config embedded in the artifact must match the runtime's
-    # architecture constants.
     assert engine.config["num_classes"] == NUM_CLASSES
 
 
@@ -104,19 +110,31 @@ def test_engine_tensor_shapes_match_architecture():
     path = _any_artifact()
     engine = ModulationCNN(path)
     t = engine._tensors
+    blocks = engine.blocks
 
-    assert t["conv0.kernel"].shape == (7, 2, 64)
-    assert t["conv1.kernel"].shape == (5, 64, 128)
-    assert t["conv2.kernel"].shape == (3, 128, 256)
-    assert t["dense0.kernel"].shape[1] == 256
-    assert t["dense1.kernel"].shape == (256, NUM_CLASSES)
+    assert 1 <= len(blocks) <= 4
+    assert blocks[0].in_channels == 2
+    for index, block in enumerate(blocks):
+        assert t[f"conv{index}.kernel"].shape == (
+            block.kernel, block.in_channels, block.out_channels
+        )
+        assert t[f"conv{index}.bias"].shape == (block.out_channels,)
+        if index:
+            assert block.in_channels == blocks[index - 1].out_channels
+        assert t[f"bn{index}.gamma"].shape[0] == block.out_channels
+        for name in ("beta", "mean", "variance"):
+            assert t[f"bn{index}.{name}"].shape == (block.out_channels,)
+        assert bool(np.all(t[f"bn{index}.variance"] > 0.0))
 
-    for idx in range(3):
-        channels = t[f"bn{idx}.gamma"].shape[0]
-        assert t[f"bn{idx}.beta"].shape == (channels,)
-        assert t[f"bn{idx}.mean"].shape == (channels,)
-        assert t[f"bn{idx}.variance"].shape == (channels,)
-        assert bool(np.all(t[f"bn{idx}.variance"] > 0.0))
+    # The classifier must consume exactly the head width the pooling and
+    # convolution stack produces.  Getting this wrong is how a flatten
+    # head silently reads the wrong axis order.
+    assert t["dense1.kernel"].shape[1] == NUM_CLASSES
+    if engine.has_hidden_dense:
+        assert t["dense0.kernel"].shape[0] == engine.architecture["head_input"]
+        assert t["dense1.kernel"].shape[0] == t["dense0.kernel"].shape[1]
+    else:
+        assert t["dense1.kernel"].shape[0] == engine.architecture["head_input"]
 
 
 def test_softmax_output_is_normalized():
@@ -124,12 +142,31 @@ def test_softmax_output_is_normalized():
     engine = ModulationCNN(path)
 
     rng = np.random.default_rng(0)
-    frames = normalize_frames(extract_frames(rng.standard_normal(4096) + 0j))
+    samples = rng.standard_normal(16384) + 0j
+    frames = normalize_frames(
+        extract_frames(samples, frame_length=engine.frame_length)
+    )
     scores = engine.predict_frames(frames)
 
+    assert frames.shape[1] == engine.frame_length
+    assert frames.shape[0] > 1
     assert scores.shape == (frames.shape[0], NUM_CLASSES)
     np.testing.assert_allclose(scores.sum(axis=1), 1.0, atol=1e-5)
     assert bool(np.all(scores >= 0.0))
+
+
+def test_shipped_artifact_validation_claim_is_consistent():
+    """The packaged model must not claim more than the gate allows."""
+
+    engine = get_engine()
+    if engine is None or not engine.trained:
+        pytest.skip("No trained ML artifact packaged")
+
+    accuracy = engine.validation_accuracy
+    assert accuracy is not None
+    assert 0.0 <= accuracy <= 1.0
+    assert engine.validated == (accuracy >= ML_VALIDATION_FLOOR)
+    assert engine.status
 
 
 # --------------------------------------------------------------
@@ -204,13 +241,29 @@ def test_predict_modulation_reports_short_capture():
     distinguish "nothing available at all" from "capture too short to
     classify". The pipeline's ML toggle must not silently drop such frames.
     """
+    engine = get_engine()
+    if engine is None:
+        pytest.skip("No ML artifact packaged")
+
+    # Shorter than the smallest frame any shipped artifact has used, so
+    # the rejection cannot be an artefact of the current frame length.
     result = predict_modulation(np.zeros(64, dtype=complex))
 
     assert result is not None
     assert result["num_frames"] == 0
     assert result["predicted_class"] is None
     assert result["confidence"] == 0.0
-    assert "Capture shorter than one 512-sample frame" in result["note"]
+    assert result["presented_as"] == "evidence"
+    assert result["frame_length"] == engine.frame_length
+    # The payload must say the stage was *skipped*, not imply the model
+    # produced a verdict, and it must name the artifact's frame length.
+    assert result["inference_ran"] is False
+    assert result["skip_reason"] == "insufficient_input"
+    assert "skipped inference" in result["note"]
+    assert (
+        f"shorter than one {engine.frame_length}-sample frame"
+        in result["note"]
+    )
 
 
 def test_get_engine_is_cached():

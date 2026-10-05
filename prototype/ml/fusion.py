@@ -45,6 +45,48 @@ DSP_MODULATIONS = {
     "Unknown",
 }
 
+# The ML dataset and the deterministic classifier spell the same
+# constellations differently ("16QAM" vs "16-QAM", "8PSK" vs "8-PSK").
+# Without this normalisation every ML QAM/PSK prediction was silently
+# rewritten to "Unknown" and could never be compared with the DSP result.
+_LABEL_ALIASES = {
+    "8PSK": "8-PSK",
+    "16QAM": "16-QAM",
+    "64QAM": "64-QAM",
+    "256QAM": "256-QAM",
+    "32QAM": "32-QAM",
+    "2FSK": "BFSK",
+    "MSK": "MSK",
+}
+
+
+def canonical_modulation(label: Any) -> str:
+    """Normalise a modulation label into one shared vocabulary.
+
+    Returns ``"Unknown"`` for an empty/None label.  Labels the DSP chain
+    cannot emit (64-QAM, PAM4, AM-DSB, ...) are returned unchanged, so the
+    caller can tell "the model named a class the receiver does not
+    implement" apart from "the model said nothing".
+    """
+
+    text = str(label or "").strip()
+    if not text:
+        return "Unknown"
+    if text in _LABEL_ALIASES:
+        return _LABEL_ALIASES[text]
+    upper = text.upper().replace("_", "-")
+    if upper in _LABEL_ALIASES:
+        return _LABEL_ALIASES[upper]
+    for known in DSP_MODULATIONS:
+        if upper == known.upper():
+            return known
+    return text
+
+
+def is_comparable(label: Any) -> bool:
+    """True when a label is inside the deterministic classifier's set."""
+    return canonical_modulation(label) in DSP_MODULATIONS
+
 
 @dataclass(frozen=True)
 class FusionConfig:
@@ -76,7 +118,7 @@ def fuse_classification(
 ) -> dict[str, Any]:
     """Apply the configured fusion policy and return a structured record."""
 
-    dsp_clean = str(dsp_modulation or "Unknown").strip()
+    dsp_clean = canonical_modulation(dsp_modulation)
     dsp_modulation = dsp_clean if dsp_clean in DSP_MODULATIONS else "Unknown"
 
     # Initialize the record with diagnostics.
@@ -85,6 +127,7 @@ def fuse_classification(
         "dsp_modulation": dsp_modulation,
         "ml_present": bool(ml_prediction),
         "ml_modulation": None,
+        "ml_comparable": None,
         "final_modulation": None,
         "disagreement": False,
         "confidence_gap": None,
@@ -98,10 +141,6 @@ def fuse_classification(
 
     # Build the side-by-side evidence set.
     evidence: list[dict[str, Any]] = []
-
-    dsp_conf: float | None = None
-    if "confidence" in (record := _as_dict(record)):
-        pass
 
     # Deterministic DSP classifier confidence is NOT stored in the
     # existing ClassificationConfig summary, so we conservatively treat
@@ -138,17 +177,50 @@ def fuse_classification(
         record["reason"] = "ML disabled"
         return record
 
-    ml_mod = str(ml_prediction.get("predicted_class") or "Unknown").strip()
-    ml_mod = ml_mod if ml_mod in DSP_MODULATIONS else "Unknown"
+    ml_raw_label = ml_prediction.get("predicted_class")
+    ml_mod = canonical_modulation(ml_raw_label)
     ml_score = float(ml_prediction.get("confidence", 0.0))
     ml_agreement = float(ml_prediction.get("frame_agreement", 0.0))
+    ml_comparable = ml_mod in DSP_MODULATIONS
+
+    record["ml_modulation"] = None if ml_mod == "Unknown" else ml_mod
+    record["ml_comparable"] = ml_comparable
+    record["ml_raw_label"] = ml_raw_label
+    record["ml_validated"] = bool(ml_prediction.get("validated", False))
+    record["ml_presented_as"] = str(
+        ml_prediction.get("presented_as", "evidence")
+    )
 
     if ml_mod == "Unknown":
         record["ml_warn"] = (
-            "ML returned Unknown; DSP result is the only usable evidence."
+            "ML returned no usable class; DSP result is the only usable "
+            "evidence."
         )
         record["final_modulation"] = dsp_modulation
         record["reason"] = "ML returned Unknown"
+        return record
+
+    if not ml_comparable:
+        # A real class, but one the deterministic receiver cannot emit
+        # (64-QAM, PAM4, AM-DSB, ...).  Record it as evidence, never as
+        # a competing answer, and say exactly that.
+        record["ml_warn"] = (
+            f"ML predicted {ml_mod}, which is outside the deterministic "
+            "classifier's vocabulary; the DSP result is kept and the ML "
+            "score is reported as evidence only."
+        )
+        record["evidence"] = [
+            {
+                "source": "ml",
+                "modulation": ml_mod,
+                "confidence": ml_score,
+                "strength": "weak",
+                "confidence_label": "raw_model_score",
+                "comparable": False,
+            }
+        ]
+        record["final_modulation"] = dsp_modulation
+        record["reason"] = "ML label outside the DSP vocabulary"
         return record
 
     evidence.append(

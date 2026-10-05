@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectra_v2"
-version = "2.1.0"
+version = "2.2.0"
 description = "Spectra - RF/signal analysis platform (engineering prototype; synthetic-data validated)"
 readme = "README.md"
 requires-python = ">=3.10"

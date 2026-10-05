@@ -157,7 +157,38 @@ def test_auto_identification_is_read_from_demodulation():
         assert window._identification_result is not None
         assert window._identification_result["best_scheme"] == "reedsolomon"
         window.update_analysis_parameters()
-        assert "reedsolomon" in window.parameter_fec_auto.text()
+        row = window.parameter_fec_auto.text()
+        assert "reedsolomon" in row
+        assert "70%" in row
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_auto_identification_row_formats_a_fractional_confidence():
+    """Confidence is a heuristic score, not a probability: a 0..1 value
+    must render as a percentage, never as "confidence 0"."""
+    window = _make_window()
+    try:
+        window.analysis = {"signal_detected": True, "detected_signals": []}
+        window._apply_candidate_detail(
+            {
+                "classification": {"modulation": "16-QAM"},
+                "demodulation": {
+                    "fec_identification": {
+                        "status": "AUTO_DETECTED",
+                        "best_scheme": "concatenated",
+                        "confidence": 0.83,
+                        "confirmed_by": "reference_payload_agreement",
+                    }
+                },
+            }
+        )
+        window.update_analysis_parameters()
+        row = window.parameter_fec_auto.text()
+        assert "concatenated" in row
+        assert "83%" in row
+        assert "confidence 0" not in row
     finally:
         window.close()
         window.deleteLater()

@@ -138,6 +138,49 @@ def test_no_fec_capture_is_bit_exact_after_alignment():
     assert result.ber is not None and result.ber["ber"] < 0.01
 
 
+@pytest.mark.parametrize("modulation", ["QPSK", "8-PSK"])
+def test_demo_level_tables_match_the_receiver_decisions(modulation):
+    """Every bit word must map to a symbol the receiver decides back to it.
+
+    The transmitter's level table is derived from the receiver's decision
+    kernel, so this is the invariant that keeps them from drifting: the
+    hand-written QPSK table had two quadrants swapped, which capped the
+    measured BER near 25% no matter how good synchronization was.
+    """
+    import numpy as np
+
+    from prototype.modulation.demodulator import qpsk_decision
+    from prototype.modulation.digital import psk8_decision
+
+    if modulation == "QPSK":
+        levels = dc.QPSK_LEVELS
+        words = np.array([[b0, b1] for b0 in (0, 1) for b1 in (0, 1)])
+
+        def decide(points):
+            return qpsk_decision(points)[0]
+
+    else:
+        levels = dc.PSK8_LEVELS
+        words = np.array(
+            [[b0, b1, b2] for b0 in (0, 1) for b1 in (0, 1) for b2 in (0, 1)]
+        )
+
+        def decide(points):
+            return psk8_decision(points)[0]
+
+    width = words.shape[1]
+    indices = np.array(
+        [int(np.dot(word, 1 << np.arange(width - 1, -1, -1))) for word in words]
+    )
+    symbols = np.asarray(levels)[indices]
+
+    decided = np.asarray(decide(symbols), dtype=np.uint8)
+    assert np.array_equal(decided, words.reshape(-1)), (
+        "demo level table does not round-trip through the receiver's "
+        f"decision kernel for {modulation}"
+    )
+
+
 def test_payload_length_matches_coded_length():
     """The demo transmitter must not pad or truncate a codeword."""
     for case in dc.demo_cases():
@@ -237,11 +280,12 @@ def test_no_reference_never_claims_a_decoded_payload():
 
 @pytest.mark.parametrize("modulation", ["QPSK", "8-PSK"])
 def test_non_qam_demos_stay_honest(modulation):
-    """QPSK/8-PSK demos: the RF chain runs and no wrong claim is made.
+    """QPSK/8-PSK demos: whatever the chain claims, it must be true.
 
-    Blind symbol-origin resolution is only implemented for 16-QAM, so the
-    coded chain is not expected to decode here; what is asserted is that
-    the run reports honestly instead of fabricating a payload.
+    The blind symbol-origin resolution now covers the PSK folds as well as
+    16-QAM, so a clean decode is legitimate — the assertion is that a
+    *claimed* clean codeword really matches the transmitted payload, and
+    that a failed alignment is never dressed up as one.
     """
     capture = dc.build_capture(
         modulation=modulation, fec_scheme="reedsolomon", nbits=768
@@ -256,7 +300,7 @@ def test_non_qam_demos_stay_honest(modulation):
 
     fec = _decoded(result)
     if fec and fec.get("uncorrectable_blocks") == 0:
-        pytest.fail(
-            "a clean codeword was claimed for a capture whose alignment was "
-            "not resolved - that would be a false positive"
+        assert _prefix_matches(fec["decoded_bits"], capture.payload_bits, 0), (
+            "a clean codeword was claimed that does not match the "
+            "transmitted payload - that would be a false positive"
         )
