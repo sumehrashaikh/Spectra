@@ -213,7 +213,6 @@ inference).
 - `prototype/docs/evidence/EVIDENCE.md` — generated evidence pack
 - `prototype/dataset/README.md` — optional external real-world dataset
 - `CHANGELOG.md` — release history
-- `AGENTBRAIN.md` — engineering journal / agent continuity
 
 ## License
 
